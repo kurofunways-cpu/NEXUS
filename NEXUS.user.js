@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.31
+// @version      1.8.32
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -10,10 +10,41 @@
 // @grant        none
 // ==/UserScript==
 
+// ============================================================================
+// NEXUS — MENSAGEM IMPORTANTE PARA O PRÓXIMO CHAT DO CHATGPT
+// ============================================================================
+// Se o usuário disser "no script tem uma mensagem importante", leia este bloco.
+// Este é um projeto contínuo. A versão oficial está no GitHub:
+//   https://github.com/kurofunways-cpu/NEXUS
+// Código executável e fonte principal: NEXUS.user.js (JavaScript / Tampermonkey)
+// Metadados para atualização automática: NEXUS.meta.js
+//
+// Instruções para continuar o projeto em um novo chat:
+// 1. Acesse o GitHub conectado e verifique a versão mais recente no repositório
+//    ANTES de alterar o código. Não confie no número de versão deste comentário.
+// 2. Preserve todas as funcionalidades e configurações anteriores; não remova
+//    funções sem pedido explícito do usuário.
+// 3. Para cada modificação solicitada, valide o código e publique a nova versão
+//    de NEXUS.user.js no repositório GitHub acima.
+// 4. Aumente o número de @version em NEXUS.user.js e NEXUS.meta.js e mantenha
+//    os campos @updateURL e @downloadURL apontando para os arquivos oficiais.
+// 5. Atualize a constante interna NEXUS_VERSION para a mesma versão.
+// 6. Entregue também uma cópia completa com extensão .lua, como o usuário pede.
+//    ATENÇÃO: esse arquivo continua sendo JavaScript para Tampermonkey, não Lua.
+// 7. Não altere a navegação, a cama, a cura ou outras partes sem necessidade.
+// 8. Informe quais testes foram feitos e o que não foi testado no jogo.
+// 9. Publicar no GitHub é uma ação separada: criar um arquivo no chat NÃO
+//    publica alterações automaticamente; requer acesso autorizado ao GitHub.
+// 10. O Tampermonkey verifica periodicamente atualizações publicadas; não há
+//     garantia de atualização instantânea e o jogo pode precisar ser recarregado.
+//
+// Objetivo: manter a NEXUS atualizável automaticamente a partir do GitHub.
+// ============================================================================
+
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.31';
+    const NEXUS_VERSION = '1.8.32';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
