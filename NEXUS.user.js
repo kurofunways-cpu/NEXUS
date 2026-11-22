@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.32
+// @version      1.8.33
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.32';
+    const NEXUS_VERSION = '1.8.33';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -89,6 +89,7 @@
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
+        notifyTargets: true,
         autoHeal: true,
         legitHeal: false,
         lagGuard: true,
@@ -3479,6 +3480,79 @@
         watchAutoRespawnPlay();
         wakeAutoRespawn(35);
     }
+    // Nearby-enemy prompt: observes server player snapshots independently of
+    // Smart Place. Never enable Auto Pick without an explicit click on Yes.
+    // Visibility and cooldown checks avoid interrupting background tabs.
+    const TARGET_NOTICE_RANGE=260;
+    const TARGET_NOTICE_COOLDOWN=45000;
+    const targetNotice={node:null,lastShownAt:-Infinity,nearby:false};
+    function hideTargetNotice() {
+        if(targetNotice.node) targetNotice.node.remove();
+        targetNotice.node=null;
+    }
+    function resetTargetNotice() {
+        hideTargetNotice();targetNotice.nearby=false;
+        targetNotice.lastShownAt=-Infinity;
+    }
+    function showTargetNotice(distance) {
+        const now=performance.now();
+        if(!document.body || document.hidden || !player.alive || !connected() ||
+           !settings.notifyTargets || settings.autoPick || targetNotice.node ||
+           now-targetNotice.lastShownAt<TARGET_NOTICE_COOLDOWN) return;
+        targetNotice.lastShownAt=now;
+        const box=document.createElement('section');
+        box.id='nx-target-notice';box.setAttribute('role','alert');
+        box.style.cssText='position:fixed;top:18px;right:18px;z-index:2147483647;'+
+            'width:min(320px,calc(100vw - 36px));padding:13px 14px;'+
+            'background:linear-gradient(145deg,#142638,#09131f);'+
+            'color:#eaffff;border:1px solid #4fded1;border-radius:13px;'+
+            'box-shadow:0 12px 35px #000b;font:13px Arial,sans-serif;';
+        const headline=document.createElement('strong');
+        headline.textContent='NEXUS · Alvo próximo';
+        headline.style.cssText='display:block;color:#83fff1;font-size:14px;margin-bottom:6px';
+        const message=document.createElement('p');
+        message.style.cssText='margin:0 0 10px;line-height:1.45';
+        message.textContent=`Inimigo a aproximadamente ${Math.round(distance)} unidades. Ativar Auto Pick?`;
+        const actions=document.createElement('div');
+        actions.style.cssText='display:flex;gap:8px;';
+        const yes=document.createElement('button');yes.type='button';yes.textContent='Yes';
+        yes.style.cssText='flex:1;background:#52daca;color:#082026;border:0;border-radius:7px;padding:8px;font-weight:bold;cursor:pointer';
+        const no=document.createElement('button');no.type='button';no.textContent='Agora não';
+        no.style.cssText='flex:1;background:#26394a;color:#eaffff;border:1px solid #526c77;border-radius:7px;padding:8px;cursor:pointer';
+        yes.addEventListener('click',()=>{
+            hideTargetNotice();
+            // Existing settings persistence and per-tab synchronization are respected.
+            editSetting('autoPick',true);
+            if(!selectedProfile) {
+                profileStatus='Auto Pick ativado — selecione um perfil de upgrades';
+                refreshProfiles();
+            }
+        });
+        no.addEventListener('click',hideTargetNotice);
+        actions.append(yes,no);box.append(headline,message,actions);
+        document.body.appendChild(box);targetNotice.node=box;
+    }
+    function observeTargetProximity(packet) {
+        if(!player.alive || settings.autoPick || !settings.notifyTargets) {
+            hideTargetNotice();targetNotice.nearby=false;return;
+        }
+        if(!(packet instanceof Uint8Array) || (packet.length-1)%19!==0) return;
+        const self=session.self, now=performance.now();
+        if(!self || now-self.at>400) return; // Never use stale positions.
+        let nearest=Infinity;
+        for(let i=1;i+18<packet.length;i+=19) {
+            if(packet[i]!==0 || (packet[i+8]&2)) continue;
+            const id=packet[i+2]|packet[i+3]<<8;
+            if(id===player.id) continue;
+            const team=packet[i+12];
+            if(self.team!==0 && self.team===team) continue; // Ignore teammates.
+            const x=packet[i+4]|packet[i+5]<<8, y=packet[i+6]|packet[i+7]<<8;
+            nearest=Math.min(nearest,Math.hypot(x-self.x,y-self.y));
+        }
+        targetNotice.nearby=nearest<=TARGET_NOTICE_RANGE;
+        if(!targetNotice.nearby) {hideTargetNotice();return;}
+        showTargetNotice(nearest);
+    }
     let lastMenuSnapshotPaint=-Infinity;
     function onGameMessage(event) {
         // A superseded server may still deliver delayed messages. Ignore them.
@@ -3491,6 +3565,7 @@
         const id = Number(packet[0]);
         let ownSnapshotProcessed=false;
         if (id === 35) { // spawn
+            hideTargetNotice();targetNotice.nearby=false;
             stopAutoRespawn();
             // Some fast respawns can skip the death message entirely. Preserve
             // the last position only when this was already an active life on
@@ -3518,6 +3593,7 @@
             if (pending && performance.now()-pending.at<=PRESPAWN_OFFER_MS) receiveOffer(pending.ids);
             updateHealth();
         } else if (id === 19) { // death
+            hideTargetNotice();targetNotice.nearby=false;
             noteAgeRecoveryDeath();
             captureReturnDeath();
             // Preserve the last confirmed or user-selected hat for the next life.
@@ -3572,7 +3648,7 @@
                 const now=performance.now();
                 noteServerSnapshot(now);
                 session.self={x:packet[i+4]|packet[i+5]<<8,
-                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],at:now};
+                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],at:now};
                 recordReturnPosition({x:packet[i+4]|packet[i+5]<<8,
                                       y:packet[i+6]|packet[i+7]<<8},now);
                 noteHealthSnapshot(Math.max(0, Math.min(100, packet[i + 13] * 100 / 255)),now);
@@ -3587,6 +3663,7 @@
                 observeSpawnBed(packet);
                 observeReturnObjects(packet);
                 observePlacement(packet);
+                observeTargetProximity(packet);
             }
         }
         // The one-off post-death food has priority over normal healing and
@@ -3615,6 +3692,7 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
+        resetTargetNotice();
         clearAgeRecovery('Sem morte nesta conexão');
         stopAutoRespawn();
         // Never use a death target/path from a previous server.
@@ -3757,6 +3835,7 @@
         }
         evaluate();
         if (key === 'autoPick') {
+            if (settings.autoPick) hideTargetNotice();
             if (!settings.autoPick) clearUpgradeRetry();
             else autoPick();
         }
@@ -3771,6 +3850,7 @@
             if (macro.selected && !macroActive(macro.selected)) releaseMacroSelection();
             if (Object.keys(macroDefs).some(macroActive)) runMacros(); else stopMacroTimer();
         }
+        if (key==='notifyTargets' && !settings.notifyTargets) hideTargetNotice();
         if (key==='showStats') syncStatsVisibility();
         if (key==='lagGuard' && autoPlacementEnabled()) scheduleAutoPlace(1);
         if (key==='threeHitGuard' && !settings.threeHitGuard) resetKatanaGuard();
@@ -4182,6 +4262,7 @@
           <div class="content" data-panel="profiles" hidden>
             <div class="section-intro"><span><strong>UPGRADE PROFILES</strong><small>Salve e reproduza seus upgrades</small></span></div>
             <label title="Automatically repeat the selected profile whenever its next item is offered">Auto Pick<input data-heal-setting="autoPick" type="checkbox"></label>
+            <label title="Exibe um alerta ao detectar inimigos a até 260 unidades; Yes ativa Auto Pick. O alerta não muda configurações sem seu clique.">Aviso de alvos<input data-heal-setting="notifyTargets" type="checkbox"></label>
             <select id="gpt-pick-profile" class="pick-input" aria-label="Saved profile"></select>
             <input id="gpt-pick-name" class="pick-input" maxlength="32" placeholder="Profile name" title="Choose items manually, then enter a name and save. Use the same name to replace a profile.">
             <div class="pick-actions">
@@ -4409,6 +4490,7 @@
     });
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
+            hideTargetNotice();
             clearMacros();backupGameSettings();
         } else {syncSettingsFromStorage();queueNativeRestore(350);}
         // Incoming WebSocket snapshots remain the primary clock. Resume
