@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.45
+// @version      1.8.46
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.45';
+    const NEXUS_VERSION = '1.8.46';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -600,7 +600,8 @@
     const BED_PLACE_MIN=71;
     const BED_PLACE_MAX=82;
     const BED_MAX_MOVE_MS=880; // Hard upper bound; each leg uses its own distance-based deadline.
-    const BED_MAX_TASK_MS=8000; // Always release movement controls if the task cannot finish.
+    const BED_MAX_TASK_MS=8000; // Release the controls, then retry instead of abandoning the life.
+    const BED_RETRY_MIN_MS=750, BED_RETRY_MAX_MS=12000;
     const BED_NAV_GRID=12;
     const BED_NAV_RADIUS=240;
     const BED_NAV_BODY=28;
@@ -665,6 +666,7 @@
         // the server entity snapshot.
         handoffMove:false,manualAfterPlacement:false,
         lastManualMoveAt:-Infinity,moveKeys:new Set(),abortReason:'',
+        retryCount:0,retryReason:'',retryLayout:null,
         socketEpoch:0,layoutKey:null,layoutCandidate:null,layoutCandidateCount:0,
         trace:[],lastLearned:false,usedLearned:false,
         failedThisRun:0,lastFailureAt:0,placementFailures:0,
@@ -763,7 +765,7 @@
         const epoch = bed.epoch;
         bed.lockTimer = setTimeout(() => {
             if (bed.locked && bed.pending && bed.epoch === epoch)
-                abortSpawnBed('Navigation safety timeout');
+                retrySpawnBed('Tempo limite de navegação');
         }, BED_MAX_TASK_MS);
         return true;
     }
@@ -780,7 +782,8 @@
             bedDistance(actual,bed.moveLastPos)<4;
         stopBedMovement();
         bed.phase='await-position';bed.awaitFreshAt=now;bed.nextAt=now+5;
-        if (fresh && (confirmedStall || stationary)) {
+        // Knockback and incoming damage are not evidence of a solid wall.
+        if (fresh && (confirmedStall || stationary) && now-heal.lastDamageAt>450) {
             rememberBedFailure(actual,goal);
         }
         bed.route=[];bed.routeAt=0;bed.waypoint=0;
@@ -798,6 +801,27 @@
             catch (_) {bedClock.unavailable=true;worker.terminate();bedClock.worker=null;}
         }
     }
+    // A safety timeout ends a navigation slice, not the spawn-bed task.
+    // Keep the current-life anchor, inventory and actual confirmed obstacles.
+    // The next fresh snapshot may recover from a tab switch or knockback.
+    function retrySpawnBed(reason,now=performance.now()){
+        if(!bed.pending || !settings.autoSpawnBed || !player.alive ||
+            bed.socketEpoch!==session.connectionEpoch)return false;
+        stopBedMovement();
+        bed.phase='retry';
+        if(bed.locked)releaseBedInput(true);
+        bed.retryCount++;
+        bed.retryReason=reason;
+        bed.retryLayout=bed.origin?bedLayoutSignature(now):null;
+        bed.route=[];bed.routeAt=0;bed.waypoint=0;bed.moveTo=null;
+        bed.moveTries=0;bed.noRoute=0;bed.tries=0;bed.placementFailures=0;
+        bed.awaitFreshAt=now;
+        bed.nextAt=now+Math.min(BED_RETRY_MAX_MS,
+            BED_RETRY_MIN_MS*2**Math.min(5,bed.retryCount-1));
+        if(settings.returnAfterBed && deathReturn.target && deathReturn.phase==='waiting')
+            deathReturn.status='Cama: nova tentativa pendente';
+        return true;
+    }
     function abortSpawnBed(reason='Manual movement') {
         if (!bed.pending) return;
         stopBedMovement();
@@ -805,6 +829,8 @@
         bed.pending=false;
         bed.phase='cancelled';
         bed.abortReason=reason;
+        if(settings.returnAfterBed && deathReturn.target && deathReturn.phase==='waiting')
+            deathReturn.status='Retorno pausado: cama interrompida';
     }
     function resetSpawnBed() {
         stopBedMovement();
@@ -821,6 +847,7 @@
         bed.origin=null;bed.self=null;bed.sid=null;bed.nearby.clear();
         bed.stepAngle=null;bed.startedAt=0;bed.awaitFreshAt=0;
         bed.moveTries=0;bed.moveDirection='out';bed.abortReason='';
+        bed.retryCount=0;bed.retryReason='';bed.retryLayout=null;
         bed.route=[];bed.routeAt=0;bed.waypoint=0;bed.noRoute=0;bed.blocked=[];bed.localBlocked=[];
         bed.moveFeedbackAt=0;bed.moveLastPos=null;bed.clearance=BED_NAV_BODY;
         bed.moveFrom=null;bed.moveTo=null;bed.moveLimitMs=BED_MAX_MOVE_MS;
@@ -1651,6 +1678,12 @@
             return;
         }
         beginReturnIfReady(now);
+        if(deathReturn.phase==='waiting'){
+            if(!bed.confirmed && bed.phase==='retry')deathReturn.status='Retorno: aguardando nova tentativa da cama';
+            else if(!bed.confirmed && !bed.pending)deathReturn.status='Retorno pausado: cama não confirmada';
+            else if(!bed.confirmed && !bed.unlocked)deathReturn.status='Retorno: aguardando item cama';
+            return;
+        }
         if(!['moving','ready','arrived'].includes(deathReturn.phase))return;
         // Arrival is NOT terminal. Continue observing server-confirmed position
         // every snapshot, including when the page is hidden.
@@ -1891,10 +1924,10 @@
         }
         // Pre-anchor bed entities may arrive only once in incremental updates.
         if(bed.sid!==null)for(let i=1;i+18<packet.length;i+=19) {
-            if(packet[i]!==SPAWN_BED_ENTITY_TYPE ||
-               packet[i+1]!==bed.sid || (packet[i+8]&2))continue;
+            if(packet[i]!==SPAWN_BED_ENTITY_TYPE || packet[i+1]!==bed.sid)continue;
             const key=packet[i+1]+':'+packet[i]+':'+
                 (packet[i+2]|packet[i+3]<<8);
+            if(packet[i+8]&2){bed.earlyBeds.delete(key);continue;}
             bed.earlyBeds.set(key,{x:packet[i+4]|packet[i+5]<<8,
                 y:packet[i+6]|packet[i+7]<<8,at:now});
         }
@@ -1926,7 +1959,7 @@
             if (type===SPAWN_BED_ENTITY_TYPE && packet[i+1]===bed.sid &&
                 !bed.knownBedIds.has(key) &&
                 Math.hypot(x-bed.origin.x,y-bed.origin.y)<=BED_POSITION_TOLERANCE &&
-                bed.tries>0 && bed.lastAt>0 && now-bed.lastAt<10000) {
+                bed.lastAt>0) {
                 // Server confirmed the new bed: STOP immediately, even when
                 // moveOwned is already false. Release WASD before learning or
                 // writing to storage, which can take additional time.
@@ -2472,7 +2505,20 @@
         // Lock the manual controls as soon as valid navigation begins. This
         // prevents a player's input from repeatedly cancelling the pathfinder.
         if(bed.locked && now-bed.lockSince>=BED_MAX_TASK_MS) {
-            abortSpawnBed('Navigation safety timeout');return;
+            retrySpawnBed('Tempo limite de navegação',now);return;
+        }
+        if(bed.locked && (!bed.self || now-bed.self.at>BED_SNAPSHOT_TTL)){
+            retrySpawnBed('Aguardando posição atualizada',now);return;
+        }
+        if(bed.phase==='retry'){
+            if(bed.handoffMove || bed.moveKeys.size || now-bed.lastManualMoveAt<350 ||
+                !bedCanWork(now) || bed.self.at<=bed.awaitFreshAt)return;
+            const layout=bedLayoutSignature(now);
+            const changed=layout!==null && bed.retryLayout!==null && layout!==bed.retryLayout;
+            if(now<bed.nextAt && !changed)return;
+            if(changed){bed.localBlocked=[];bed.blocked=[];bed.retryCount=0;}
+            bed.phase='await-position';bed.nextAt=now;bed.retryReason='';
+            bed.awaitFreshAt=0;
         }
         // The player has regained movement. Keep the server-confirmation
         // window open briefly to learn the bed, but never steal WASD again.
@@ -2511,7 +2557,9 @@
                     at.at>bed.startedAt) {
                     bed.waypoint++;
                     if(bed.waypoint<bed.route.length) {
-                        driveBedWaypoint(now,bed.route[bed.waypoint]);return;
+                        if(!driveBedWaypoint(now,bed.route[bed.waypoint]))
+                            retrySpawnBed('Recalculando trecho interrompido',now);
+                        return;
                     }
                     stopBedMovement();bed.phase='await-position';
                     bed.route=[];bed.nextAt=now+1;bed.awaitFreshAt=now;return;
@@ -2529,14 +2577,12 @@
             (bed.awaitFreshAt && bed.self.at<=bed.awaitFreshAt))return;
         const objects=bedObstacles(now);
         if(!bedOriginFree(objects)) {
-            if(++bed.noRoute>=BED_NAV_MAX_NO_ROUTE)
-                abortSpawnBed('Bed center blocked by a structure');
-            else bed.nextAt=now+50;
+            retrySpawnBed('Centro da cama bloqueado',now);
             return;
         }
         if(!bedReadyToPlace(objects)) {
             if(bed.moveTries>=BED_NAV_MAX_LEGS) {
-                abortSpawnBed('Could not reach a bed placement point');return;
+                retrySpawnBed('Ponto de colocação ainda inacessível',now);return;
             }
             bedPromoteLayout(now);
             let route=null;
@@ -2548,9 +2594,7 @@
                 if(route?.length){bed.clearance=clearance;break;}
             }
             if(!route || !route.length) {
-                if(++bed.noRoute>=BED_NAV_MAX_NO_ROUTE)
-                    abortSpawnBed('No route; check wall collision / inventory');
-                else bed.nextAt=now+25;
+                retrySpawnBed('Nenhuma rota livre no momento',now);
                 return;
             }
             bed.noRoute=0;bed.route=route;bed.routeAt=now;bed.waypoint=0;
@@ -2576,14 +2620,14 @@
             // an invalid goal. Do not poison route memory during lag spikes.
             if(!bed.self || bed.self.at<=bed.lastAt) {
                 if(now-bed.lastAt<850){bed.nextAt=now+85;return;}
-                abortSpawnBed('No fresh server confirmation');return;
+                retrySpawnBed('Aguardando confirmação do servidor',now);return;
             }
             // Move to ANOTHER placement angle in the SAME respawn, instead of
             // retrying one impossible position on every future life.
             rememberBedPlacementFailure(bed.self);
             bed.placementFailures++;
             if(bed.placementFailures>=3) {
-                abortSpawnBed('Three rejected bed positions; learning saved');return;
+                retrySpawnBed('Posições rejeitadas; recalculando',now);return;
             }
             stopBedMovement();bed.tries=0;bed.phase='await-position';
             bed.route=[];bed.waypoint=0;bed.nextAt=now+12;
@@ -4540,6 +4584,7 @@
                 !bed.pending ? `Cama: ${bed.abortReason||'aguardando respawn'}` :
                 !bed.unlocked ? 'Cama: aguardando item no inventário' :
                 !bed.origin ? 'Cama: aguardando posição do spawn' :
+                bed.phase==='retry' ? `Cama: ${bed.retryReason} • tentativa ${bed.retryCount+1} • ${Math.ceil(Math.max(0,bed.nextAt-performance.now())/1000)}s` :
                 bed.phase==='await-heal' ? 'Cama: aguardando fim da cura (tentativa mantida)' :
                 bed.phase==='moving' ? (bed.usedLearned ?
                     'Cama: rota aprendida (WASD bloqueado)' :
@@ -5086,7 +5131,11 @@
         }
         tryAgeRecovery();
         if(autoRespawn.armed)tryAutoRespawn();
-        if(bed.pending)trySpawnBed();
+        if(bed.pending){
+            if(bed.locked && (!bed.self || now-bed.self.at>BED_SNAPSHOT_TTL))
+                retrySpawnBed('Retomando após suspensão',now);
+            trySpawnBed(now);
+        }
         retryUpgradeChoice();
         autoPick();
         evaluate();
@@ -5112,10 +5161,8 @@
     // Chromium can freeze hidden pages altogether. Release owned movement
     // before suspension; resume ONLY after new server snapshots arrive.
     document.addEventListener('freeze',()=>{
-        if(bed.moveOwned){
-            stopBedMovement();bed.phase='await-position';
-            bed.awaitFreshAt=performance.now();
-        }
+        if(bed.pending && (bed.moveOwned || bed.locked))
+            retrySpawnBed('Aba suspensa; retomada automática');
         if(deathReturn.moveOwned){
             stopReturnMovement();deathReturn.phase='ready';
             deathReturn.nextAt=performance.now();
