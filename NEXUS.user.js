@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.35
+// @version      1.8.36
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.35';
+    const NEXUS_VERSION = '1.8.36';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3344,6 +3344,8 @@
         upgrades.choices[upgrades.stage] = id;
         if (id===SPAWN_BED_ID) bed.unlocked=true;
         upgrades.stage++;
+        // An upgrade has been chosen: a Yes prompt no longer serves a purpose.
+        finishTargetNotice();
         upgrades.lastChoiceAt=performance.now();
         upgrades.lastChosenAge=upgrades.age;
         upgrades.consumed=true;
@@ -3515,23 +3517,32 @@
         watchAutoRespawnPlay();
         wakeAutoRespawn(35);
     }
-    // Event-driven player detection. The server decides which entities a client
-    // can see; there is no arbitrary 260-unit cutoff or render-frame polling.
-    // Each player is alerted once per encounter until absent for 10 seconds.
-    const TARGET_NOTICE_REARM_MS=10000;
-    const targetNotice={node:null,players:new Map(),prompted:new Set(),lastDebugAt:-Infinity};
+    // Player detection stays active, but a confirmation is useful only while
+    // Auto Pick is OFF and no upgrade has been selected in the current life.
+    // Display at most ONE prompt per life, not one per player encounter.
+    const TARGET_NOTICE_RETENTION_MS=10000;
+    const targetNotice={node:null,players:new Map(),shownThisLife:false,lastDebugAt:-Infinity};
+    function targetNoticeEligible() {
+        return player.alive && settings.notifyTargets && !settings.autoPick &&
+            !targetNotice.shownThisLife && upgrades.stage===0 &&
+            !upgrades.consumed && !upgrades.choices.some(validId);
+    }
+    function finishTargetNotice() {
+        targetNotice.shownThisLife=true;
+        hideTargetNotice();
+    }
     function hideTargetNotice() {
         if(targetNotice.node) targetNotice.node.remove();
         targetNotice.node=null;
     }
     function resetTargetNotice() {
         hideTargetNotice();
-        targetNotice.players.clear();targetNotice.prompted.clear();
+        targetNotice.players.clear();targetNotice.shownThisLife=false;
         targetNotice.lastDebugAt=-Infinity;
     }
     function showTargetNotice() {
-        if(!document.body || document.hidden || !player.alive || !connected() ||
-           !settings.notifyTargets || targetNotice.node) return false;
+        if(!document.body || document.hidden || !connected() ||
+           !targetNoticeEligible() || targetNotice.node) return false;
         const box=document.createElement('section');
         box.id='nx-target-notice';box.setAttribute('role','alert');
         box.style.cssText='position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:2147483647;'+
@@ -3544,9 +3555,7 @@
         headline.style.cssText='display:block;color:#83fff1;font-size:14px;margin-bottom:6px';
         const message=document.createElement('p');
         message.style.cssText='margin:0 0 10px;line-height:1.45';
-        message.textContent=settings.autoPick ?
-            'Outro jogador detectado. Auto Pick já está ativo. Manter?' :
-            'Outro jogador detectado. Ativar Auto Pick?';
+        message.textContent='Outro jogador detectado. Ativar Auto Pick?';
         const actions=document.createElement('div');
         actions.style.cssText='display:flex;gap:8px;';
         const yes=document.createElement('button');yes.type='button';yes.textContent='Yes';
@@ -3554,34 +3563,32 @@
         const no=document.createElement('button');no.type='button';no.textContent='Agora não';
         no.style.cssText='flex:1;background:#26394a;color:#eaffff;border:1px solid #526c77;border-radius:7px;padding:8px;cursor:pointer';
         yes.addEventListener('click',()=>{
-            hideTargetNotice();
+            finishTargetNotice();
             editSetting('autoPick',true);
             if(!selectedProfile) {
                 profileStatus='Auto Pick ativado — selecione um perfil de upgrades';
                 refreshProfiles();
             }
         });
-        no.addEventListener('click',hideTargetNotice);
+        no.addEventListener('click',finishTargetNotice);
         actions.append(yes,no);box.append(headline,message,actions);
         document.body.appendChild(box);targetNotice.node=box;
+        targetNotice.shownThisLife=true; // prevent another prompt until respawn
         return true;
     }
     function flushTargetNotice() {
-        if(targetNotice.node || document.hidden || !player.alive ||
-           !settings.notifyTargets) return;
+        if(targetNotice.node || document.hidden || !targetNoticeEligible()) return;
         const now=performance.now();
-        const fresh=[...targetNotice.players].filter(([id,t])=>
-            now-t<2500 && !targetNotice.prompted.has(id));
-        if(!fresh.length || !showTargetNotice())return;
-        // One prompt covers the players currently observed; dismissing it
-        // cannot generate an infinite sequence of notifications.
-        for(const [id,t] of targetNotice.players) if(now-t<2500)
-            targetNotice.prompted.add(id);
+        if([...targetNotice.players.values()].some(t=>now-t<2500))
+            showTargetNotice();
     }
     function observeTargetProximity(packet) {
-        if(!player.alive || !settings.notifyTargets) {
-            resetTargetNotice();return;
+        if(!player.alive) {resetTargetNotice();return;}
+        if(!settings.notifyTargets) {
+            hideTargetNotice();targetNotice.players.clear();return;
         }
+        if(settings.autoPick || upgrades.stage>0 || upgrades.choices.some(validId))
+            hideTargetNotice();
         if(!(packet instanceof Uint8Array) || (packet.length-1)%19!==0) return;
         const now=performance.now();
         for(let i=1;i+18<packet.length;i+=19) {
@@ -3595,16 +3602,11 @@
                     targetNotice.players.set(id,now-2501);
                 continue;
             }
-            const previousAt=targetNotice.players.get(id);
-            if(previousAt!==undefined && now-previousAt>TARGET_NOTICE_REARM_MS)
-                targetNotice.prompted.delete(id);
             targetNotice.players.set(id,now);
         }
         for(const [id,lastAt] of targetNotice.players) {
-            if(now-lastAt>TARGET_NOTICE_REARM_MS) {
+            if(now-lastAt>TARGET_NOTICE_RETENTION_MS)
                 targetNotice.players.delete(id);
-                targetNotice.prompted.delete(id);
-            }
         }
         // Update promptly on every server packet, never on an artificial timer.
         flushTargetNotice();
@@ -3905,6 +3907,7 @@
         }
         evaluate();
         if (key === 'autoPick') {
+            if (settings.autoPick) hideTargetNotice();
             if (!settings.autoPick) clearUpgradeRetry();
             else autoPick();
         }
@@ -4331,7 +4334,7 @@
           <div class="content" data-panel="profiles" hidden>
             <div class="section-intro"><span><strong>UPGRADE PROFILES</strong><small>Salve e reproduza seus upgrades</small></span></div>
             <label title="Automatically repeat the selected profile whenever its next item is offered">Auto Pick<input data-heal-setting="autoPick" type="checkbox"></label>
-            <label title="Mostra Yes assim que o servidor informar outro jogador, em qualquer parte da área recebida, sem exigir distância mínima.">Aviso de alvos<input data-heal-setting="notifyTargets" type="checkbox"></label>
+            <label title="Mostra Yes somente uma vez por vida, se Auto Pick estiver desligado e nenhum upgrade tiver sido escolhido.">Aviso de alvos<input data-heal-setting="notifyTargets" type="checkbox"></label>
             <div id="nx-target-debug" class="nx-info-line">Detecção de jogadores: aguardando dados</div>
             <select id="gpt-pick-profile" class="pick-input" aria-label="Saved profile"></select>
             <input id="gpt-pick-name" class="pick-input" maxlength="32" placeholder="Profile name" title="Choose items manually, then enter a name and save. Use the same name to replace a profile.">
