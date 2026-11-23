@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.39
+// @version      1.8.40
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.39';
+    const NEXUS_VERSION = '1.8.40';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -86,6 +86,7 @@
         autoRespawn: false,
         ageRecovery: true, // ONLY after a death observed in this live connection
         returnAfterBed: false,
+        returnSpin: true,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -831,6 +832,7 @@
     const RETURN_ARRIVED=20, RETURN_WAYPOINT=16;
     // A death inside this radius keeps the ORIGINAL destination, not the latest death.
     const RETURN_DEATH_RADIUS=120;
+    const RETURN_SPIN_PERIOD_MS=2000, RETURN_SPIN_INTERVAL_MS=50;
     // Return is sticky within a small tolerance. A real knockback should
     // restart navigation on its FIRST server-confirmed displacement, not after
     // multiple snapshots while opponents push the character farther away.
@@ -857,7 +859,7 @@
         catch (_) {}
     }
     const deathReturn={
-        target:null, lastSelf:null, aliveTrail:[], recorded:[],
+        target:null, lastSelf:null, aliveTrail:[], recorded:[], spinNextAt:0,
         nextAt:0, phase:'idle', epoch:0, socketEpoch:0, server:'',
         self:null, route:[], step:0, attempted:0,
         startedAt:0, moveAt:0, moveFrom:null, moveTo:null,
@@ -885,7 +887,7 @@
     function resetReturnForServer() {
         stopReturnMovement(false);
         deathReturn.epoch++;
-        deathReturn.target=null;deathReturn.lastSelf=null;
+        deathReturn.target=null;deathReturn.lastSelf=null;deathReturn.spinNextAt=0;
         deathReturn.aliveTrail=[];deathReturn.recorded=[];
         deathReturn.self=null;deathReturn.route=[];deathReturn.step=0;
         deathReturn.moveFrom=null;deathReturn.moveTo=null;
@@ -973,6 +975,7 @@
     function captureReturnDeath(now=performance.now()) {
         if(!player.alive)return; // duplicate death messages must not move the anchor
         const previousTarget=deathReturn.target;
+        deathReturn.spinNextAt=0;
         stopReturnMovement();
         deathReturn.epoch++;
         deathReturn.phase='idle';deathReturn.status='Aguardando cama';
@@ -1593,6 +1596,18 @@
         },deadline);
         return true;
     }
+    // Rotate the equipped weapon's aim only; never send movement or attack.
+    // Snapshot-driven and rate-limited, so hidden tabs do not queue catch-up bursts.
+    function driveReturnSpin(now=performance.now()){
+        if(!settings.returnSpin || deathReturn.phase!=='arrived' ||
+            !returnCanMove(now) || session.attacking || heal.phase!=='idle' ||
+            heal.foodSelected || (isEligible() && now>=heal.nextAt) ||
+            (settings.lagGuard && networkState(now)!=='OK'))return false;
+        if(now<deathReturn.spinNextAt)return true;
+        const angle=2*Math.PI*(now%RETURN_SPIN_PERIOD_MS)/RETURN_SPIN_PERIOD_MS;
+        deathReturn.spinNextAt=now+RETURN_SPIN_INTERVAL_MS;
+        return transmit([13,...apAngleBytes(angle)]);
+    }
     function driveReturn(now=performance.now()){
         if(!settings.returnAfterBed||!player.alive||
             deathReturn.socketEpoch!==session.connectionEpoch)return;
@@ -1616,7 +1631,8 @@
                 (recentHit && distance>RETURN_ARRIVED+4);
             if(!displaced){
                 deathReturn.driftSamples=0;
-                deathReturn.status='Fixado no local da morte';
+                deathReturn.status=driveReturnSpin(now) ?
+                    'Fixado no local da morte • Giro 360°' : 'Fixado no local da morte';
                 return;
             }
             // No extra snapshot required: server position itself confirms
@@ -1650,7 +1666,9 @@
             stopReturnMovement();deathReturn.phase='arrived';
             deathReturn.driftSamples=0;deathReturn.arrivals++;
             deathReturn.status='Fixado no local da morte';
-            saveSuccessfulReturn();return;
+            saveSuccessfulReturn();
+            if(driveReturnSpin(now))deathReturn.status='Fixado no local da morte • Giro 360°';
+            return;
         }
         if(deathReturn.phase==='moving'){
             const at=deathReturn.self,to=deathReturn.moveTo;
@@ -4498,6 +4516,7 @@
             <label title="Após morrer, tenta reequipar o último chapéu observado. O servidor precisa autorizar a compra/equipamento">Último Chapéu<input data-heal-setting="autoLastHat" type="checkbox"></label>
             <label title="Usa caminhos aprendidos por configuração das estruturas; descarta posições antigas quando troca de servidor.">Cama no Respawn<input data-heal-setting="autoSpawnBed" type="checkbox"></label>
             <label title="Após confirmar a cama, retorna ao ponto original da morte. Mortes dentro do raio de 120 unidades mantêm esse ponto; fora dele criam um novo. Requer Cama no Respawn.">Fixar no Local da Morte<input data-heal-setting="returnAfterBed" type="checkbox"></label>
+            <label title="Gira a mira em 360° com a arma selecionada após chegar ao ponto da morte. Uma volta a cada 2 segundos; não ataca automaticamente. Pausa durante cura, movimento manual e uso de itens.">Giro 360° no retorno<input data-heal-setting="returnSpin" type="checkbox"></label>
             <div class="nx-info-line" id="nx-bed-status">Cama: aguardando respawn</div>
             <div class="nx-info-line" id="nx-return-status">Retorno: aguardando morte</div>
             <div class="pick-actions" style="margin-top:8px">
