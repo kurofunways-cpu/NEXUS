@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.47
+// @version      1.8.48
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.47';
+    const NEXUS_VERSION = '1.8.48';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -90,6 +90,7 @@
         spinDegreesPerSecond: 180,
         goofyNames: false,
         smartNames: false,
+        deathChat: true,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -3802,6 +3803,46 @@
         menu.querySelector('#gpt-pick-save').disabled = !count;
         menu.querySelector('#gpt-pick-delete').disabled = !profile;
     }
+    // FUN: count confirmed deaths in this tab, and announce after respawn.
+    // Chat opcode 7 carries UTF-8 bytes; never queue repeated announcements.
+    const DEATH_COUNT_KEY=PREFIX+'death_count_v1';
+    const DEATH_CHAT_GAP=3000;
+    const deathChat={total:0,pending:false,readyAt:0,lastAt:-Infinity,epoch:-1};
+    try{
+        const count=Number(sessionStorage.getItem(DEATH_COUNT_KEY));
+        if(Number.isSafeInteger(count)&&count>=0)deathChat.total=count;
+    }catch(_){}
+    function saveDeathCount(){
+        try{sessionStorage.setItem(DEATH_COUNT_KEY,String(deathChat.total));}catch(_){}
+    }
+    function countDeath(){
+        if(!player.alive)return false;
+        deathChat.total=Math.min(Number.MAX_SAFE_INTEGER,deathChat.total+1);
+        saveDeathCount();
+        deathChat.pending=!!settings.deathChat;
+        deathChat.epoch=session.connectionEpoch;
+        deathChat.readyAt=Infinity;
+        return true;
+    }
+    function armDeathChat(now=performance.now()){
+        if(deathChat.pending && deathChat.epoch===session.connectionEpoch)
+            deathChat.readyAt=now+250;
+    }
+    function announceDeathCount(now=performance.now()){
+        if(!settings.deathChat || !deathChat.pending || !player.alive ||
+            !connected() || deathChat.epoch!==session.connectionEpoch ||
+            now<deathChat.readyAt || now-deathChat.lastAt<DEATH_CHAT_GAP ||
+            !session.self || now-session.self.at>RETURN_SNAPSHOT_TTL ||
+            session.ws.bufferedAmount>=1024)return false;
+        // Only one successful send per pending count. Fast deaths coalesce.
+        const message='Deaths: '+deathChat.total;
+        if(!transmit([7,...new TextEncoder().encode(message)]))return false;
+        deathChat.pending=false;deathChat.lastAt=now;
+        return true;
+    }
+    function resetDeathCount(){
+        deathChat.total=0;deathChat.pending=false;saveDeathCount();
+    }
     // FUN: change the nickname once per observed death, before native Play.
     const GOOFY_NAMES=Object.freeze([
         'Jimothy','Tung Tung','Tralalero','Cappuccino','Brr Patapim',
@@ -4184,6 +4225,7 @@
             player.id = Number(packet[1]);
             player.alive = Number.isInteger(player.id) && player.id >= 0;
             player.health = 100;
+            if(player.alive)armDeathChat();
             resetRespawnHat();
             armAgeRecoverySpawn();
             resetSpawnBed();
@@ -4195,6 +4237,7 @@
             if (pending && performance.now()-pending.at<=PRESPAWN_OFFER_MS) receiveOffer(pending.ids);
             updateHealth();
         } else if (id === 19) { // death
+            countDeath();
             if(player.alive){
                 captureSmartDeath();
                 if(goofy.applied!==null)restoreGoofyNickname(false);
@@ -4304,11 +4347,12 @@
             const now=performance.now();
             if (observeAutoPlace(packet,now)) runAutoPlace(now);
         }
-        if(player.alive)driveSpin();
+        if(player.alive){driveSpin();announceDeathCount();}
     }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
+        deathChat.pending=false;deathChat.readyAt=0;
         resetSmartLife(true);
         goofy.pending=false;
         if(goofy.applied!==null)restoreGoofyNickname(!settings.goofyNames);
@@ -4512,6 +4556,7 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
+        if(key==='deathChat' && !settings.deathChat)deathChat.pending=false;
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
             resetSpin();
@@ -4577,6 +4622,8 @@
     }
     function refreshInputs() {
         if (!menu) return;
+        const countStatus=menu.querySelector('#nx-death-count');
+        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total;
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
         if(ageStatus)ageStatus.textContent='Age: '+(settings.ageRecovery ? ageRecovery.status : 'desativado');
         const bedStatus=menu.querySelector('#nx-bed-status');
@@ -4887,6 +4934,9 @@
             <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
             <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
+            <label title="Anuncia o total de mortes no chat após renascer, com intervalo mínimo de 3 segundos. Contagem por aba.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-death-count">Mortes: 0</div>
+            <button type="button" id="nx-death-reset" title="Zera apenas o contador de mortes desta aba">Zerar mortes</button>
           </div>
           <div class="content" data-panel="macros" hidden>
             <div class="section-intro"><span><strong>MANUAL MACROS</strong><small>F / V · controles e velocidade</small></span></div>
@@ -4961,6 +5011,7 @@
             for (const panel of menu.querySelectorAll('[data-panel]')) panel.hidden = panel.dataset.panel !== button.dataset.tab;
             for (const tab of menu.querySelectorAll('[data-tab]')) tab.setAttribute('aria-selected', String(tab === button));
         });
+        menu.querySelector('#nx-death-reset').addEventListener('click',()=>{resetDeathCount();refreshInputs();});
         menu.querySelector('#nx-bed-cancel').addEventListener('click',()=>{
             if(bed.pending)abortSpawnBed('Parada manual pelo HUD');
             refreshInputs();
@@ -5176,7 +5227,10 @@
     setInterval(()=>{if(player.alive && (heal.foodSelected || heal.restore)){
         if(!recoverStuckHeal())watchHealRestore();
     }},100);
-    setInterval(()=>{if(goofy.original!==null || settings.goofyNames)syncGoofyNickname();},500);
+    setInterval(()=>{
+        if(goofy.original!==null || settings.goofyNames)syncGoofyNickname();
+        if(deathChat.pending)announceDeathCount();
+    },500);
     function spinFrame(){
         if(!document.hidden && settings.returnSpin && player.alive)driveSpin();
         requestAnimationFrame(spinFrame);
