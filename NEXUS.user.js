@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.40
+// @version      1.8.41
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.40';
+    const NEXUS_VERSION = '1.8.41';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -86,7 +86,8 @@
         autoRespawn: false,
         ageRecovery: true, // ONLY after a death observed in this live connection
         returnAfterBed: false,
-        returnSpin: true,
+        returnSpin: true, // legacy key retained for existing tab preferences
+        spinDegreesPerSecond: 180,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -100,6 +101,11 @@
         holdMaxMs: 100,
     });
     const limits = value => Math.max(1, Math.min(1000, Math.round(Number(value) || 1)));
+    function numericSetting(key,value){
+        if(key!=='spinDegreesPerSecond')return limits(value);
+        const n=Number(value);
+        return Number.isFinite(n)&&n>0 ? n : DEFAULTS.spinDegreesPerSecond;
+    }
     // Shared settings use localStorage. Explicit per-tab overrides use
     // sessionStorage: they survive a reload of this tab but do not broadcast
     // changes to other tabs. A duplicated tab starts with a snapshot and then
@@ -110,7 +116,7 @@
         let saved = null;
         try { saved = localStorage.getItem(PREFIX + key); } catch (_) {}
         return saved === null ? fallback :
-            (typeof fallback === 'boolean' ? saved === 'true' : limits(saved));
+            (typeof fallback === 'boolean' ? saved === 'true' : numericSetting(key,saved));
     }
     function saveTabOverrides() {
         try { sessionStorage.setItem(TAB_LOCAL_KEY, JSON.stringify(tabOverrides)); } catch (_) {}
@@ -126,7 +132,7 @@
                 if (typeof fallback==='boolean' && typeof value==='boolean')
                     tabOverrides[key]=value;
                 else if (typeof fallback==='number' && typeof value==='number' && Number.isFinite(value))
-                    tabOverrides[key]=limits(value);
+                    tabOverrides[key]=numericSetting(key,value);
             }
         }
     } catch (_) {}
@@ -832,7 +838,8 @@
     const RETURN_ARRIVED=20, RETURN_WAYPOINT=16;
     // A death inside this radius keeps the ORIGINAL destination, not the latest death.
     const RETURN_DEATH_RADIUS=120;
-    const RETURN_SPIN_PERIOD_MS=2000, RETURN_SPIN_INTERVAL_MS=50;
+    const SPIN_INTERVAL_MS=25;
+    const spin={nextAt:0,lastAt:null,angle:0};
     // Return is sticky within a small tolerance. A real knockback should
     // restart navigation on its FIRST server-confirmed displacement, not after
     // multiple snapshots while opponents push the character farther away.
@@ -859,7 +866,7 @@
         catch (_) {}
     }
     const deathReturn={
-        target:null, lastSelf:null, aliveTrail:[], recorded:[], spinNextAt:0,
+        target:null, lastSelf:null, aliveTrail:[], recorded:[],
         nextAt:0, phase:'idle', epoch:0, socketEpoch:0, server:'',
         self:null, route:[], step:0, attempted:0,
         startedAt:0, moveAt:0, moveFrom:null, moveTo:null,
@@ -887,7 +894,7 @@
     function resetReturnForServer() {
         stopReturnMovement(false);
         deathReturn.epoch++;
-        deathReturn.target=null;deathReturn.lastSelf=null;deathReturn.spinNextAt=0;
+        deathReturn.target=null;deathReturn.lastSelf=null;
         deathReturn.aliveTrail=[];deathReturn.recorded=[];
         deathReturn.self=null;deathReturn.route=[];deathReturn.step=0;
         deathReturn.moveFrom=null;deathReturn.moveTo=null;
@@ -975,7 +982,6 @@
     function captureReturnDeath(now=performance.now()) {
         if(!player.alive)return; // duplicate death messages must not move the anchor
         const previousTarget=deathReturn.target;
-        deathReturn.spinNextAt=0;
         stopReturnMovement();
         deathReturn.epoch++;
         deathReturn.phase='idle';deathReturn.status='Aguardando cama';
@@ -1596,17 +1602,29 @@
         },deadline);
         return true;
     }
-    // Rotate the equipped weapon's aim only; never send movement or attack.
-    // Snapshot-driven and rate-limited, so hidden tabs do not queue catch-up bursts.
-    function driveReturnSpin(now=performance.now()){
-        if(!settings.returnSpin || deathReturn.phase!=='arrived' ||
-            !returnCanMove(now) || session.attacking || heal.phase!=='idle' ||
-            heal.foodSelected || (isEligible() && now>=heal.nextAt) ||
-            (settings.lagGuard && networkState(now)!=='OK'))return false;
-        if(now<deathReturn.spinNextAt)return true;
-        const angle=2*Math.PI*(now%RETURN_SPIN_PERIOD_MS)/RETURN_SPIN_PERIOD_MS;
-        deathReturn.spinNextAt=now+RETURN_SPIN_INTERVAL_MS;
-        return transmit([13,...apAngleBytes(angle)]);
+    // Independent Fun feature: only aim packets, no attack or movement.
+    // The setting controls angular speed, not packet frequency. No catch-up bursts.
+    function resetSpin(){
+        spin.nextAt=0;spin.lastAt=null;spin.angle=0;
+    }
+    function driveSpin(now=performance.now()){
+        if(!settings.returnSpin || !player.alive || !connected() ||
+            !session.self || now-session.self.at>RETURN_SNAPSHOT_TTL ||
+            bed.pending || bed.locked || ageRecovery.pending ||
+            heal.phase!=='idle' || heal.foodSelected ||
+            (isEligible() && now>=heal.nextAt) ||
+            macro.selected || Object.keys(macroDefs).some(macroActive) ||
+            ap.manualItem || now<ap.manualUntil ||
+            session.ws.bufferedAmount>=2048 ||
+            (settings.lagGuard && networkState(now)!=='OK')){
+            spin.lastAt=null;spin.nextAt=0;return false;
+        }
+        if(now<spin.nextAt)return true;
+        const elapsed=spin.lastAt===null?0:Math.max(0,Math.min(250,now-spin.lastAt));
+        // Divide before multiplying to avoid overflow at very large finite speeds.
+        spin.angle=(spin.angle+((settings.spinDegreesPerSecond/1000)*elapsed)%360)%360;
+        spin.lastAt=now;spin.nextAt=now+SPIN_INTERVAL_MS;
+        return transmit([13,...apAngleBytes(spin.angle*Math.PI/180)]);
     }
     function driveReturn(now=performance.now()){
         if(!settings.returnAfterBed||!player.alive||
@@ -1631,8 +1649,7 @@
                 (recentHit && distance>RETURN_ARRIVED+4);
             if(!displaced){
                 deathReturn.driftSamples=0;
-                deathReturn.status=driveReturnSpin(now) ?
-                    'Fixado no local da morte • Giro 360°' : 'Fixado no local da morte';
+                deathReturn.status='Fixado no local da morte';
                 return;
             }
             // No extra snapshot required: server position itself confirms
@@ -1666,9 +1683,7 @@
             stopReturnMovement();deathReturn.phase='arrived';
             deathReturn.driftSamples=0;deathReturn.arrivals++;
             deathReturn.status='Fixado no local da morte';
-            saveSuccessfulReturn();
-            if(driveReturnSpin(now))deathReturn.status='Fixado no local da morte • Giro 360°';
-            return;
+            saveSuccessfulReturn();return;
         }
         if(deathReturn.phase==='moving'){
             const at=deathReturn.self,to=deathReturn.moveTo;
@@ -2577,6 +2592,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
+        resetSpin();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -3978,6 +3994,7 @@
             const now=performance.now();
             if (observeAutoPlace(packet,now)) runAutoPlace(now);
         }
+        if(player.alive)driveSpin();
     }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
@@ -4102,7 +4119,7 @@
     }
     function editSetting(key, value, external=false) {
         if (!Object.hasOwn(DEFAULTS,key)) return;
-        settings[key] = typeof DEFAULTS[key] === 'boolean' ? Boolean(value) : limits(value);
+        settings[key] = typeof DEFAULTS[key] === 'boolean' ? Boolean(value) : numericSetting(key,value);
         // Legit Heal runs on an independent fixed 1-ms schedule; the stored
         // normal Heal ms is not modified when switching modes.
         if (key==='autoPlaceMs') { settings[key]=Math.max(1,settings[key]); ap.nextAt=0; }
@@ -4171,6 +4188,7 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
+        if(key==='returnSpin' || key==='spinDegreesPerSecond')resetSpin();
         if(key==='returnAfterBed') {
             if(!settings.returnAfterBed)cancelReturn('Retorno desativado');
             else if(!settings.autoSpawnBed)deathReturn.status='Ative Cama no Respawn';
@@ -4497,6 +4515,7 @@
             <button type="button" data-tab="profiles" aria-selected="false">Perfis</button>
             <button type="button" data-tab="network" aria-selected="false">Rede</button>
             <button type="button" data-tab="hud" aria-selected="false">HUD</button>
+            <button type="button" data-tab="fun" aria-selected="false">Fun</button>
           </div>
           <div class="content" data-panel="heal">
             <div class="section-intro"><span><strong>RECOVERY</strong><small>Heal e consumo de comida</small></span>
@@ -4516,7 +4535,6 @@
             <label title="Após morrer, tenta reequipar o último chapéu observado. O servidor precisa autorizar a compra/equipamento">Último Chapéu<input data-heal-setting="autoLastHat" type="checkbox"></label>
             <label title="Usa caminhos aprendidos por configuração das estruturas; descarta posições antigas quando troca de servidor.">Cama no Respawn<input data-heal-setting="autoSpawnBed" type="checkbox"></label>
             <label title="Após confirmar a cama, retorna ao ponto original da morte. Mortes dentro do raio de 120 unidades mantêm esse ponto; fora dele criam um novo. Requer Cama no Respawn.">Fixar no Local da Morte<input data-heal-setting="returnAfterBed" type="checkbox"></label>
-            <label title="Gira a mira em 360° com a arma selecionada após chegar ao ponto da morte. Uma volta a cada 2 segundos; não ataca automaticamente. Pausa durante cura, movimento manual e uso de itens.">Giro 360° no retorno<input data-heal-setting="returnSpin" type="checkbox"></label>
             <div class="nx-info-line" id="nx-bed-status">Cama: aguardando respawn</div>
             <div class="nx-info-line" id="nx-return-status">Retorno: aguardando morte</div>
             <div class="pick-actions" style="margin-top:8px">
@@ -4527,6 +4545,12 @@
               <button type="button" id="nx-return-stop" title="Desativa a vigilância do ponto de morte e libera o movimento">Desativar retorno</button>
               <button type="button" id="nx-return-clear" title="Apaga rotas de retorno aprendidas e mantém a opção">Limpar retornos</button>
             </div>
+          </div>
+          <div class="content" data-panel="fun" hidden>
+            <div class="section-intro"><span><strong>FUN</strong><small>Rotação da arma</small></span></div>
+            <label title="Giro contínuo da mira em qualquer local, mesmo sem retorno ou cama. Pausa apenas para proteger cura e seleção de itens; não inicia ataques.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
+            <label title="Velocidade angular em graus por segundo, sem máximo configurado. 360 = uma volta por segundo.">Velocidade 360°/s<input data-heal-setting="spinDegreesPerSecond" type="number" min="0" step="any"></label>
+            <div class="nx-info-line">360 = 1 volta/s • 720 = 2 voltas/s</div>
           </div>
           <div class="content" data-panel="macros" hidden>
             <div class="section-intro"><span><strong>MANUAL MACROS</strong><small>F / V · controles e velocidade</small></span></div>
@@ -4810,6 +4834,7 @@
         }
     });
     document.addEventListener('resume',resumeAutomationsAfterSleep);
+    setInterval(()=>{if(settings.returnSpin && player.alive)driveSpin();},SPIN_INTERVAL_MS);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
     else mount();
 })();
