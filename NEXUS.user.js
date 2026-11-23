@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.42
+// @version      1.8.43
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.42';
+    const NEXUS_VERSION = '1.8.43';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -88,6 +88,7 @@
         returnAfterBed: false,
         returnSpin: true, // legacy key retained for existing tab preferences
         spinDegreesPerSecond: 180,
+        goofyNames: false,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -3679,6 +3680,110 @@
         menu.querySelector('#gpt-pick-save').disabled = !count;
         menu.querySelector('#gpt-pick-delete').disabled = !profile;
     }
+    // FUN: change the nickname once per observed death, before native Play.
+    const GOOFY_NAMES=Object.freeze([
+        'Jimothy','Tung Tung','Tralalero','Cappuccino','Brr Patapim',
+        'Bombardino','Chimpanzini','Lirili Larila','Bananini','Crocodilo',
+        '67 Goblin','41 Nugget','Aura Farmer','Chill Guy','Train Dog',
+        'Chicken Jockey','Skibidi CEO','Ohio NPC','Sigma Potato','Rizz Goblin',
+        'Mewing Fish','Unc 3000','Goofy Ahh','Lil Microwave','Toaster 67',
+        'Lag Goblin','WiFi Potato','Bed CEO','Respawn NPC','Spiky Nugget',
+        'Moltbot','Brdyshch','Petrovich','Syomga','Blox Banana',
+        'Dr Nugget','Bread Lord','Silly Goose','Bonk CEO','Mr Waffles',
+        'Bing Bong','Rizzasaurus','Soggy Toast','Aura Minus','No Brain',
+        'Potato 67','Lil Pickle','Meme Goblin','Bob the Blob','Goofy Bean'
+    ]);
+    const GOOFY_BACKUP_KEY=PREFIX+'goofy_nickname_backup_v1';
+    const goofy={original:null,applied:null,last:null,pending:false};
+    try{
+        const saved=JSON.parse(sessionStorage.getItem(GOOFY_BACKUP_KEY)||'null');
+        if(saved && typeof saved.original==='string'){
+            goofy.original=saved.original;
+            goofy.applied=typeof saved.applied==='string'?saved.applied:null;
+            goofy.last=typeof saved.last==='string'?saved.last:null;
+        }
+    }catch(_){}
+    function saveGoofyBackup(){
+        try{
+            if(goofy.original===null)sessionStorage.removeItem(GOOFY_BACKUP_KEY);
+            else sessionStorage.setItem(GOOFY_BACKUP_KEY,JSON.stringify({
+                original:goofy.original,applied:goofy.applied,last:goofy.last
+            }));
+        }catch(_){}
+    }
+    function nicknameInput(){
+        const el=document.getElementById('nickname');
+        return el && typeof el.value==='string' ? el:null;
+    }
+    function setGameNickname(el,value){
+        if(el.value===value)return;
+        el.value=value;
+        el.dispatchEvent(new Event('input',{bubbles:true}));
+        el.dispatchEvent(new Event('change',{bubbles:true}));
+    }
+    function rememberOriginalNickname(){
+        if(goofy.original!==null)return true;
+        const el=nicknameInput();
+        if(!el)return false;
+        goofy.original=el.value;
+        saveGoofyBackup();return true;
+    }
+    function chooseGoofyNickname(maxLength,random=Math.random){
+        const cap=Number.isInteger(maxLength)&&maxLength>0?maxLength:16;
+        const choices=[...new Set(GOOFY_NAMES.map(n=>n.slice(0,cap)))].filter(n=>
+            n!==goofy.last && n!==goofy.original);
+        if(!choices.length)return null;
+        return choices[Math.min(choices.length-1,Math.floor(random()*choices.length))];
+    }
+    function prepareGoofyNickname(){
+        if(!settings.goofyNames || player.alive || !goofy.pending)return false;
+        const el=nicknameInput();
+        if(!el || el.disabled || !rememberOriginalNickname())return false;
+        if(goofy.applied===null){
+            goofy.applied=chooseGoofyNickname(el.maxLength);
+            if(goofy.applied===null)return false;
+            goofy.last=goofy.applied;
+            saveGoofyBackup();
+        }
+        setGameNickname(el,goofy.applied);return true;
+    }
+    function restoreGoofyNickname(disable=false){
+        if(disable)goofy.pending=false;
+        if(goofy.original===null)return true;
+        const el=nicknameInput();
+        if(!el)return false;
+        const generated=goofy.applied;
+        // Restore only this tab's menu and our own persisted temporary value.
+        setGameNickname(el,goofy.original);
+        try{
+            if(generated!==null && localStorage.getItem('nickname')===generated)
+                localStorage.setItem('nickname',goofy.original);
+        }catch(_){}
+        goofy.applied=null;
+        if(disable){goofy.original=null;goofy.last=null;}
+        saveGoofyBackup();return true;
+    }
+    function finishGoofySpawn(){
+        goofy.pending=false;
+        if(goofy.applied!==null)
+            setTimeout(()=>{if(!goofy.pending)restoreGoofyNickname(!settings.goofyNames);},0);
+    }
+    function syncGoofyNickname(){
+        if(!settings.goofyNames){
+            if(goofy.original!==null)restoreGoofyNickname(true);
+        }else if(goofy.applied!==null && !goofy.pending){
+            restoreGoofyNickname(false);
+        }else rememberOriginalNickname();
+    }
+    window.addEventListener('click',event=>{
+        if(event.target?.closest?.('#play'))prepareGoofyNickname();
+    },true);
+    window.addEventListener('keydown',event=>{
+        if(event.key==='Enter' && !event.repeat && playAvailable(document.querySelector('#play')) &&
+            (event.target===nicknameInput() || !event.target?.closest?.('input,textarea,select,button,[contenteditable]')))
+            prepareGoofyNickname();
+    },true);
+    window.addEventListener('load',syncGoofyNickname,{once:true});
     // AUTO SPAWN: use the game's own Play button after a confirmed death.
     // No synthetic login packets, and no clicks while alive. A bounded retry
     // tolerates the delay between the death packet and the native menu opening.
@@ -3746,7 +3851,7 @@
         if(now-autoRespawn.lastClickAt>=850){
             const play=document.querySelector('#play');
             if(playAvailable(play)){
-                try{play.click();autoRespawn.attempts++;autoRespawn.lastClickAt=now;}
+                try{prepareGoofyNickname();play.click();autoRespawn.attempts++;autoRespawn.lastClickAt=now;}
                 catch(_){}
             }
         }
@@ -3878,6 +3983,7 @@
         const id = Number(packet[0]);
         let ownSnapshotProcessed=false;
         if (id === 35) { // spawn
+            finishGoofySpawn();
             resetTargetNotice();
             stopAutoRespawn();
             // Some fast respawns can skip the death message entirely. Preserve
@@ -3906,6 +4012,10 @@
             if (pending && performance.now()-pending.at<=PRESPAWN_OFFER_MS) receiveOffer(pending.ids);
             updateHealth();
         } else if (id === 19) { // death
+            if(player.alive){
+                if(goofy.applied!==null)restoreGoofyNickname(false);
+                goofy.pending=true;
+            }
             resetTargetNotice();
             noteAgeRecoveryDeath();
             captureReturnDeath();
@@ -4013,6 +4123,8 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
+        goofy.pending=false;
+        if(goofy.applied!==null)restoreGoofyNickname(!settings.goofyNames);
         resetTargetNotice();
         clearAgeRecovery('Sem morte nesta conexão');
         stopAutoRespawn();
@@ -4211,6 +4323,7 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
+        if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
             resetSpin();
             if(!settings.returnSpin && player.alive && connected() &&
@@ -4576,10 +4689,11 @@
             </div>
           </div>
           <div class="content" data-panel="fun" hidden>
-            <div class="section-intro"><span><strong>FUN</strong><small>Rotação de qualquer item</small></span></div>
+            <div class="section-intro"><span><strong>FUN</strong><small>Rotação e nomes engraçados</small></span></div>
             <label title="Giro contínuo e fluido com qualquer item na mão, mesmo sem retorno ou cama. Não inicia ataques; pausa apenas durante ações automáticas incompatíveis.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
             <label title="Velocidade angular em graus por segundo, sem máximo configurado. 360 = uma volta por segundo.">Velocidade 360°/s<input data-heal-setting="spinDegreesPerSecond" type="number" min="0" step="any"></label>
             <div class="nx-info-line">360 = 1 volta/s • 720 = 2 voltas/s</div>
+            <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
           </div>
           <div class="content" data-panel="macros" hidden>
             <div class="section-intro"><span><strong>MANUAL MACROS</strong><small>F / V · controles e velocidade</small></span></div>
@@ -4863,6 +4977,7 @@
         }
     });
     document.addEventListener('resume',resumeAutomationsAfterSleep);
+    setInterval(()=>{if(goofy.original!==null || settings.goofyNames)syncGoofyNickname();},500);
     function spinFrame(){
         if(!document.hidden && settings.returnSpin && player.alive)driveSpin();
         requestAnimationFrame(spinFrame);
