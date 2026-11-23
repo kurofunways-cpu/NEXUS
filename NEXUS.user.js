@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.50
+// @version      1.8.51
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.50';
+    const NEXUS_VERSION = '1.8.51';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3933,11 +3933,12 @@
         if(!settings.returnSpin && aim)transmit([13,...aim]);
         return true;
     }
-    // FUN: count confirmed deaths in this tab, and announce after respawn.
-    // Chat opcode 7 carries UTF-8 bytes; never queue repeated announcements.
+    // FUN: publish the confirmed death total via the actual game chat.
+    // Outbound 7 + UTF-8; inbound entity chat 30 + uint16 id + UTF-8.
     const DEATH_COUNT_KEY=PREFIX+'death_count_v1';
-    const DEATH_CHAT_GAP=3000;
-    const deathChat={total:0,pending:false,readyAt:0,lastAt:-Infinity,epoch:-1};
+    const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=1000;
+    const deathChat={total:0,pending:false,readyAt:Infinity,lastAt:-Infinity,epoch:-1,
+        echo:null,status:'Aguardando morte'};
     try{
         const count=Number(sessionStorage.getItem(DEATH_COUNT_KEY));
         if(Number.isSafeInteger(count)&&count>=0)deathChat.total=count;
@@ -3951,27 +3952,53 @@
         saveDeathCount();
         deathChat.pending=!!settings.deathChat;
         deathChat.epoch=session.connectionEpoch;
-        deathChat.readyAt=Infinity;
+        deathChat.readyAt=Infinity;deathChat.echo=null;
+        deathChat.status='Aguardando respawn';
         return true;
     }
     function armDeathChat(now=performance.now()){
-        if(deathChat.pending && deathChat.epoch===session.connectionEpoch)
-            deathChat.readyAt=now+250;
+        if(!deathChat.pending || !settings.deathChat)return;
+        // Respawn can reconnect the socket. Rebind only on a confirmed spawn,
+        // never while the new connection has no player.
+        deathChat.epoch=session.connectionEpoch;
+        deathChat.readyAt=now+DEATH_CHAT_SPAWN_DELAY;
+        deathChat.status='Aguardando entrada no jogo';
+    }
+    function observeDeathChatEcho(packet,now=performance.now()){
+        const e=deathChat.echo;
+        if(!e || !player.alive || e.epoch!==session.connectionEpoch ||
+            now-e.at>5000 || !(packet instanceof Uint8Array) || packet.length<4 ||
+            packet[0]!==30)return false;
+        const id=packet[1]|packet[2]<<8;
+        if(id!==e.playerId)return false;
+        if(new TextDecoder().decode(packet.subarray(3))!==e.message)return false;
+        deathChat.echo=null;deathChat.status='Confirmado pelo servidor: '+e.message;
+        return true;
     }
     function announceDeathCount(now=performance.now()){
+        if(deathChat.echo && now-deathChat.echo.at>5000){
+            deathChat.echo=null;deathChat.status='Enviado ao jogo; sem confirmação';
+        }
         if(!settings.deathChat || !deathChat.pending || !player.alive ||
             !connected() || deathChat.epoch!==session.connectionEpoch ||
             now<deathChat.readyAt || now-deathChat.lastAt<DEATH_CHAT_GAP ||
             !session.self || now-session.self.at>RETURN_SNAPSHOT_TTL ||
             session.ws.bufferedAmount>=1024)return false;
-        // Only one successful send per pending count. Fast deaths coalesce.
         const message='Deaths: '+deathChat.total;
+        // Never simulate a chat bubble or count a local HUD update as delivery.
         if(!transmit([7,...new TextEncoder().encode(message)]))return false;
         deathChat.pending=false;deathChat.lastAt=now;
+        deathChat.echo={message,at:now,epoch:session.connectionEpoch,playerId:player.id};
+        deathChat.status='Enviado ao jogo; aguardando confirmação';
         return true;
     }
+    function resetDeathChatConnection(){
+        deathChat.readyAt=Infinity;deathChat.epoch=-1;deathChat.echo=null;
+        if(deathChat.pending)deathChat.status='Aguardando respawn';
+    }
     function resetDeathCount(){
-        deathChat.total=0;deathChat.pending=false;saveDeathCount();
+        deathChat.total=0;deathChat.pending=false;deathChat.echo=null;
+        deathChat.status='Aguardando morte';saveDeathCount();
     }
     // FUN: change the nickname once per observed death, before native Play.
     const GOOFY_NAMES=Object.freeze([
@@ -4334,6 +4361,7 @@
         }
         if (!packet || !packet.length) return;
         const id = Number(packet[0]);
+        if(id===30)observeDeathChatEcho(packet);
         let ownSnapshotProcessed=false;
         if (id === 35) { // spawn
             finishGoofySpawn();
@@ -4484,7 +4512,7 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
-        deathChat.pending=false;deathChat.readyAt=0;
+        resetDeathChatConnection();
         resetSmartLife(true);
         goofy.pending=false;
         if(goofy.applied!==null)restoreGoofyNickname(!settings.goofyNames);
@@ -4599,6 +4627,7 @@
             }
         }
         const result = originalSend.apply(this, arguments);
+        if(this===session.ws && raw && raw[0]===7)deathChat.lastAt=performance.now();
         // Record a native choice only after the original send succeeds.
         if (this === session.ws && raw && raw.length === 2) {
             if (raw[0] === 14) { clearUpgradeRetry(); recordChoice(raw[1]); }
@@ -4695,7 +4724,7 @@
                 hat.pending=true;hat.tries=0;hat.nextAt=0;tryRestoreHat();
             }
         }
-        if(key==='deathChat' && !settings.deathChat)deathChat.pending=false;
+        if(key==='deathChat' && !settings.deathChat){deathChat.pending=false;deathChat.echo=null;deathChat.status='Desativado';}
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
             resetSpin();
@@ -4766,7 +4795,7 @@
         const counterStatus=menu.querySelector('#nx-counter-status');
         if(counterStatus)counterStatus.textContent='Contra-ataque: '+(settings.counterAttack?counter.status:'desativado');
         const countStatus=menu.querySelector('#nx-death-count');
-        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total;
+        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
         if(ageStatus)ageStatus.textContent='Age: '+(settings.ageRecovery ? ageRecovery.status : 'desativado');
         const bedStatus=menu.querySelector('#nx-bed-status');
@@ -5077,7 +5106,7 @@
             <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
             <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
-            <label title="Anuncia o total de mortes no chat após renascer, com intervalo mínimo de 3 segundos. Contagem por aba.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
+            <label title="Envia o total de mortes ao chat real do jogo após renascer, com intervalo mínimo de 3 segundos. HUD mostra apenas o contador e o estado do envio.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
             <label title="Ao receber dano, tenta um golpe contra o provável agressor próximo. Não ataca aliados, não persegue e evita situações ambíguas. Cura e ataque manual têm prioridade.">Contra-ataque<input data-heal-setting="counterAttack" type="checkbox"></label>
             <div class="nx-info-line" id="nx-counter-status">Contra-ataque: desativado</div>
             <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
@@ -5376,7 +5405,7 @@
     }},100);
     setInterval(()=>{
         if(goofy.original!==null || settings.goofyNames)syncGoofyNickname();
-        if(deathChat.pending)announceDeathCount();
+        if(deathChat.pending || deathChat.echo)announceDeathCount();
     },500);
     function spinFrame(){
         if(!document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}
