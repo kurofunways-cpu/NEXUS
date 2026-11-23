@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.48
+// @version      1.8.49
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.48';
+    const NEXUS_VERSION = '1.8.49';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -91,6 +91,7 @@
         goofyNames: false,
         smartNames: false,
         deathChat: true,
+        counterAttack: false,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -2672,7 +2673,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
-        resetSpin();
+        resetSpin();resetCounter();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -3803,6 +3804,83 @@
         menu.querySelector('#gpt-pick-save').disabled = !count;
         menu.querySelector('#gpt-pick-delete').disabled = !profile;
     }
+    // FUN: conservative retaliation using fresh snapshots. The damage
+    // message does not identify an attacker; never assume a nearby player
+    // is guilty merely because they are the closest.
+    const COUNTER_MELEE=new Set([0,1,2,3,13,15,17,28,30,31,36,37,40]);
+    const COUNTER_RANGE=120, COUNTER_THREAT_RANGE=155;
+    const counter={target:null,lastAt:-Infinity,status:'Aguardando dano'};
+    function resetCounter(){
+        counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando dano';
+    }
+    function observeCounter(packet,now,damaged){
+        if(!settings.counterAttack || !player.alive || !session.self ||
+            !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
+        const self=session.self, candidates=[], seen=new Map();
+        let hazard=false;
+        for(let i=1;i+18<packet.length;i+=19){
+            if(packet[i+8]&2)continue;
+            const type=packet[i],id=packet[i+2]|packet[i+3]<<8,sid=packet[i+1];
+            const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
+            const distance=Math.hypot(x-self.x,y-self.y);
+            if([2,7,9,17].includes(type) && sid!==self.sid && distance<100)hazard=true;
+            if(type!==0 || id===player.id || sid===self.sid ||
+                (self.team!==0 && self.team===packet[i+12]) || packet[i+13]===0)continue;
+            const e={id,sid,x,y,at:now,distance,weapon:packet[i+10]};
+            seen.set(id,e);
+            if(!COUNTER_MELEE.has(e.weapon) || distance>COUNTER_THREAT_RANGE)continue;
+            const direction=packet[i+9]*2*Math.PI/255-Math.PI;
+            const toward=Math.atan2(self.y-y,self.x-x);
+            const facing=Math.cos(direction-toward)>=Math.cos(0.7);
+            if(facing)candidates.push(e);
+        }
+        if(damaged){
+            // A nearby hostile structure can account for the hit instead.
+            if(!hazard)for(const o of deathReturn.objects.values()){
+                if([2,7,9,17].includes(o.type) && o.sid!==self.sid &&
+                    now-o.at<1500 && Math.hypot(o.x-self.x,o.y-self.y)<100){hazard=true;break;}
+            }
+            if(!hazard && candidates.length===1){
+                counter.target={...candidates[0],expires:now+650};
+                counter.status='Possível agressor detectado';
+            }else{
+                counter.target=null;
+                counter.status=hazard?'Dano próximo a estrutura; sem ataque':
+                    'Agressor incerto; sem ataque';
+            }
+        }else if(counter.target){
+            const old=counter.target,e=seen.get(old.id);
+            if(e && e.sid===old.sid)counter.target={...e,expires:old.expires};
+            else if(e)counter.target=null;
+        }
+    }
+    function driveCounter(now=performance.now()){
+        const t=counter.target;
+        if(!settings.counterAttack || !t || !player.alive || !connected())return false;
+        if(now>t.expires || now-t.at>250){
+            counter.target=null;counter.status='Agressor fora da janela';return false;
+        }
+        if(!session.self || now-session.self.at>250 || session.attacking ||
+            heal.phase!=='idle' || heal.foodSelected || heal.restore ||
+            (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ||
+            ageRecovery.pending || bed.locked || (bed.pending && bed.phase==='placing') ||
+            macro.selected || Object.keys(macroDefs).some(macroActive) ||
+            ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024 ||
+            (settings.lagGuard && networkState(now)!=='OK') ||
+            now-counter.lastAt<350)return false;
+        // Require an observed melee item; never attack while holding food,
+        // a building or an unknown item. No chasing or automatic selection.
+        if(!COUNTER_MELEE.has(heal.observedItem) || now-heal.observedItemAt>250 ||
+            Math.hypot(t.x-session.self.x,t.y-session.self.y)>COUNTER_RANGE)return false;
+        const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
+        if(!transmit([19,...apAngleBytes(angle)]))return false;
+        transmit([18]);
+        counter.lastAt=now;counter.target=null;counter.status='Contra-ataque enviado';
+        resetSpin();
+        const aim=currentAim();
+        if(!settings.returnSpin && aim)transmit([13,...aim]);
+        return true;
+    }
     // FUN: count confirmed deaths in this tab, and announce after respawn.
     // Chat opcode 7 carries UTF-8 bytes; never queue repeated announcements.
     const DEATH_COUNT_KEY=PREFIX+'death_count_v1';
@@ -4309,7 +4387,9 @@
                     deathReturn.lastHitAt=now;
                 recordReturnPosition({x:packet[i+4]|packet[i+5]<<8,
                                       y:packet[i+6]|packet[i+7]<<8},now);
+                const counterDamaged=observedHealth<player.health-0.5;
                 noteHealthSnapshot(observedHealth,now);
+                observeCounter(packet,now,counterDamaged);
                 updateHealth();
                 evaluate();
                 ownSnapshotProcessed=true;
@@ -4347,7 +4427,7 @@
             const now=performance.now();
             if (observeAutoPlace(packet,now)) runAutoPlace(now);
         }
-        if(player.alive){driveSpin();announceDeathCount();}
+        if(player.alive){if(!driveCounter())driveSpin();announceDeathCount();}
     }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
@@ -4556,6 +4636,7 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
+        if(key==='counterAttack')resetCounter();
         if(key==='deathChat' && !settings.deathChat)deathChat.pending=false;
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
@@ -4622,6 +4703,8 @@
     }
     function refreshInputs() {
         if (!menu) return;
+        const counterStatus=menu.querySelector('#nx-counter-status');
+        if(counterStatus)counterStatus.textContent='Contra-ataque: '+(settings.counterAttack?counter.status:'desativado');
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total;
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
@@ -4935,6 +5018,8 @@
             <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
             <label title="Anuncia o total de mortes no chat após renascer, com intervalo mínimo de 3 segundos. Contagem por aba.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
+            <label title="Ao receber dano, tenta um golpe contra o provável agressor próximo. Não ataca aliados, não persegue e evita situações ambíguas. Cura e ataque manual têm prioridade.">Contra-ataque<input data-heal-setting="counterAttack" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-counter-status">Contra-ataque: desativado</div>
             <div class="nx-info-line" id="nx-death-count">Mortes: 0</div>
             <button type="button" id="nx-death-reset" title="Zera apenas o contador de mortes desta aba">Zerar mortes</button>
           </div>
@@ -5232,7 +5317,7 @@
         if(deathChat.pending)announceDeathCount();
     },500);
     function spinFrame(){
-        if(!document.hidden && settings.returnSpin && player.alive)driveSpin();
+        if(!document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}
         requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
