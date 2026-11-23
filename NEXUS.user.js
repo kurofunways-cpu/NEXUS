@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.52
+// @version      1.8.53
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.52';
+    const NEXUS_VERSION = '1.8.53';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1657,7 +1657,7 @@
     }
     function spinCanAim(now){
         return settings.returnSpin && player.alive && connected() && !session.attacking &&
-            now-counter.lastAt>=110 &&
+            now-counter.lastAt>=110 && !counter.restorePending &&
             session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
             !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
             heal.phase==='idle' && !heal.foodSelected &&
@@ -2720,6 +2720,12 @@
     }
     function observeWeapon(id) {
         const now = performance.now();
+        if(id===15){
+            counter.hammerSeen=true;
+            // Delayed snapshots of our temporary Hammer must not overwrite
+            // the user's saved weapon or contaminate weapon-slot learning.
+            if(now<counter.hammerEchoUntil || counter.restorePending)return;
+        }
         // Never learn the temporarily selected food/building or a delayed
         // pre-selection snapshot as a new manual weapon choice.
         if (heal.phase !== 'idle' || macro.selected || now-session.lastAutomationAt < 250 ||
@@ -3824,19 +3830,28 @@
         menu.querySelector('#gpt-pick-delete').disabled = !profile;
     }
     // FUN: opt-in melee aura, using approximate weapon reach and fresh entities.
-    // No automatic movement, chasing, or change of weapon.
+    // No automatic movement or chasing. The only temporary weapon swap is
+    // a verified available Hammer to escape a hostile trap.
     const COUNTER_REACH=new Map([[0,90],[1,110],[2,155],[3,115],[13,100],[15,95],
         [17,170],[28,165],[30,130],[31,105],[36,170],[37,170],[40,170]]);
-    const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map()};
+    const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map(),
+        traps:new Map(),contact:null,lastSelf:null,hammerSeen:false,hammerEchoUntil:0,
+        restorePending:false,restoreTries:0,restoreNextAt:0};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
+        counter.traps.clear();counter.contact=null;counter.lastSelf=null;counter.hammerSeen=false;
+        counter.hammerEchoUntil=0;counter.restorePending=false;counter.restoreTries=0;counter.restoreNextAt=0;
     }
     function resetHatCopy(){
         hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.status='Aguardando jogador';
     }
     function counterWeapon(now){
         const r=heal.restore;
+        if(heal.observedItem===15 && now<counter.hammerEchoUntil){
+            const id=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
+            return COUNTER_REACH.has(id)?{id,select:true}:null;
+        }
         // WebSocket sends are ordered. Once the restore selection was sent,
         // the next attack can select that same known weapon explicitly.
         if(r && r.sent && r.epoch===session.connectionEpoch &&
@@ -3881,6 +3896,92 @@
         // Selection is performed at the instant of a strike; no stale target
         // from a prior life or earlier damage is carried over.
     }
+    const AURA_TRAP_TYPE=6, AURA_TRAP_CONTACT=34, AURA_TRAP_TTL=1800;
+    function observeAuraTrap(packet,now){
+        if(!settings.killAura || !player.alive || !session.self ||
+            !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
+        const self=session.self;
+        for(let i=1;i+18<packet.length;i+=19){
+            if(packet[i]!==AURA_TRAP_TYPE)continue;
+            const sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8,key=sid+':'+id;
+            if(packet[i+8]&2){counter.traps.delete(key);if(counter.contact?.key===key)counter.contact=null;continue;}
+            const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8,team=packet[i+12];
+            if(sid===self.sid || (self.team!==0 && self.team===team) ||
+                Math.hypot(x-self.x,y-self.y)>260){counter.traps.delete(key);continue;}
+            counter.traps.set(key,{key,sid,team,x,y,at:now});
+        }
+        for(const [key,t] of counter.traps)if(now-t.at>AURA_TRAP_TTL)counter.traps.delete(key);
+        if(counter.traps.size>96)for(const [key] of [...counter.traps.entries()].sort((a,b)=>a[1].at-b[1].at).slice(0,counter.traps.size-96))counter.traps.delete(key);
+        // Entity-only packets can remove/update traps, but cannot provide a
+        // second independent player position observation.
+        const previous=counter.lastSelf;
+        if(previous && self.at<=previous.at)return;
+        counter.lastSelf={x:self.x,y:self.y,at:self.at};
+        let nearest=null,distance=AURA_TRAP_CONTACT;
+        for(const t of counter.traps.values()){
+            if(t.sid===self.sid || (self.team!==0 && self.team===t.team))continue;
+            const d=Math.hypot(t.x-self.x,t.y-self.y);
+            if(d<=distance){distance=d;nearest=t;}
+        }
+        if(!nearest){counter.contact=null;return;}
+        const dt=previous?self.at-previous.at:0;
+        const stationary=dt>=20 && dt<=350 &&
+            Math.hypot(self.x-previous.x,self.y-previous.y)/dt<=.12;
+        if(!stationary || counter.contact?.key!==nearest.key){
+            counter.contact={key:nearest.key,since:self.at,samples:1,confirmed:false};
+            return;
+        }
+        counter.contact.samples++;
+        if(counter.contact.samples>=2 && self.at-counter.contact.since>=45)
+            counter.contact.confirmed=true;
+    }
+    function auraTrapTarget(now){
+        const c=counter.contact,t=c&&counter.traps.get(c.key),self=session.self;
+        if(!c?.confirmed || !t || !self || now-t.at>AURA_TRAP_TTL ||
+            now-self.at>250 || t.sid===self.sid ||
+            (self.team!==0 && self.team===t.team) ||
+            Math.hypot(t.x-self.x,t.y-self.y)>AURA_TRAP_CONTACT+3)return null;
+        return t;
+    }
+    function auraHammerAvailable(){
+        // Observed equipment is authoritative. A completed upgrade choice
+        // is a second source of evidence; an outstanding pick is not.
+        return counter.hammerSeen || session.weaponIds.includes(15) ||
+            (upgrades.choices.includes(15) && upgrades.pendingPick?.id!==15);
+    }
+    function recoverAuraWeapon(now){
+        if(!counter.restorePending)return false;
+        if(!player.alive || !connected()){counter.restorePending=false;return false;}
+        if(heal.phase!=='idle' || heal.foodSelected || ageRecovery.pending ||
+            macro.selected || Object.keys(macroDefs).some(macroActive) ||
+            (bed.pending && bed.phase==='placing' && bed.locked))return true;
+        if(session.ws.bufferedAmount>=1024 || now<counter.restoreNextAt)return true;
+        counter.restoreTries++;
+        if(restoreWeapon()){counter.restorePending=false;return true;}
+        counter.restoreNextAt=now+150;
+        if(counter.restoreTries>=3)counter.restorePending=false;
+        return true;
+    }
+    function strikeAuraTrap(t,now){
+        if(!auraHammerAvailable()){counter.status='Preso em trap; Hammer indisponível';return false;}
+        const self=session.self;
+        const angle=Math.atan2(t.y-self.y,t.x-self.x);
+        const aim=apAngleBytes(angle);
+        const alreadyHammer=session.weaponPacket[0]===2?session.weaponPacket[1]===15:
+            session.weaponIds[session.weapon]===15;
+        // A complete ordered transaction: select -> hit -> stop -> restore.
+        // Do not keep Hammer selected between swings or across food holds.
+        session.lastAutomationAt=now;counter.hammerEchoUntil=now+1000;
+        if(!transmit([2,15])){counter.status='Trap: falha ao selecionar Hammer';return false;}
+        const hit=transmit([19,...aim]);
+        transmit([18]);
+        if(!alreadyHammer && !restoreWeapon()){
+            counter.restorePending=true;counter.restoreTries=0;counter.restoreNextAt=now+50;
+        }
+        counter.lastAt=now;resetSpin();
+        counter.status=hit?'Quebrando trap com Hammer':'Trap: golpe não enviado';
+        return true; // even a failed attack may have selected the Hammer
+    }
     function selectAuraTarget(now,reach){
         const self=session.self;
         if(!self)return null;
@@ -3905,6 +4006,7 @@
         return true;
     }
     function driveCounter(now=performance.now()){
+        if(recoverAuraWeapon(now))return true;
         if(!settings.killAura || !player.alive || !connected())return false;
         if(!session.self || now-session.self.at>250 || session.attacking ||
             heal.phase!=='idle' || heal.foodSelected ||
@@ -3914,10 +4016,12 @@
             ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024 ||
             (settings.lagGuard && networkState(now)!=='OK') ||
             now-counter.lastAt<150)return false;
+        const trap=auraTrapTarget(now);
+        if(trap && auraHammerAvailable())return strikeAuraTrap(trap,now);
         const w=counterWeapon(now);
-        if(!w){counter.status='Aguardando arma';return false;}
+        if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return false;}
         const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
-        if(!t){counter.status='Nenhum inimigo no alcance';return false;}
+        if(!t){counter.status=trap?'Preso em trap; Hammer indisponível':'Nenhum inimigo no alcance';return false;}
         if(w.select && !transmit(session.weaponPacket))return false;
         const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
         if(!transmit([19,...apAngleBytes(angle)]))return false;
@@ -4469,12 +4573,14 @@
                                       y:packet[i+6]|packet[i+7]<<8},now);
                 noteHealthSnapshot(observedHealth,now);
                 observeCounter(packet,now);
+                observeAuraTrap(packet,now);
                 updateHealth();
                 evaluate();
                 ownSnapshotProcessed=true;
                 break;
             }
             if (player.alive) {
+                if(!ownSnapshotProcessed)observeAuraTrap(packet,performance.now());
                 // Confirming a bed and releasing movement takes precedence
                 // over more expensive general placement bookkeeping.
                 observeSpawnBed(packet);
@@ -4589,6 +4695,7 @@
                 case 2: {
                     if (raw.length < 2) break;
                     heal.restore=null; // respect an intentional manual item selection
+                    counter.restorePending=false;counter.hammerEchoUntil=0;
                     ap.manualItem=raw[0]===0?raw[1]>1:!([15,...session.weaponIds].includes(raw[1]));
                     ap.manualUntil=performance.now()+(ap.manualItem?160:0);
                     if (macro.selected) {
@@ -4717,7 +4824,11 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
-        if(key==='killAura')resetCounter();
+        if(key==='killAura'){
+            const pending=counter.restorePending;
+            resetCounter();counter.restorePending=pending;
+            if(pending)recoverAuraWeapon(performance.now());
+        }
         if(key==='copyNearbyHat'){
             resetHatCopy();
             if(!settings.copyNearbyHat && settings.autoLastHat && hat.wanted && player.alive){
@@ -5107,7 +5218,7 @@
             <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
             <label title="Envia o total de mortes ao chat real do jogo após renascer, com intervalo mínimo de 3 segundos. HUD mostra apenas o contador e o estado do envio.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
-            <label title="Ataca automaticamente o inimigo mais próximo dentro do alcance estimado da arma equipada, mesmo sem receber dano. Não persegue, não ataca aliados. Cura e ataque manual têm prioridade.">Kill Aura<input data-heal-setting="killAura" type="checkbox"></label>
+            <label title="Ataca inimigos no alcance estimado. Se ficar preso em trap inimiga, prioriza quebrá-la com Hammer disponível e restaura a arma anterior. Não persegue nem ataca aliados. Cura e ataque manual têm prioridade.">Kill Aura<input data-heal-setting="killAura" type="checkbox"></label>
             <div class="nx-info-line" id="nx-counter-status">Kill Aura: desativada</div>
             <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
             <div class="nx-info-line" id="nx-hat-copy-status">Chapéu: cópia desativada</div>
