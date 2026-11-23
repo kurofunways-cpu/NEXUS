@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.34
+// @version      1.8.35
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.34';
+    const NEXUS_VERSION = '1.8.35';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3515,44 +3515,38 @@
         watchAutoRespawnPlay();
         wakeAutoRespawn(35);
     }
-    // Player proximity prompt observes the server's world snapshots; separate
-    // accounts can share a clan and still count for the explicit UI test.
-    // A player seen in a different chunk is retained briefly, never forever.
-    // No automatic Auto Pick change happens without the Yes click.
-    const TARGET_NOTICE_RANGE=260;
-    const TARGET_NOTICE_COOLDOWN=45000;
-    const targetNotice={node:null,lastShownAt:-Infinity,nearby:false,
-        players:new Map(),lastDebugAt:-Infinity};
+    // Event-driven player detection. The server decides which entities a client
+    // can see; there is no arbitrary 260-unit cutoff or render-frame polling.
+    // Each player is alerted once per encounter until absent for 10 seconds.
+    const TARGET_NOTICE_REARM_MS=10000;
+    const targetNotice={node:null,players:new Map(),prompted:new Set(),lastDebugAt:-Infinity};
     function hideTargetNotice() {
         if(targetNotice.node) targetNotice.node.remove();
         targetNotice.node=null;
     }
     function resetTargetNotice() {
-        hideTargetNotice();targetNotice.nearby=false;
-        targetNotice.players.clear();targetNotice.lastDebugAt=-Infinity;
-        targetNotice.lastShownAt=-Infinity;
+        hideTargetNotice();
+        targetNotice.players.clear();targetNotice.prompted.clear();
+        targetNotice.lastDebugAt=-Infinity;
     }
-    function showTargetNotice(distance) {
-        const now=performance.now();
+    function showTargetNotice() {
         if(!document.body || document.hidden || !player.alive || !connected() ||
-           !settings.notifyTargets || targetNotice.node ||
-           now-targetNotice.lastShownAt<TARGET_NOTICE_COOLDOWN) return;
-        targetNotice.lastShownAt=now;
+           !settings.notifyTargets || targetNotice.node) return false;
         const box=document.createElement('section');
         box.id='nx-target-notice';box.setAttribute('role','alert');
         box.style.cssText='position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:2147483647;'+
-            'width:min(320px,calc(100vw - 36px));padding:13px 14px;'+
+            'width:min(340px,calc(100vw - 36px));padding:13px 14px;'+
             'background:linear-gradient(145deg,#142638,#09131f);'+
             'color:#eaffff;border:1px solid #4fded1;border-radius:13px;'+
             'box-shadow:0 12px 35px #000b;font:13px Arial,sans-serif;';
         const headline=document.createElement('strong');
-        headline.textContent='NEXUS · Jogador próximo';
+        headline.textContent='NEXUS · Jogador detectado';
         headline.style.cssText='display:block;color:#83fff1;font-size:14px;margin-bottom:6px';
         const message=document.createElement('p');
         message.style.cssText='margin:0 0 10px;line-height:1.45';
         message.textContent=settings.autoPick ?
-            `Jogador a ~${Math.round(distance)} unidades. Auto Pick já está ativo. Manter?` :
-            `Jogador a ~${Math.round(distance)} unidades. Ativar Auto Pick?`;
+            'Outro jogador detectado. Auto Pick já está ativo. Manter?' :
+            'Outro jogador detectado. Ativar Auto Pick?';
         const actions=document.createElement('div');
         actions.style.cssText='display:flex;gap:8px;';
         const yes=document.createElement('button');yes.type='button';yes.textContent='Yes';
@@ -3561,7 +3555,6 @@
         no.style.cssText='flex:1;background:#26394a;color:#eaffff;border:1px solid #526c77;border-radius:7px;padding:8px;cursor:pointer';
         yes.addEventListener('click',()=>{
             hideTargetNotice();
-            // Existing settings persistence and per-tab synchronization are respected.
             editSetting('autoPick',true);
             if(!selectedProfile) {
                 profileStatus='Auto Pick ativado — selecione um perfil de upgrades';
@@ -3571,43 +3564,59 @@
         no.addEventListener('click',hideTargetNotice);
         actions.append(yes,no);box.append(headline,message,actions);
         document.body.appendChild(box);targetNotice.node=box;
+        return true;
+    }
+    function flushTargetNotice() {
+        if(targetNotice.node || document.hidden || !player.alive ||
+           !settings.notifyTargets) return;
+        const now=performance.now();
+        const fresh=[...targetNotice.players].filter(([id,t])=>
+            now-t<2500 && !targetNotice.prompted.has(id));
+        if(!fresh.length || !showTargetNotice())return;
+        // One prompt covers the players currently observed; dismissing it
+        // cannot generate an infinite sequence of notifications.
+        for(const [id,t] of targetNotice.players) if(now-t<2500)
+            targetNotice.prompted.add(id);
     }
     function observeTargetProximity(packet) {
         if(!player.alive || !settings.notifyTargets) {
-            hideTargetNotice();targetNotice.nearby=false;
-            targetNotice.players.clear();return;
+            resetTargetNotice();return;
         }
         if(!(packet instanceof Uint8Array) || (packet.length-1)%19!==0) return;
         const now=performance.now();
-        for(let i=1;i+18<packet.length;i+=19){
-            if(packet[i]!==0)continue;
+        for(let i=1;i+18<packet.length;i+=19) {
+            if(packet[i]!==0) continue;
             const id=packet[i+2]|packet[i+3]<<8;
-            if(id===player.id)continue;
-            if(packet[i+8]&2){targetNotice.players.delete(id);continue;}
-            const x=packet[i+4]|packet[i+5]<<8;
-            const y=packet[i+6]|packet[i+7]<<8;
-            targetNotice.players.set(id,{x,y,at:now});
+            if(id===player.id) continue;
+            if(packet[i+8]&2) {
+                // Mark this player unseen without forgetting the encounter;
+                // only a long absence permits a new alert for the same ID.
+                if(targetNotice.players.has(id))
+                    targetNotice.players.set(id,now-2501);
+                continue;
+            }
+            const previousAt=targetNotice.players.get(id);
+            if(previousAt!==undefined && now-previousAt>TARGET_NOTICE_REARM_MS)
+                targetNotice.prompted.delete(id);
+            targetNotice.players.set(id,now);
         }
-        for(const [id,p] of targetNotice.players){
-            if(now-p.at>1500)targetNotice.players.delete(id);
+        for(const [id,lastAt] of targetNotice.players) {
+            if(now-lastAt>TARGET_NOTICE_REARM_MS) {
+                targetNotice.players.delete(id);
+                targetNotice.prompted.delete(id);
+            }
         }
-        const self=session.self;
-        if(!self || now-self.at>850){
-            hideTargetNotice();targetNotice.nearby=false;return;
-        }
-        let nearest=Infinity;
-        for(const p of targetNotice.players.values())
-            nearest=Math.min(nearest,Math.hypot(p.x-self.x,p.y-self.y));
-        targetNotice.nearby=nearest<=TARGET_NOTICE_RANGE;
-        if(now-targetNotice.lastDebugAt>220){
-            const debug=menu?.querySelector('#nx-target-debug');
-            if(debug)debug.textContent=targetNotice.nearby ?
-                `Jogador detectado a ${Math.round(nearest)} unidades` :
-                'Nenhum jogador no alcance';
+        // Update promptly on every server packet, never on an artificial timer.
+        flushTargetNotice();
+        if(now-targetNotice.lastDebugAt>=220) {
+            const status=menu?.querySelector('#nx-target-debug');
+            if(status) {
+                const observed=[...targetNotice.players.values()].filter(t=>now-t<2500).length;
+                status.textContent=observed ?
+                    `Jogadores detectados: ${observed}` : 'Nenhum jogador detectado';
+            }
             targetNotice.lastDebugAt=now;
         }
-        if(!targetNotice.nearby){hideTargetNotice();return;}
-        showTargetNotice(nearest);
     }
     let lastMenuSnapshotPaint=-Infinity;
     function onGameMessage(event) {
@@ -4322,7 +4331,7 @@
           <div class="content" data-panel="profiles" hidden>
             <div class="section-intro"><span><strong>UPGRADE PROFILES</strong><small>Salve e reproduza seus upgrades</small></span></div>
             <label title="Automatically repeat the selected profile whenever its next item is offered">Auto Pick<input data-heal-setting="autoPick" type="checkbox"></label>
-            <label title="Avisa quando outro jogador (inclusive outra conta ou aliado) estiver a 260 unidades; Yes ativa ou mantém o Auto Pick.">Aviso de alvos<input data-heal-setting="notifyTargets" type="checkbox"></label>
+            <label title="Mostra Yes assim que o servidor informar outro jogador, em qualquer parte da área recebida, sem exigir distância mínima.">Aviso de alvos<input data-heal-setting="notifyTargets" type="checkbox"></label>
             <div id="nx-target-debug" class="nx-info-line">Detecção de jogadores: aguardando dados</div>
             <select id="gpt-pick-profile" class="pick-input" aria-label="Saved profile"></select>
             <input id="gpt-pick-name" class="pick-input" maxlength="32" placeholder="Profile name" title="Choose items manually, then enter a name and save. Use the same name to replace a profile.">
@@ -4557,6 +4566,7 @@
         // Incoming WebSocket snapshots remain the primary clock. Resume
         // only if the last snapshot is still fresh; never make up positions.
         resumeAutomationsAfterSleep();
+        if(!document.hidden)flushTargetNotice();
         syncStatsVisibility();
     });
     // Chromium can freeze hidden pages altogether. Release owned movement
