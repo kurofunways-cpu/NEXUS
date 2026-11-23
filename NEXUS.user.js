@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.51
+// @version      1.8.52
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.51';
+    const NEXUS_VERSION = '1.8.52';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -91,7 +91,7 @@
         goofyNames: false,
         smartNames: false,
         deathChat: true,
-        counterAttack: false,
+        killAura: false,
         copyNearbyHat: false,
         spikeMs: 1,
         trapMs: 1,
@@ -291,6 +291,16 @@
     window.addEventListener('pagehide',backupGameSettings);
 
     const player = { id: -1, alive: false, health: 100 };
+    // Only an observed death in this live socket can authorize respawn movement.
+    // Never serialize these flags or recover them from shared tab settings.
+    const lifeGate={deathEpoch:-1,respawnAuthorized:false};
+    function clearLifeGate(){lifeGate.deathEpoch=-1;lifeGate.respawnAuthorized=false;}
+    function markLifeDeath(){if(player.alive){lifeGate.deathEpoch=session.connectionEpoch;lifeGate.respawnAuthorized=false;}}
+    function authorizeLifeSpawn(){
+        const authorized=!player.alive && lifeGate.deathEpoch===session.connectionEpoch;
+        lifeGate.deathEpoch=-1;lifeGate.respawnAuthorized=authorized;
+        return authorized;
+    }
     const session = {
         ws: null,
         weapon: 0,                  // last native primary/secondary selection
@@ -846,7 +856,7 @@
         bed.spawnAt=performance.now();
         bed.spawnCandidate=null;bed.spawnCandidateCount=0;
         bed.spawnAnchorConfirmed=false;bed.earlyBeds.clear();
-        bed.pending=!!(settings.autoSpawnBed && player.alive);
+        bed.pending=!!(settings.autoSpawnBed && player.alive && lifeGate.respawnAuthorized);
         // An inventory update can precede spawn during fast reconnects.
         bed.unlocked=!!(bed.preSpawnUnlockAt && performance.now()-bed.preSpawnUnlockAt<1500);
         bed.preSpawnUnlockAt=0;bed.confirmed=false;bed.tries=0;
@@ -1047,7 +1057,8 @@
     function onReturnRespawn() {
         stopReturnMovement();
         deathReturn.epoch++;
-        deathReturn.phase='waiting';deathReturn.status=deathReturn.target ? 'Aguardando cama confirmada' : 'Morte sem posição confirmada';
+        deathReturn.phase=lifeGate.respawnAuthorized?'waiting':'idle';
+        deathReturn.status=lifeGate.respawnAuthorized?(deathReturn.target?'Aguardando cama confirmada':'Morte sem posição confirmada'):'Primeira vida: aguardando morte real';
         deathReturn.self=null;deathReturn.lastSelf=null;deathReturn.aliveTrail=[];
         deathReturn.movers.clear(); // previous-life dynamic hitboxes are stale
         deathReturn.trace=[];deathReturn.route=[];deathReturn.step=0;
@@ -1561,7 +1572,7 @@
         saveReturnPaths();deathReturn.learned=true;
     }
     function beginReturnIfReady(now=performance.now()){
-        if(!settings.returnAfterBed||!deathReturn.target||!player.alive||
+        if(!lifeGate.respawnAuthorized||!settings.returnAfterBed||!deathReturn.target||!player.alive||
             deathReturn.phase!=='waiting' || !bed.confirmed ||
             !settings.autoSpawnBed || !bed.self ||
             deathReturn.socketEpoch!==session.connectionEpoch)return false;
@@ -1580,7 +1591,7 @@
         return true;
     }
     function returnCanMove(now){
-        return player.alive && connected() && settings.returnAfterBed &&
+        return lifeGate.respawnAuthorized && player.alive && connected() && settings.returnAfterBed &&
             deathReturn.target && bed.confirmed && !bed.pending &&
             deathReturn.socketEpoch===session.connectionEpoch &&
             deathReturn.self && now-deathReturn.self.at<=RETURN_SNAPSHOT_TTL &&
@@ -1594,7 +1605,7 @@
     }
     function returnMoveTo(point,now){
         const self=deathReturn.self;
-        if(!point||!self)return false;
+        if(!point||!self||!returnCanMove(now))return false;
         if(returnDist(self,point)<=RETURN_WAYPOINT){deathReturn.step++;return true;}
         const angle=Math.atan2(point.y-self.y,point.x-self.x);
         if(!transmit([1,...apAngleBytes(angle)]))return false;
@@ -1679,7 +1690,7 @@
         spin.lastSentAt=now;return true;
     }
     function driveReturn(now=performance.now()){
-        if(!settings.returnAfterBed||!player.alive||
+        if(!lifeGate.respawnAuthorized||!settings.returnAfterBed||!player.alive||
             deathReturn.socketEpoch!==session.connectionEpoch)return;
         if(!deathReturn.target){
             if(deathReturn.phase==='waiting')deathReturn.status='Sem posição da morte nesta vida';
@@ -2476,7 +2487,8 @@
     }
     function bedCanWork(now=performance.now()) {
         // Server snapshots are the control clock even in background tabs.
-        return bed.pending && settings.autoSpawnBed && bed.unlocked &&
+        return lifeGate.respawnAuthorized && bed.socketEpoch===session.connectionEpoch &&
+            bed.pending && settings.autoSpawnBed && bed.unlocked &&
             player.alive && connected() && bed.spawnAnchorConfirmed &&
             !!bed.origin && !!bed.self &&
             now-bed.self.at<=BED_SNAPSHOT_TTL &&
@@ -2508,7 +2520,7 @@
     }
     function trySpawnBed(now=performance.now()) {
         if(ageRecovery.pending)return; // Recovery must happen before bed movement.
-        if(!bed.pending || !settings.autoSpawnBed || !player.alive || !connected() ||
+        if(!lifeGate.respawnAuthorized || !bed.pending || !settings.autoSpawnBed || !player.alive || !connected() ||
             bed.socketEpoch!==session.connectionEpoch)return;
         // Lock the manual controls as soon as valid navigation begins. This
         // prevents a player's input from repeatedly cancelling the pathfinder.
@@ -3811,14 +3823,14 @@
         menu.querySelector('#gpt-pick-save').disabled = !count;
         menu.querySelector('#gpt-pick-delete').disabled = !profile;
     }
-    // FUN: damage-triggered retaliation, based on approximate weapon reach.
-    // The protocol does not expose attacker identity or exact hitbox geometry.
+    // FUN: opt-in melee aura, using approximate weapon reach and fresh entities.
+    // No automatic movement, chasing, or change of weapon.
     const COUNTER_REACH=new Map([[0,90],[1,110],[2,155],[3,115],[13,100],[15,95],
         [17,170],[28,165],[30,130],[31,105],[36,170],[37,170],[40,170]]);
-    const counter={target:null,lastAt:-Infinity,status:'Aguardando dano',players:new Map()};
+    const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map()};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
-        counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando dano';counter.players.clear();
+        counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
     }
     function resetHatCopy(){
         hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.status='Aguardando jogador';
@@ -3835,17 +3847,15 @@
         return now-heal.observedItemAt<=250 && COUNTER_REACH.has(heal.observedItem)?
             {id:heal.observedItem,select:false}:null;
     }
-    function observeCounter(packet,now,damaged){
-        if((!settings.counterAttack && !settings.copyNearbyHat) || !player.alive || !session.self ||
+    function observeCounter(packet,now){
+        if((!settings.killAura && !settings.copyNearbyHat) || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
         const self=session.self;
-        let hazard=false;
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8,sid=packet[i+1];
             if(type===0 && (packet[i+8]&2)){counter.players.delete(id);if(counter.target?.id===id)counter.target=null;continue;}
             if(packet[i+8]&2)continue;
             const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
-            if([2,7,9,17].includes(type) && sid!==self.sid && Math.hypot(x-self.x,y-self.y)<100)hazard=true;
             if(type!==0 || id===player.id || sid===self.sid)continue;
             if(packet[i+13]===0){counter.players.delete(id);if(counter.target?.id===id)counter.target=null;continue;}
             counter.players.set(id,{id,sid,x,y,at:now,weapon:packet[i+10],hat:packet[i+11],
@@ -3868,33 +3878,20 @@
                 hatCopy.target=nearest;
             }
         }
-        if(!settings.counterAttack)return;
-        if(damaged){
-            if(!hazard)for(const o of deathReturn.objects.values()){
-                if([2,7,9,17].includes(o.type) && o.sid!==self.sid &&
-                    now-o.at<1500 && Math.hypot(o.x-self.x,o.y-self.y)<100){hazard=true;break;}
-            }
-            const candidates=[];
-            for(const e of counter.players.values()){
-                if(now-e.at>250 || (self.team!==0&&self.team===e.team))continue;
-                const reach=COUNTER_REACH.get(e.weapon);
-                const distance=Math.hypot(e.x-self.x,e.y-self.y);
-                if(!reach || distance>reach+35)continue;
-                const toward=Math.atan2(self.y-e.y,self.x-e.x);
-                if(Math.cos(e.angle-toward)>=Math.cos(0.85))candidates.push(e);
-            }
-            if(!hazard && candidates.length===1){
-                counter.target={...candidates[0],expires:now+950};
-                counter.status='Possível agressor detectado';
-            }else{
-                counter.target=null;counter.status=hazard?'Dano próximo a estrutura; sem ataque':'Agressor incerto; sem ataque';
-            }
-        }else if(counter.target){
-            const old=counter.target,e=counter.players.get(old.id);
-            if(e && e.sid===old.sid && !(self.team!==0&&self.team===e.team))
-                counter.target={...e,expires:old.expires};
-            else counter.target=null;
+        // Selection is performed at the instant of a strike; no stale target
+        // from a prior life or earlier damage is carried over.
+    }
+    function selectAuraTarget(now,reach){
+        const self=session.self;
+        if(!self)return null;
+        let best=null,bestDistance=reach;
+        for(const e of counter.players.values()){
+            if(now-e.at>250 || e.id===player.id || e.sid===self.sid ||
+                (self.team!==0&&self.team===e.team))continue;
+            const d=Math.hypot(e.x-self.x,e.y-self.y);
+            if(d<=bestDistance){bestDistance=d;best=e;}
         }
+        return best;
     }
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
@@ -3908,11 +3905,7 @@
         return true;
     }
     function driveCounter(now=performance.now()){
-        const t=counter.target;
-        if(!settings.counterAttack || !t || !player.alive || !connected())return false;
-        if(now>t.expires || now-t.at>250){
-            counter.target=null;counter.status='Agressor fora da janela';return false;
-        }
+        if(!settings.killAura || !player.alive || !connected())return false;
         if(!session.self || now-session.self.at>250 || session.attacking ||
             heal.phase!=='idle' || heal.foodSelected ||
             (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ||
@@ -3922,12 +3915,14 @@
             (settings.lagGuard && networkState(now)!=='OK') ||
             now-counter.lastAt<150)return false;
         const w=counterWeapon(now);
-        if(!w || Math.hypot(t.x-session.self.x,t.y-session.self.y)>COUNTER_REACH.get(w.id))return false;
+        if(!w){counter.status='Aguardando arma';return false;}
+        const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
+        if(!t){counter.status='Nenhum inimigo no alcance';return false;}
         if(w.select && !transmit(session.weaponPacket))return false;
         const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
         if(!transmit([19,...apAngleBytes(angle)]))return false;
         transmit([18]);
-        counter.lastAt=now;counter.target=null;counter.status='Contra-ataque enviado';
+        counter.lastAt=now;counter.target=null;counter.status='Golpe enviado ao inimigo #'+t.id;
         resetSpin();
         const aim=currentAim();
         if(!settings.returnSpin && aim)transmit([13,...aim]);
@@ -4368,11 +4363,15 @@
             resetSmartLife();smartLife.startedAt=performance.now();
             resetTargetNotice();
             stopAutoRespawn();
-            // Some fast respawns can skip the death message entirely. Preserve
-            // the last position only when this was already an active life on
-            // the SAME WebSocket; new connections start with player.alive=false.
-            if(player.alive && settings.returnAfterBed)
-                captureReturnDeath();
+            // A spawn alone is not proof of death. A duplicate spawn must
+            // not restart navigation or turn the old position into a target.
+            const confirmedRespawn=authorizeLifeSpawn();
+            if(!confirmedRespawn){
+                resetReturnForServer();
+                if(bed.moveOwned)stopBedMovement();
+                releaseBedInput();
+                bed.handoffMove=false;bed.moveKeys.clear();
+            }
             clearMacros(false);
             resetPlacementTracking();
             cancelHeal(false);
@@ -4395,6 +4394,7 @@
             if (pending && performance.now()-pending.at<=PRESPAWN_OFFER_MS) receiveOffer(pending.ids);
             updateHealth();
         } else if (id === 19) { // death
+            markLifeDeath();
             countDeath();
             if(player.alive){
                 captureSmartDeath();
@@ -4467,9 +4467,8 @@
                     deathReturn.lastHitAt=now;
                 recordReturnPosition({x:packet[i+4]|packet[i+5]<<8,
                                       y:packet[i+6]|packet[i+7]<<8},now);
-                const counterDamaged=observedHealth<player.health-0.5;
                 noteHealthSnapshot(observedHealth,now);
-                observeCounter(packet,now,counterDamaged);
+                observeCounter(packet,now);
                 updateHealth();
                 evaluate();
                 ownSnapshotProcessed=true;
@@ -4512,6 +4511,7 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
+        clearLifeGate();
         resetDeathChatConnection();
         resetSmartLife(true);
         goofy.pending=false;
@@ -4717,7 +4717,7 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
-        if(key==='counterAttack')resetCounter();
+        if(key==='killAura')resetCounter();
         if(key==='copyNearbyHat'){
             resetHatCopy();
             if(!settings.copyNearbyHat && settings.autoLastHat && hat.wanted && player.alive){
@@ -4793,7 +4793,7 @@
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
         if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
-        if(counterStatus)counterStatus.textContent='Contra-ataque: '+(settings.counterAttack?counter.status:'desativado');
+        if(counterStatus)counterStatus.textContent='Kill Aura: '+(settings.killAura?counter.status:'desativada');
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
@@ -5085,7 +5085,7 @@
             <div class="nx-info-line" id="nx-age-recovery-status">Age: aguardando morte nesta aba</div>
             <label title="Após morrer, clica automaticamente no Play do jogo. Repete após cada morte enquanto ativo.">Auto Spawn<input data-heal-setting="autoRespawn" type="checkbox"></label>
             <label title="Após morrer, tenta reequipar o último chapéu observado. O servidor precisa autorizar a compra/equipamento">Último Chapéu<input data-heal-setting="autoLastHat" type="checkbox"></label>
-            <label title="Usa caminhos aprendidos por configuração das estruturas; descarta posições antigas quando troca de servidor.">Cama no Respawn<input data-heal-setting="autoSpawnBed" type="checkbox"></label>
+            <label title="Só inicia após morte confirmada e respawn na mesma conexão. Usa caminhos aprendidos, nunca destinos de outra vida ou aba.">Cama no Respawn<input data-heal-setting="autoSpawnBed" type="checkbox"></label>
             <label title="Após confirmar a cama, retorna ao ponto original da morte. Mortes dentro do raio de 120 unidades mantêm esse ponto; fora dele criam um novo. Requer Cama no Respawn.">Fixar no Local da Morte<input data-heal-setting="returnAfterBed" type="checkbox"></label>
             <div class="nx-info-line" id="nx-bed-status">Cama: aguardando respawn</div>
             <div class="nx-info-line" id="nx-return-status">Retorno: aguardando morte</div>
@@ -5107,8 +5107,8 @@
             <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
             <label title="Envia o total de mortes ao chat real do jogo após renascer, com intervalo mínimo de 3 segundos. HUD mostra apenas o contador e o estado do envio.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
-            <label title="Ao receber dano, tenta um golpe contra o provável agressor próximo. Não ataca aliados, não persegue e evita situações ambíguas. Cura e ataque manual têm prioridade.">Contra-ataque<input data-heal-setting="counterAttack" type="checkbox"></label>
-            <div class="nx-info-line" id="nx-counter-status">Contra-ataque: desativado</div>
+            <label title="Ataca automaticamente o inimigo mais próximo dentro do alcance estimado da arma equipada, mesmo sem receber dano. Não persegue, não ataca aliados. Cura e ataque manual têm prioridade.">Kill Aura<input data-heal-setting="killAura" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-counter-status">Kill Aura: desativada</div>
             <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
             <div class="nx-info-line" id="nx-hat-copy-status">Chapéu: cópia desativada</div>
             <div class="nx-info-line" id="nx-death-count">Mortes: 0</div>
