@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.46
+// @version      1.8.47
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.46';
+    const NEXUS_VERSION = '1.8.47';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1638,7 +1638,7 @@
         spin.lastSentAt=-Infinity;spin.lastAt=null;spin.angle=0;spin.aim=null;
     }
     function spinCanAim(now){
-        return settings.returnSpin && player.alive && connected() &&
+        return settings.returnSpin && player.alive && connected() && !session.attacking &&
             session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
             !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
             heal.phase==='idle' && !heal.foodSelected &&
@@ -2716,7 +2716,7 @@
     function restoreWeapon() {
         if (!connected() || !transmit(session.weaponPacket)) return false;
         // Restore direction/attack only if a real, manual attack was in progress.
-        const aim = settings.returnSpin && spin.aim ? spin.aim : currentAim();
+        const aim = !session.attacking && settings.returnSpin && spin.aim ? spin.aim : currentAim();
         if (aim) transmit(session.attacking ? [19, ...aim] : [13, ...aim]);
         return true;
     }
@@ -3580,6 +3580,7 @@
     },true);
     window.addEventListener('blur',()=>{
         if(session.attacking && connected())transmit([18]);
+        if(session.attacking)resetSpin();
         session.attacking=false;
         clearMacros();
         // Keyup may not be delivered after switching tabs. Stop a movement
@@ -4406,18 +4407,19 @@
                     if (raw.length >= 3) {
                         session.nativeAim = [raw[1], raw[2]];
                     }
-                    if (raw[0] === 19) session.attacking = true;
-                    if(raw.length===3 && spinCanAim(performance.now())){
-                        // Native aim updates otherwise snap rotation back to
-                        // the mouse. Only redirect a real, user-issued attack.
-                        if(raw[0]===13){driveSpin();return;}
-                        const aim=advanceSpin(performance.now());
-                        const result=originalSend.call(this,new Uint8Array([19,...aim]));
-                        spin.lastSentAt=performance.now();
-                        return result;
+                    // Manual attack direction always belongs to the native
+                    // client. Aim-only spin must not redirect a held attack.
+                    if (raw[0] === 19) {
+                        if(!session.attacking)resetSpin();
+                        session.attacking=true;
+                    } else if(raw.length===3 && spinCanAim(performance.now())){
+                        driveSpin();return;
                     }
                     break;
-                case 18: session.attacking = false; break;
+                case 18:
+                    if(session.attacking)resetSpin();
+                    session.attacking=false;
+                    break;
             }
         }
         const result = originalSend.apply(this, arguments);
@@ -4879,7 +4881,7 @@
           </div>
           <div class="content" data-panel="fun" hidden>
             <div class="section-intro"><span><strong>FUN</strong><small>Rotação e nomes engraçados</small></span></div>
-            <label title="Giro contínuo e fluido com qualquer item na mão, mesmo sem retorno ou cama. Não inicia ataques; pausa apenas durante ações automáticas incompatíveis.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
+            <label title="Giro contínuo com qualquer item. Ao atacar, respeita a mira do mouse e retoma o giro ao soltar. Não inicia ataques automaticamente.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
             <label title="Velocidade angular em graus por segundo, sem máximo configurado. 360 = uma volta por segundo.">Velocidade 360°/s<input data-heal-setting="spinDegreesPerSecond" type="number" min="0" step="any"></label>
             <div class="nx-info-line">360 = 1 volta/s • 720 = 2 voltas/s</div>
             <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
