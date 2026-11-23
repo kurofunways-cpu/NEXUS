@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.49
+// @version      1.8.50
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.49';
+    const NEXUS_VERSION = '1.8.50';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -92,6 +92,7 @@
         smartNames: false,
         deathChat: true,
         counterAttack: false,
+        copyNearbyHat: false,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -569,6 +570,10 @@
     function observeSelfHat(id, now=performance.now()) {
         if (!Number.isInteger(id) || id<0 || id>11) return;
         hat.current=id;
+        if(settings.copyNearbyHat){
+            if(hatCopy.target && id===hatCopy.target.hat){hatCopy.status='Chapéu confirmado #'+id;hatCopy.tries=0;}
+            return; // Never overwrite the user's saved last hat with a copied hat.
+        }
         if (hat.pending) {
             if (id===hat.wanted) { hat.pending=false; return; }
             // Keep the pre-death hat during the un-equipped respawn phase.
@@ -579,7 +584,7 @@
         // fresh spawn snapshot doesn't mean the previous hat was unequipped.
     }
     function tryRestoreHat(now=performance.now()) {
-        if (ageRecovery.pending) return; // Do not undo Immunity before the food.
+        if (ageRecovery.pending || (settings.copyNearbyHat && hatCopy.target)) return; // Copy/Immunity owns hat selection.
         if (!hat.pending || !settings.autoLastHat || !player.alive || !connected() ||
             !hat.wanted || hat.tries>=2 || now<hat.nextAt ||
             session.ws.bufferedAmount>2048) return;
@@ -1641,6 +1646,7 @@
     }
     function spinCanAim(now){
         return settings.returnSpin && player.alive && connected() && !session.attacking &&
+            now-counter.lastAt>=110 &&
             session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
             !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
             heal.phase==='idle' && !heal.foodSelected &&
@@ -2673,7 +2679,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
-        resetSpin();resetCounter();
+        resetSpin();resetCounter();resetHatCopy();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -2711,7 +2717,7 @@
             session.weaponPacket = [2,15];
             session.weaponIds[1] = 15;
         } else if (session.weaponPacket[0] === 0 &&
-                   [0,1,3,4,13,17,28,30,31].includes(id)) {
+                   [0,1,2,3,4,13,17,26,27,28,30,31,36,37,40].includes(id)) {
             session.weaponIds[session.weapon] = id;
         }
     }
@@ -2930,6 +2936,7 @@
         // normal onGameMessage tail will use that newer position instead.
         if(bed.pending && bed.self && session.self && bed.self.at>=session.self.at)
             trySpawnBed(now);
+        driveCounter(now); // Ordered weapon restoration already sent; no extra tick required.
         return true;
     }
     function randomHold() {
@@ -3804,55 +3811,101 @@
         menu.querySelector('#gpt-pick-save').disabled = !count;
         menu.querySelector('#gpt-pick-delete').disabled = !profile;
     }
-    // FUN: conservative retaliation using fresh snapshots. The damage
-    // message does not identify an attacker; never assume a nearby player
-    // is guilty merely because they are the closest.
-    const COUNTER_MELEE=new Set([0,1,2,3,13,15,17,28,30,31,36,37,40]);
-    const COUNTER_RANGE=120, COUNTER_THREAT_RANGE=155;
-    const counter={target:null,lastAt:-Infinity,status:'Aguardando dano'};
+    // FUN: damage-triggered retaliation, based on approximate weapon reach.
+    // The protocol does not expose attacker identity or exact hitbox geometry.
+    const COUNTER_REACH=new Map([[0,90],[1,110],[2,155],[3,115],[13,100],[15,95],
+        [17,170],[28,165],[30,130],[31,105],[36,170],[37,170],[40,170]]);
+    const counter={target:null,lastAt:-Infinity,status:'Aguardando dano',players:new Map()};
+    const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
-        counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando dano';
+        counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando dano';counter.players.clear();
+    }
+    function resetHatCopy(){
+        hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.status='Aguardando jogador';
+    }
+    function counterWeapon(now){
+        const r=heal.restore;
+        // WebSocket sends are ordered. Once the restore selection was sent,
+        // the next attack can select that same known weapon explicitly.
+        if(r && r.sent && r.epoch===session.connectionEpoch &&
+            now-r.at<=250){
+            const id=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
+            return COUNTER_REACH.has(id)?{id,select:true}:null;
+        }
+        return now-heal.observedItemAt<=250 && COUNTER_REACH.has(heal.observedItem)?
+            {id:heal.observedItem,select:false}:null;
     }
     function observeCounter(packet,now,damaged){
-        if(!settings.counterAttack || !player.alive || !session.self ||
+        if((!settings.counterAttack && !settings.copyNearbyHat) || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
-        const self=session.self, candidates=[], seen=new Map();
+        const self=session.self;
         let hazard=false;
         for(let i=1;i+18<packet.length;i+=19){
-            if(packet[i+8]&2)continue;
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8,sid=packet[i+1];
+            if(type===0 && (packet[i+8]&2)){counter.players.delete(id);if(counter.target?.id===id)counter.target=null;continue;}
+            if(packet[i+8]&2)continue;
             const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
-            const distance=Math.hypot(x-self.x,y-self.y);
-            if([2,7,9,17].includes(type) && sid!==self.sid && distance<100)hazard=true;
-            if(type!==0 || id===player.id || sid===self.sid ||
-                (self.team!==0 && self.team===packet[i+12]) || packet[i+13]===0)continue;
-            const e={id,sid,x,y,at:now,distance,weapon:packet[i+10]};
-            seen.set(id,e);
-            if(!COUNTER_MELEE.has(e.weapon) || distance>COUNTER_THREAT_RANGE)continue;
-            const direction=packet[i+9]*2*Math.PI/255-Math.PI;
-            const toward=Math.atan2(self.y-y,self.x-x);
-            const facing=Math.cos(direction-toward)>=Math.cos(0.7);
-            if(facing)candidates.push(e);
+            if([2,7,9,17].includes(type) && sid!==self.sid && Math.hypot(x-self.x,y-self.y)<100)hazard=true;
+            if(type!==0 || id===player.id || sid===self.sid)continue;
+            if(packet[i+13]===0){counter.players.delete(id);if(counter.target?.id===id)counter.target=null;continue;}
+            counter.players.set(id,{id,sid,x,y,at:now,weapon:packet[i+10],hat:packet[i+11],
+                team:packet[i+12],angle:packet[i+9]*2*Math.PI/255-Math.PI});
         }
+        for(const [id,e] of counter.players)if(now-e.at>350)counter.players.delete(id);
+        if(counter.players.size>128)for(const [id] of [...counter.players.entries()].sort((a,b)=>a[1].at-b[1].at).slice(0,counter.players.size-128))counter.players.delete(id);
+        if(settings.copyNearbyHat){
+            let nearest=null,best=Infinity;
+            for(const e of counter.players.values()){
+                if(!Number.isInteger(e.hat)||e.hat<0||e.hat>11)continue;
+                const d=Math.hypot(e.x-self.x,e.y-self.y);
+                if(d<best){best=d;nearest=e;}
+            }
+            if(!nearest){hatCopy.target=null;hatCopy.status='Aguardando jogador';}
+            else{
+                if(!hatCopy.target || hatCopy.target.hat!==nearest.hat){
+                    hatCopy.tries=0;hatCopy.status='Alvo: chapéu #'+nearest.hat;
+                }
+                hatCopy.target=nearest;
+            }
+        }
+        if(!settings.counterAttack)return;
         if(damaged){
-            // A nearby hostile structure can account for the hit instead.
             if(!hazard)for(const o of deathReturn.objects.values()){
                 if([2,7,9,17].includes(o.type) && o.sid!==self.sid &&
                     now-o.at<1500 && Math.hypot(o.x-self.x,o.y-self.y)<100){hazard=true;break;}
             }
+            const candidates=[];
+            for(const e of counter.players.values()){
+                if(now-e.at>250 || (self.team!==0&&self.team===e.team))continue;
+                const reach=COUNTER_REACH.get(e.weapon);
+                const distance=Math.hypot(e.x-self.x,e.y-self.y);
+                if(!reach || distance>reach+35)continue;
+                const toward=Math.atan2(self.y-e.y,self.x-e.x);
+                if(Math.cos(e.angle-toward)>=Math.cos(0.85))candidates.push(e);
+            }
             if(!hazard && candidates.length===1){
-                counter.target={...candidates[0],expires:now+650};
+                counter.target={...candidates[0],expires:now+950};
                 counter.status='Possível agressor detectado';
             }else{
-                counter.target=null;
-                counter.status=hazard?'Dano próximo a estrutura; sem ataque':
-                    'Agressor incerto; sem ataque';
+                counter.target=null;counter.status=hazard?'Dano próximo a estrutura; sem ataque':'Agressor incerto; sem ataque';
             }
         }else if(counter.target){
-            const old=counter.target,e=seen.get(old.id);
-            if(e && e.sid===old.sid)counter.target={...e,expires:old.expires};
-            else if(e)counter.target=null;
+            const old=counter.target,e=counter.players.get(old.id);
+            if(e && e.sid===old.sid && !(self.team!==0&&self.team===e.team))
+                counter.target={...e,expires:old.expires};
+            else counter.target=null;
         }
+    }
+    function driveHatCopy(now=performance.now()){
+        const t=hatCopy.target;
+        if(!settings.copyNearbyHat || !player.alive || !connected() || ageRecovery.pending ||
+            !t || now-t.at>350 || now<hatCopy.nextAt || now-hat.lastManualAt<750 ||
+            session.ws.bufferedAmount>=1024 || (settings.lagGuard&&networkState(now)!=='OK'))return false;
+        if(hat.current===t.hat){hatCopy.status='Chapéu confirmado #'+t.hat;return false;}
+        if(hatCopy.tries>=2){hatCopy.status='Chapéu não confirmado / indisponível';return false;}
+        if(!transmit([5,t.hat]))return false;
+        hatCopy.tries++;hatCopy.nextAt=now+1500;hatCopy.status='Tentando chapéu #'+t.hat;
+        return true;
     }
     function driveCounter(now=performance.now()){
         const t=counter.target;
@@ -3861,17 +3914,16 @@
             counter.target=null;counter.status='Agressor fora da janela';return false;
         }
         if(!session.self || now-session.self.at>250 || session.attacking ||
-            heal.phase!=='idle' || heal.foodSelected || heal.restore ||
+            heal.phase!=='idle' || heal.foodSelected ||
             (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ||
-            ageRecovery.pending || bed.locked || (bed.pending && bed.phase==='placing') ||
+            ageRecovery.pending || (bed.pending && bed.phase==='placing' && bed.locked) ||
             macro.selected || Object.keys(macroDefs).some(macroActive) ||
             ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024 ||
             (settings.lagGuard && networkState(now)!=='OK') ||
-            now-counter.lastAt<350)return false;
-        // Require an observed melee item; never attack while holding food,
-        // a building or an unknown item. No chasing or automatic selection.
-        if(!COUNTER_MELEE.has(heal.observedItem) || now-heal.observedItemAt>250 ||
-            Math.hypot(t.x-session.self.x,t.y-session.self.y)>COUNTER_RANGE)return false;
+            now-counter.lastAt<150)return false;
+        const w=counterWeapon(now);
+        if(!w || Math.hypot(t.x-session.self.x,t.y-session.self.y)>COUNTER_REACH.get(w.id))return false;
+        if(w.select && !transmit(session.weaponPacket))return false;
         const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
         if(!transmit([19,...apAngleBytes(angle)]))return false;
         transmit([18]);
@@ -4427,7 +4479,7 @@
             const now=performance.now();
             if (observeAutoPlace(packet,now)) runAutoPlace(now);
         }
-        if(player.alive){if(!driveCounter())driveSpin();announceDeathCount();}
+        if(player.alive){if(!driveCounter())driveSpin();driveHatCopy();announceDeathCount();}
     }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
@@ -4637,6 +4689,12 @@
             else if(!player.alive && connected())startAutoRespawn();
         }
         if(key==='counterAttack')resetCounter();
+        if(key==='copyNearbyHat'){
+            resetHatCopy();
+            if(!settings.copyNearbyHat && settings.autoLastHat && hat.wanted && player.alive){
+                hat.pending=true;hat.tries=0;hat.nextAt=0;tryRestoreHat();
+            }
+        }
         if(key==='deathChat' && !settings.deathChat)deathChat.pending=false;
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
@@ -4703,6 +4761,8 @@
     }
     function refreshInputs() {
         if (!menu) return;
+        const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
+        if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
         if(counterStatus)counterStatus.textContent='Contra-ataque: '+(settings.counterAttack?counter.status:'desativado');
         const countStatus=menu.querySelector('#nx-death-count');
@@ -5020,6 +5080,8 @@
             <label title="Anuncia o total de mortes no chat após renascer, com intervalo mínimo de 3 segundos. Contagem por aba.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
             <label title="Ao receber dano, tenta um golpe contra o provável agressor próximo. Não ataca aliados, não persegue e evita situações ambíguas. Cura e ataque manual têm prioridade.">Contra-ataque<input data-heal-setting="counterAttack" type="checkbox"></label>
             <div class="nx-info-line" id="nx-counter-status">Contra-ataque: desativado</div>
+            <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-hat-copy-status">Chapéu: cópia desativada</div>
             <div class="nx-info-line" id="nx-death-count">Mortes: 0</div>
             <button type="button" id="nx-death-reset" title="Zera apenas o contador de mortes desta aba">Zerar mortes</button>
           </div>
