@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.36
+// @version      1.8.37
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.36';
+    const NEXUS_VERSION = '1.8.37';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -826,7 +826,7 @@
     const RETURN_MAX_TIME=60000, RETURN_MAX_STEPS=220;
     // Structural obstacles persist between incremental world updates. Deletions
     // are applied immediately by observeReturnObjects; TTL is a safety fallback.
-    const RETURN_MAP_TTL=120000;
+    const RETURN_MAP_TTL=300000;
     const returnPaths=[];
     try {
         const saved=JSON.parse(localStorage.getItem(RETURN_ROUTES_KEY)||'[]');
@@ -855,7 +855,7 @@
         driftSamples:0, manualMove:false, arrivals:0,
         lastHitAt:-Infinity, lastKnockbackAt:-Infinity,
         spawnLayout:'clear',
-        objects:new Map(), frontObstacle:null, forceRethink:false,
+        objects:new Map(), movers:new Map(), frontObstacle:null, forceRethink:false,
         // Navigation confidence comes from actual server-confirmed progress,
         // NOT from changes in any direction or assumptions about wall radii.
         observedAt:0,forwardBest:0,progressSamples:0,observedSpeed:0.24,
@@ -881,7 +881,7 @@
         deathReturn.nextAt=0;deathReturn.bad=[];deathReturn.fails=0;
         deathReturn.driftSamples=0;deathReturn.manualMove=false;deathReturn.arrivals=0;
         deathReturn.lastHitAt=-Infinity;deathReturn.lastKnockbackAt=-Infinity;
-        deathReturn.trace=[];deathReturn.objects.clear();deathReturn.frontObstacle=null;
+        deathReturn.trace=[];deathReturn.objects.clear();deathReturn.movers.clear();deathReturn.frontObstacle=null;
         deathReturn.observedAt=0;deathReturn.forwardBest=0;deathReturn.progressSamples=0;
         deathReturn.recentSites=[];deathReturn.detourSide=1;
         deathReturn.verifiedPath=[];deathReturn.learningClean=true;
@@ -928,6 +928,8 @@
                 }
             }
         }
+        if(previous && ['moving','ready'].includes(deathReturn.phase))
+            returnLearnPassage(previous,current,now);
         deathReturn.lastSelf=current;
         deathReturn.self=current;
         recordReturnTrail(current);
@@ -985,6 +987,7 @@
         deathReturn.epoch++;
         deathReturn.phase='waiting';deathReturn.status=deathReturn.target ? 'Aguardando cama confirmada' : 'Morte sem posição confirmada';
         deathReturn.self=null;deathReturn.lastSelf=null;deathReturn.aliveTrail=[];
+        deathReturn.movers.clear(); // previous-life dynamic hitboxes are stale
         deathReturn.trace=[];deathReturn.route=[];deathReturn.step=0;
         deathReturn.moveTo=null;deathReturn.attempted=0;deathReturn.startedAt=0;
         deathReturn.bad=[];deathReturn.fails=0;deathReturn.nextAt=0;
@@ -998,15 +1001,21 @@
         deathReturn.socketEpoch=session.connectionEpoch;
         deathReturn.server=String(session.ws?.url||'');
     }
+    // Hitbox categories are not identical: solid objects stop movement,
+    // spikes/traps are dangerous but traversable, and mobile entities change
+    // position. Avoid turning a player or a damage zone into a permanent wall.
+    // Entity types come from server snapshots, not inventory IDs.
+    const RETURN_NAV_HAZARDS=new Set([2,7,9,17]);
+    const RETURN_MOVING_TTL=850;
     function observeReturnObjects(packet,now=performance.now()) {
         if(!(packet instanceof Uint8Array)||(packet.length-1)%19!==0)return;
-        const objects=deathReturn.objects;
+        const objects=deathReturn.objects, movers=deathReturn.movers;
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8;
             const key=sid+':'+type+':'+id;
             if(packet[i+8]&2){
                 const removed=objects.get(key);
-                objects.delete(key);
+                objects.delete(key);movers.delete(key);
                 if(removed){
                     deathReturn.bad=deathReturn.bad.filter(f=>{
                         const vx=f.to.x-f.from.x,vy=f.to.y-f.from.y,
@@ -1022,20 +1031,125 @@
                 }
                 continue;
             }
-            if(!bedBlocksMovement(type))continue;
-            const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
-            objects.set(key,{type,x,y,radius:BED_ENTITY_RADII[type],at:now});
+            const x=packet[i+4]|packet[i+5]<<8,
+                  y=packet[i+6]|packet[i+7]<<8;
+            if(type===0 || BED_NAV_DYNAMIC.has(type)){
+                if(type===0 && id===player.id)continue;
+                const old=movers.get(key),dt=old?now-old.at:0;
+                const dx=old?x-old.x:0,dy=old?y-old.y:0;
+                const speed=dt>15&&dt<500?Math.hypot(dx,dy)/dt:Infinity;
+                const vx=speed<=1.5?dx/dt:0,vy=speed<=1.5?dy/dt:0;
+                movers.set(key,{x,y,at:now,type,sid,team:packet[i+12],
+                    vx,vy,radius:type===0?34:Math.min(65,BED_ENTITY_RADII[type]??35)});
+                continue;
+            }
+            if(!bedBlocksMovement(type) && !RETURN_NAV_HAZARDS.has(type))continue;
+            const old=objects.get(key);
+            objects.set(key,{type,sid,x,y,radius:BED_ENTITY_RADII[type]??40,
+                navPad:old?.navPad??0,at:now});
         }
-        if(objects.size>650)for(const [k,v] of objects){
-            if(now-v.at>RETURN_MAP_TTL||objects.size>570)objects.delete(k);
-        }
+        // Keep static entities across incremental world packets. Remove only
+        // explicit server deletions or genuinely old snapshots; avoid the old
+        // two-minute amnesia in which a standing wall disappeared from A*.
+        for(const [key,v] of objects)
+            if(now-v.at>RETURN_MAP_TTL)objects.delete(key);
+        if(objects.size>650)for(const [key] of [...objects.entries()]
+            .sort((a,b)=>a[1].at-b[1].at).slice(0,objects.size-570))
+            objects.delete(key);
+        for(const [key,v] of movers)
+            if(now-v.at>RETURN_MOVING_TTL)movers.delete(key);
+        if(movers.size>100)for(const [key] of [...movers.entries()]
+            .sort((a,b)=>a[1].at-b[1].at).slice(0,movers.size-70))
+            movers.delete(key);
     }
     function returnObstacles(now=performance.now(),point=deathReturn.self) {
         const result=[];
         if(!point)return result;
         for(const o of deathReturn.objects.values())
-            if(now-o.at<RETURN_MAP_TTL && returnDist(o,point)<550)result.push(o);
+            if(!RETURN_NAV_HAZARDS.has(o.type) && now-o.at<RETURN_MAP_TTL &&
+                returnDist(o,point)<650)
+                result.push({...o,radius:Math.max(8,o.radius+(o.navPad||0))});
         return result;
+    }
+    // Snapshot-driven risk zones are SOFT navigation costs, not permanent
+    // blocked cells. This allows an escape when enemies surround the player.
+    function returnRiskZones(now=performance.now(),point=deathReturn.self){
+        if(!point)return [];
+        const zones=[],selfSid=session.self?.sid,selfTeam=session.self?.team;
+        for(const o of deathReturn.objects.values()){
+            if(!RETURN_NAV_HAZARDS.has(o.type) || now-o.at>RETURN_MAP_TTL ||
+               returnDist(o,point)>650)continue;
+            const own=selfSid!==undefined && o.sid===selfSid;
+            zones.push({x:o.x,y:o.y,radius:o.radius+25,
+                weight:own?18:(o.type===9?200:160),at:o.at});
+        }
+        for(const o of deathReturn.movers.values()){
+            if(now-o.at>RETURN_MOVING_TTL || returnDist(o,point)>490)continue;
+            const predict=Math.min(180,Math.max(0,now-o.at)+85);
+            const friendly=o.type===0 && selfTeam!==0 && o.team===selfTeam;
+            zones.push({x:o.x+o.vx*predict,y:o.y+o.vy*predict,
+                radius:o.radius+26,weight:o.type===0?(friendly?30:75):55,at:o.at});
+        }
+        return zones.sort((a,b)=>returnDist(a,point)-returnDist(b,point)).slice(0,18);
+    }
+    function returnRiskCost(p,zones){
+        let penalty=0;
+        for(const z of zones){
+            const d=returnDist(p,z),outer=z.radius+48;
+            if(d>=outer)continue;
+            const proportion=(outer-d)/outer;
+            penalty+=z.weight*proportion*proportion;
+        }
+        return Math.min(280,penalty);
+    }
+    function returnRiskOnSegment(a,b,zones){
+        const dx=b.x-a.x,dy=b.y-a.y,len2=dx*dx+dy*dy;
+        for(const z of zones){
+            if(z.weight<45)continue;
+            const t=len2>0?Math.max(0,Math.min(1,
+                ((z.x-a.x)*dx+(z.y-a.y)*dy)/len2)):0;
+            if(Math.hypot(z.x-a.x-dx*t,z.y-a.y-dy*t)<z.radius+7)
+                return true;
+        }
+        return false;
+    }
+    // Real movement is stronger evidence than a guessed hitbox radius.
+    // Shrink only this observed object's navigation margin after walking close
+    // to it; no globally permanent collision changes are learned.
+    function returnLearnPassage(from,to,now){
+        if(!from||!to || now-from.at>450 || now-from.at<0 ||
+           returnDist(from,to)<10 || returnDist(from,to)>100 ||
+           now-deathReturn.lastHitAt<550)return;
+        const dx=to.x-from.x,dy=to.y-from.y,len2=dx*dx+dy*dy;
+        for(const o of deathReturn.objects.values()){
+            if(RETURN_NAV_HAZARDS.has(o.type) || now-o.at>RETURN_MAP_TTL ||
+               returnDist(o,to)>180)continue;
+            const t=Math.max(0,Math.min(1,
+                ((o.x-from.x)*dx+(o.y-from.y)*dy)/len2));
+            const d=Math.hypot(o.x-from.x-dx*t,o.y-from.y-dy*t);
+            if(d<o.radius+18 && d>Math.max(0,o.radius-18))
+                o.navPad=Math.max(-15,(o.navPad||0)-2);
+        }
+    }
+    function returnLearnBlockingObstacle(from,to,now){
+        if(now-deathReturn.lastHitAt<750)return;
+        const dx=to.x-from.x,dy=to.y-from.y,len2=dx*dx+dy*dy;
+        if(len2<1)return;
+        let best=null,nearest=Infinity;
+        for(const o of deathReturn.objects.values()){
+            if(RETURN_NAV_HAZARDS.has(o.type) || now-o.at>RETURN_MAP_TTL)continue;
+            const t=Math.max(0,Math.min(1,
+                ((o.x-from.x)*dx+(o.y-from.y)*dy)/len2));
+            const d=Math.hypot(o.x-from.x-dx*t,o.y-from.y-dy*t);
+            const gap=returnDist(o,from)-o.radius;
+            // A real stall occurs at the near edge of a collider, even when
+            // the requested segment crosses its entire circle.
+            if(t>0 && d<o.radius+22 && gap>=-8 && gap<55 && gap<nearest){
+                best=o;nearest=gap;
+            }
+        }
+        // Only a stable, observed stall can increase a local margin.
+        if(best)best.navPad=Math.min(18,(best.navPad||0)+4);
     }
     // Navigation "radar": sweep a circle representing our player along the
     // intended movement segment. All coordinates come from server snapshots;
@@ -1159,7 +1273,7 @@
         return penalty;
     }
 
-    function returnTrimTrail(trail,start,goal,obs) {
+    function returnTrimTrail(trail,start,goal,obs,risk=[]) {
         if(!Array.isArray(trail)||trail.length<2||!start||!goal)return null;
         let first=-1,best=125;
         for(let i=0;i<trail.length;i++){
@@ -1175,10 +1289,13 @@
         while(idx<tail.length&&points.length<190){
             let end=idx;
             for(let j=Math.min(tail.length-1,idx+17);j>=idx;j--){
-                if(returnSegmentClear(at,tail[j],obs,16)&&!returnBadEdge(at,tail[j])){end=j;break;}
+                if(returnSegmentClear(at,tail[j],obs,16)&&
+                   !returnRiskOnSegment(at,tail[j],risk)&&
+                   !returnBadEdge(at,tail[j])){end=j;break;}
             }
             const next=tail[end];
-            if(returnBadEdge(at,next)||!returnSegmentClear(at,next,obs,10))return null;
+            if(returnBadEdge(at,next)||!returnSegmentClear(at,next,obs,10)||
+               returnRiskOnSegment(at,next,risk))return null;
             if(returnDist(at,next)>RETURN_WAYPOINT)points.push(next);
             at=next;idx=end+1;
         }
@@ -1205,6 +1322,7 @@
             // preserves more direct progress. Avoid previously failed legs.
             const lineClear=returnSegmentClear(start,point,obstacles,clearance);
             const score=returnDist(point,end)+returnLoopPenalty(point,start)+
+                returnRiskCost(point,returnRiskZones(performance.now(),start))+
                 (lineClear?0:65)+(returnBadEdge(start,point)?480:0)+
                 (side===deathReturn.detourSide?-20:20);
             if(score<best){best=score;choice=point;}
@@ -1216,7 +1334,8 @@
     function routeToReturnGoal(now,clearance=22) {
         const start=deathReturn.self,goal=deathReturn.target;
         if(!start||!goal)return null;
-        const obs=returnObstacles(now,start),distance=returnDist(start,goal);
+        const obs=returnObstacles(now,start),risk=returnRiskZones(now,start),
+            distance=returnDist(start,goal);
         if(distance<=RETURN_ARRIVED)return [];
         const heading=Math.atan2(goal.y-start.y,goal.x-start.x);
         // Local planner may see a longer corridor, but each *actual* move is
@@ -1227,6 +1346,7 @@
         const shortLeg=distance<=80?goal:{
             x:start.x+Math.cos(heading)*80,y:start.y+Math.sin(heading)*80};
         if(returnSegmentClear(start,shortLeg,obs,clearance)&&
+            !returnRiskOnSegment(start,shortLeg,risk) &&
             !returnBadEdge(start,shortLeg) &&
             (!returnFrontObstacle(start,intermediate,obs,clearance) ||
                 returnDist(start,returnFrontObstacle(start,intermediate,obs,clearance))>110))
@@ -1290,7 +1410,7 @@
                 const p=coords(id);
                 if(!returnSegmentClear(at,p,obs,clearance)||returnBadEdge(at,p))continue;
                 const next=bestScore[atId]+Math.hypot(dx,dy)*cell+
-                    returnLoopPenalty(p,start)*0.11;
+                    returnLoopPenalty(p,start)*0.11+returnRiskCost(p,risk);
                 if(next<bestScore[id]){
                     bestScore[id]=next;parents[id]=atId;
                     pushNode(id,next+returnDist(p,planGoal));
@@ -1311,6 +1431,7 @@
         while(idx<path.length){
             let j=path.length-1;
             for(;j>idx;j--)if(returnSegmentClear(current,path[j],obs,clearance)&&
+                    !returnRiskOnSegment(current,path[j],risk)&&
                     !returnBadEdge(current,path[j]))break;
             const p=path[j];smoothed.push(p);current=p;idx=j+1;
         }
@@ -1349,7 +1470,8 @@
             if(r.socket!==socket||!returnLayoutSimilar(r.layout,layout)||
                 returnDist(r.spawn,bed.origin)>65||
                 returnDist(r.goal,goal)>60)continue;
-            const route=returnTrimTrail(r.path,start,goal,obs);
+            const route=returnTrimTrail(r.path,start,goal,obs,
+                returnRiskZones(now,start));
             if(route)return route;
         }
         return null;
@@ -1560,9 +1682,15 @@
                 const pushedOffCourse=cadenceStable && fresh && lateral>42 &&
                     forward<leg*0.35;
                 if(stalled || pushedOffCourse){
+                    // A passing player or a recent hit cannot establish that a
+                    // corridor is permanently blocked by a wall.
+                    const temporaryRisk=now-deathReturn.lastHitAt<750 ||
+                        returnRiskOnSegment(at,to,returnRiskZones(now,at));
+                    if(stalled && !temporaryRisk)
+                        returnLearnBlockingObstacle(at,to,now);
                     // The blocked segment begins at the last *observed*
                     // position, not the theoretical route's first waypoint.
-                    markReturnBlocked({x:at.x,y:at.y},to,now);
+                    if(!temporaryRisk)markReturnBlocked({x:at.x,y:at.y},to,now);
                     stopReturnMovement();deathReturn.fails++;
                     deathReturn.route=[];deathReturn.step=0;
                     deathReturn.phase='ready';deathReturn.nextAt=now+20;
@@ -1594,12 +1722,15 @@
             // Short unobstructed corrections should not wait for a full A*.
             if(distance<=165 && returnSegmentClear(deathReturn.self,
                     deathReturn.target,obstacles,15) &&
+                !returnRiskOnSegment(deathReturn.self,deathReturn.target,
+                    returnRiskZones(now,deathReturn.self)) &&
                 !returnBadEdge(deathReturn.self,deathReturn.target)) {
                 route=[{x:deathReturn.target.x,y:deathReturn.target.y}];
             }
             if(!route && !deathReturn.fails){
                 route=replayReturnPath(now)||returnTrimTrail(deathReturn.recorded,
-                    deathReturn.self,deathReturn.target,obstacles);
+                    deathReturn.self,deathReturn.target,obstacles,
+                    returnRiskZones(now,deathReturn.self));
                 deathReturn.usedRecorded=!!route;
             }
             if(!route)for(const clearance of [26,20,15]){
