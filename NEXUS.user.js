@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.38
+// @version      1.8.39
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.38';
+    const NEXUS_VERSION = '1.8.39';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -829,6 +829,8 @@
     // position snapshot. Keep the last position from THIS socket for 12s.
     const RETURN_TTL=12000, RETURN_SNAPSHOT_TTL=1050;
     const RETURN_ARRIVED=20, RETURN_WAYPOINT=16;
+    // A death inside this radius keeps the ORIGINAL destination, not the latest death.
+    const RETURN_DEATH_RADIUS=120;
     // Return is sticky within a small tolerance. A real knockback should
     // restart navigation on its FIRST server-confirmed displacement, not after
     // multiple snapshots while opponents push the character farther away.
@@ -969,6 +971,8 @@
         }
     }
     function captureReturnDeath(now=performance.now()) {
+        if(!player.alive)return; // duplicate death messages must not move the anchor
+        const previousTarget=deathReturn.target;
         stopReturnMovement();
         deathReturn.epoch++;
         deathReturn.phase='idle';deathReturn.status='Aguardando cama';
@@ -988,7 +992,9 @@
             deathReturn.socketEpoch!==session.connectionEpoch){
             deathReturn.status='Morte: última posição não recebida';return;
         }
-        deathReturn.target={x:last.x,y:last.y};
+        // The circle is a retention boundary, never an arrival boundary.
+        deathReturn.target=previousTarget && returnDist(last,previousTarget)<=RETURN_DEATH_RADIUS
+            ? previousTarget : {x:last.x,y:last.y};
         const trace=deathReturn.aliveTrail;
         if(trace.length>2)deathReturn.recorded=trace.slice(-500).map(p=>({x:p.x,y:p.y}));
     }
@@ -3829,7 +3835,7 @@
             // Some fast respawns can skip the death message entirely. Preserve
             // the last position only when this was already an active life on
             // the SAME WebSocket; new connections start with player.alive=false.
-            if(player.alive && settings.returnAfterBed && !deathReturn.target)
+            if(player.alive && settings.returnAfterBed)
                 captureReturnDeath();
             clearMacros(false);
             resetPlacementTracking();
@@ -4229,7 +4235,7 @@
         if(returnStatus)returnStatus.textContent=!settings.returnAfterBed?'Retorno: desativado' :
             !settings.autoSpawnBed?'Retorno: ative Cama no Respawn' :
             !deathReturn.target?'Retorno: aguardando uma morte' :
-            deathReturn.status + (['moving','ready','arrived'].includes(deathReturn.phase) ?
+            deathReturn.status + ` • Raio ${RETURN_DEATH_RADIUS}u` + (['moving','ready','arrived'].includes(deathReturn.phase) ?
                 ` • ${Math.round(returnDist(deathReturn.self||bed.origin||deathReturn.target,deathReturn.target))} unidades • falhas ${deathReturn.fails}` : '') +
             (deathReturn.frontObstacle && deathReturn.phase!=='arrived' ?
                 ` • Frente: ${returnObstacleLabel(deathReturn.frontObstacle.type)}` : '')+
@@ -4491,7 +4497,7 @@
             <label title="Após morrer, clica automaticamente no Play do jogo. Repete após cada morte enquanto ativo.">Auto Spawn<input data-heal-setting="autoRespawn" type="checkbox"></label>
             <label title="Após morrer, tenta reequipar o último chapéu observado. O servidor precisa autorizar a compra/equipamento">Último Chapéu<input data-heal-setting="autoLastHat" type="checkbox"></label>
             <label title="Usa caminhos aprendidos por configuração das estruturas; descarta posições antigas quando troca de servidor.">Cama no Respawn<input data-heal-setting="autoSpawnBed" type="checkbox"></label>
-            <label title="Após confirmar a cama, permanece no ponto da morte. Se for deslocado, recalcula a rota e retorna, até desativar a opção. Requer Cama no Respawn.">Fixar no Local da Morte<input data-heal-setting="returnAfterBed" type="checkbox"></label>
+            <label title="Após confirmar a cama, retorna ao ponto original da morte. Mortes dentro do raio de 120 unidades mantêm esse ponto; fora dele criam um novo. Requer Cama no Respawn.">Fixar no Local da Morte<input data-heal-setting="returnAfterBed" type="checkbox"></label>
             <div class="nx-info-line" id="nx-bed-status">Cama: aguardando respawn</div>
             <div class="nx-info-line" id="nx-return-status">Retorno: aguardando morte</div>
             <div class="pick-actions" style="margin-top:8px">
