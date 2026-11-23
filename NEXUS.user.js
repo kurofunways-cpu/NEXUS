@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.43
+// @version      1.8.44
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.43';
+    const NEXUS_VERSION = '1.8.44';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -2437,7 +2437,9 @@
             player.alive && connected() && bed.spawnAnchorConfirmed &&
             !!bed.origin && !!bed.self &&
             now-bed.self.at<=BED_SNAPSHOT_TTL &&
-            player.health>=90 && heal.phase==='idle' && !macro.selected &&
+            // Movement and healing use separate channels. Low HP alone must
+            // never block bed navigation, even with Auto Heal disabled.
+            !macro.selected &&
             !Object.keys(macroDefs).some(macroActive) && !ap.manualItem &&
             // The HUD can stay open for diagnostics. It must never cancel a task.
             session.ws.bufferedAmount<2048;
@@ -2476,8 +2478,9 @@
             if (now-bed.lastAt>=1000) abortSpawnBed('Player resumed movement');
             return;
         }
+        if(bed.phase==='await-heal' && bed.handoffMove)return;
         if(bed.phase==='moving') {
-            if(player.health<90 || heal.phase!=='idle' || macro.selected ||
+            if(macro.selected ||
                 ap.manualItem || session.ws.bufferedAmount>=2048) {
                 stopBedMovement();bed.phase='await-position';
                 bed.route=[];bed.awaitFreshAt=now;bed.nextAt=now+25;return;
@@ -2550,6 +2553,21 @@
             }
             bed.noRoute=0;bed.route=route;bed.routeAt=now;bed.waypoint=0;
             driveBedWaypoint(now,route[0]);return;
+        }
+        // Only the actual building selection conflicts with food. Keep the
+        // task pending, release movement controls and their safety timer, and
+        // do not count a food hold as a failed placement or navigation leg.
+        if(heal.phase!=='idle' || heal.foodSelected){
+            stopBedMovement();
+            bed.phase='await-heal';
+            if(bed.locked)releaseBedInput(true);
+            return;
+        }
+        if(bed.phase==='await-heal'){
+            // Replan from the fresh position above if knockback moved us.
+            // A real manual movement handoff must not be stolen mid-keyhold.
+            if(bed.handoffMove)return;
+            bed.phase='placing';
         }
         if(bed.tries>=4) {
             // Wait for a fresh snapshot; no server response is not proof of
@@ -2812,6 +2830,12 @@
         if (heal.sentTimes.length>80) heal.sentTimes.splice(0,heal.sentTimes.length-80);
         heal.nextAt = now + smartHealInterval();
         wakeAt(heal.nextAt);
+        // Legit Heal may immediately start another hold on the next snapshot.
+        // Use this idle gap; do not postpone a bed forever under repeated hits.
+        // If the current snapshot has not yet reached observeSpawnBed, the
+        // normal onGameMessage tail will use that newer position instead.
+        if(bed.pending && bed.self && session.self && bed.self.at>=session.self.at)
+            trySpawnBed(now);
         return true;
     }
     function randomHold() {
@@ -4397,6 +4421,7 @@
                 !bed.pending ? `Cama: ${bed.abortReason||'aguardando respawn'}` :
                 !bed.unlocked ? 'Cama: aguardando item no inventário' :
                 !bed.origin ? 'Cama: aguardando posição do spawn' :
+                bed.phase==='await-heal' ? 'Cama: aguardando fim da cura (tentativa mantida)' :
                 bed.phase==='moving' ? (bed.usedLearned ?
                     'Cama: rota aprendida (WASD bloqueado)' :
                     'Cama: desviando de rotas falhas (WASD bloqueado)') :
