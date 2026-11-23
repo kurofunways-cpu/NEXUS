@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.37
+// @version      1.8.38
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.37';
+    const NEXUS_VERSION = '1.8.38';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -605,19 +605,24 @@
     // Explicit state=DELETE packets evict it immediately; TTL is a failsafe.
     const BED_NEARBY_TTL=120000;
     const BED_SNAPSHOT_TTL=850;
+    // Current spawn must be confirmed in two consistent snapshots.
+    const BED_ORIGIN_MAX_DRIFT=42, BED_ORIGIN_CONFIRM_GAP=1500;
     // Save only successful, server-observed paths; negative examples are
     // stored per obstacle layout. Coordinates are relative to the NEW spawn,
     // never absolute map positions from another server.
     // The route archive is kept separate from older, incorrectly mapped collision data.
     // The old route archive was generated while wood walls (type 8) were
     // mistakenly considered radius 0. Never replay paths learned on that map.
-    const BED_ROUTE_STORAGE=PREFIX+'bed_route_knowledge_v3';
+    // Do not replay old unscoped routes from earlier servers/bed locations.
+    const BED_ROUTE_STORAGE=PREFIX+'bed_route_knowledge_v4';
     const BED_ROUTE_MEMORY_MAX=36;
     let bedRouteKnowledge=[];
     try {
         const records=JSON.parse(localStorage.getItem(BED_ROUTE_STORAGE)||'[]');
         if(Array.isArray(records))bedRouteKnowledge=records.filter(r=>
             r && typeof r.key==='string' && r.key.length<500 &&
+            typeof r.server==='string' && r.server.length<250 &&
+            r.anchor && Number.isFinite(r.anchor.x) && Number.isFinite(r.anchor.y) &&
             (!r.good || (Array.isArray(r.good) && r.good.length<=16 &&
                 r.good.every(p=>p && Number.isFinite(p.x) && Number.isFinite(p.y) &&
                     Math.abs(p.x)<=240 && Math.abs(p.y)<=240))) &&
@@ -636,6 +641,8 @@
     } catch (_) {}
     const bed={pending:false,unlocked:false,confirmed:false,tries:0,
         nextAt:0,lastAt:0,epoch:0,preSpawnUnlockAt:0,
+        spawnAt:0,spawnCandidate:null,spawnCandidateCount:0,
+        spawnAnchorConfirmed:false,earlyBeds:new Map(),
         phase:'idle',origin:null,self:null,sid:null,nearby:new Map(),
         stepAngle:null,startedAt:0,stopTimer:null,moveOwned:false,
         moveRevision:0,moveTries:0,moveDirection:'out',awaitFreshAt:0,
@@ -793,6 +800,9 @@
         stopBedMovement();
         releaseBedInput();
         bed.epoch++;
+        bed.spawnAt=performance.now();
+        bed.spawnCandidate=null;bed.spawnCandidateCount=0;
+        bed.spawnAnchorConfirmed=false;bed.earlyBeds.clear();
         bed.pending=!!(settings.autoSpawnBed && player.alive);
         // An inventory update can precede spawn during fast reconnects.
         bed.unlocked=!!(bed.preSpawnUnlockAt && performance.now()-bed.preSpawnUnlockAt<1500);
@@ -1787,8 +1797,10 @@
     function noteBedInventory(packet) {
         if (packet instanceof Uint8Array && packet[0]===2 &&
             packet.subarray(1).includes(SPAWN_BED_ID)) {
-            if (player.alive) bed.unlocked=true;
-            else bed.preSpawnUnlockAt=performance.now();
+            if (player.alive) {
+                if (bed.pending && bed.socketEpoch===session.connectionEpoch)
+                    bed.unlocked=true;
+            } else bed.preSpawnUnlockAt=performance.now();
         }
     }
     function observeSpawnBed(packet,now=performance.now()) {
@@ -1804,12 +1816,47 @@
             break;
         }
         if (self) {
+            if(bed.socketEpoch!==session.connectionEpoch ||
+               now<bed.spawnAt)return;
             bed.seenSnapshots++;
             bed.self=self;
-            if (!bed.origin) bed.origin={x:self.x,y:self.y,at:now};
+            if(!bed.origin) {
+                const candidate=bed.spawnCandidate;
+                if(!candidate || now-candidate.at>BED_ORIGIN_CONFIRM_GAP ||
+                   bedDistance(candidate,self)>BED_ORIGIN_MAX_DRIFT) {
+                    bed.spawnCandidate={x:self.x,y:self.y,at:now};
+                    bed.spawnCandidateCount=1;
+                } else if(++bed.spawnCandidateCount>=2) {
+                    bed.origin={x:candidate.x,y:candidate.y,at:now};
+                    bed.spawnAnchorConfirmed=true;
+                }
+            }
             if (bed.locked && bed.origin && bed.pending) rememberBedMovement(self);
         }
-        if (!bed.origin || bed.sid===null) return;
+        // Pre-anchor bed entities may arrive only once in incremental updates.
+        if(bed.sid!==null)for(let i=1;i+18<packet.length;i+=19) {
+            if(packet[i]!==SPAWN_BED_ENTITY_TYPE ||
+               packet[i+1]!==bed.sid || (packet[i+8]&2))continue;
+            const key=packet[i+1]+':'+packet[i]+':'+
+                (packet[i+2]|packet[i+3]<<8);
+            bed.earlyBeds.set(key,{x:packet[i+4]|packet[i+5]<<8,
+                y:packet[i+6]|packet[i+7]<<8,at:now});
+        }
+        if (!bed.origin || bed.sid===null || !bed.spawnAnchorConfirmed)return;
+        if(bed.tries===0 && bed.lastAt===0) {
+            for(const existing of bed.earlyBeds.values()) {
+                if(now-existing.at>3000 ||
+                   bedDistance(existing,bed.origin)>BED_POSITION_TOLERANCE)continue;
+                // An existing own bed at this fresh spawn requires no travel.
+                stopBedMovement(true,bed.locked);
+                bed.pending=false;bed.confirmed=true;bed.phase='existing';
+                bed.route=[];bed.waypoint=0;bed.moveTo=null;
+                releaseBedInput();
+                if(settings.returnAfterBed && deathReturn.target)
+                    beginReturnIfReady(now);
+                return;
+            }
+        }
         for (let i=1;i+18<packet.length;i+=19) {
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8;
             const key=packet[i+1]+':'+type+':'+id;
@@ -1979,11 +2026,18 @@
     }
     // A few pixels of spawn-position or object jitter should not cause a new
     // memory slot. Reuse only near-identical obstacle layouts, not old servers.
+    function bedMemoryMatchesSite(record) {
+        return !!(record && bed.origin && session.ws &&
+            bed.socketEpoch===session.connectionEpoch &&
+            record.server===String(session.ws.url||'') &&
+            record.anchor && bedDistance(record.anchor,bed.origin)<=42);
+    }
     function matchingBedKnowledge(key) {
         const scene=decodeBedLayout(key);
         if(!scene)return null;
         let best=null,bestCost=Infinity;
         for(const record of bedRouteKnowledge) {
+            if(!bedMemoryMatchesSite(record))continue;
             const saved=decodeBedLayout(record.key);
             if(!saved || saved.length!==scene.length)continue;
             const used=new Set();let matched=0,cost=0;
@@ -2003,9 +2057,14 @@
     }
     function bedKnowledgeFor(key,create=false) {
         if(!key)return null;
-        let item=bedRouteKnowledge.find(r=>r.key===key) || matchingBedKnowledge(key);
+        if(!bed.origin || bed.socketEpoch!==session.connectionEpoch || !session.ws)
+            return null;
+        let item=bedRouteKnowledge.find(r=>r.key===key && bedMemoryMatchesSite(r)) ||
+            matchingBedKnowledge(key);
         if(!item && create) {
-            item={key,good:null,goodGoal:null,bad:{},blocks:[],badGoals:[],ok:0,updated:0};
+            item={key,server:String(session.ws.url||''),
+                anchor:{x:bed.origin.x,y:bed.origin.y},
+                good:null,goodGoal:null,bad:{},blocks:[],badGoals:[],ok:0,updated:0};
             bedRouteKnowledge.unshift(item);
             if(bedRouteKnowledge.length>BED_ROUTE_MEMORY_MAX)bedRouteKnowledge.pop();
         }
@@ -2321,7 +2380,8 @@
     function bedCanWork(now=performance.now()) {
         // Server snapshots are the control clock even in background tabs.
         return bed.pending && settings.autoSpawnBed && bed.unlocked &&
-            player.alive && connected() && !!bed.origin && !!bed.self &&
+            player.alive && connected() && bed.spawnAnchorConfirmed &&
+            !!bed.origin && !!bed.self &&
             now-bed.self.at<=BED_SNAPSHOT_TTL &&
             player.health>=90 && heal.phase==='idle' && !macro.selected &&
             !Object.keys(macroDefs).some(macroActive) && !ap.manualItem &&
@@ -2637,12 +2697,13 @@
         return !ageRecovery.pending && settings.autoHeal && player.alive && player.id >= 0 &&
             player.health > 0 && player.health < 100 && connected();
     }
+    const LEGIT_HEAL_INTERVAL_MS=1;
     function smartHealInterval() {
-        // Heal ms is the actual requested interval in both modes. Only
-        // an explicit emergency permits an override; ordinary HP values do
-        // not silently clamp 100 ms to 45/65/85 ms as in 1.8.6.
-        if (guardCritical()) return Math.min(settings.intervalMs, 12);
-        if (emergencyGuard()) return Math.min(settings.intervalMs, 24);
+        // Heal ms only controls NORMAL heal. Legit uses fixed 1-ms scheduling
+        // while Hold Min/Max still determine randomized food hold duration.
+        if(settings.legitHeal)return LEGIT_HEAL_INTERVAL_MS;
+        if(guardCritical())return Math.min(settings.intervalMs,12);
+        if(emergencyGuard())return Math.min(settings.intervalMs,24);
         return settings.intervalMs;
     }
     function canRetrySnapshot(now) {
@@ -3800,7 +3861,9 @@
             releaseBedInput();
             bed.handoffMove=false;bed.moveKeys.clear();
             bed.pending=false;
-            bed.preSpawnUnlockAt=bed.unlocked?performance.now():bed.preSpawnUnlockAt;
+            // Inventory from the dead player is invalid in a new life.
+            // A fresh packet between death and respawn may re-unlock it.
+            bed.preSpawnUnlockAt=0;bed.unlocked=false;
             clearMacros(false);
             resetPlacementTracking();
             cancelHeal(false);
@@ -4016,8 +4079,8 @@
     function editSetting(key, value, external=false) {
         if (!Object.hasOwn(DEFAULTS,key)) return;
         settings[key] = typeof DEFAULTS[key] === 'boolean' ? Boolean(value) : limits(value);
-        // Legit Heal changes the food hold behavior only. Never modify the
-        // user's Heal ms when enabling, disabling, or syncing across tabs.
+        // Legit Heal runs on an independent fixed 1-ms schedule; the stored
+        // normal Heal ms is not modified when switching modes.
         if (key==='autoPlaceMs') { settings[key]=Math.max(1,settings[key]); ap.nextAt=0; }
         if (key==='autoPlaceRate') { settings[key]=apRateLimit(settings[key]); ap.nextAt=0; }
         normalizeHolds();
@@ -4026,8 +4089,13 @@
             if (key === 'holdMinMs') persist('holdMaxMs');
         }
         if (!settings.autoHeal) cancelHeal();
-        else if (key === 'legitHeal' && heal.phase !== 'idle') cancelHeal();
-        else if (key === 'intervalMs') {
+        else if (key === 'legitHeal') {
+            if(heal.phase!=='idle')cancelHeal();
+            const now=performance.now();
+            heal.nextAt=Math.max(now,heal.lastSentAt+smartHealInterval());
+            clearWake();
+        }
+        else if (key === 'intervalMs' && !settings.legitHeal) {
             if (heal.phase === 'idle') {
                 const now=performance.now();
                 // Recalculate in both directions. The old code only allowed
@@ -4410,9 +4478,9 @@
             <div class="section-intro"><span><strong>RECOVERY</strong><small>Heal e consumo de comida</small></span>
               <span class="health-chip" id="gpt-heal-health">—</span></div>
             <label title="Use food automatically when your health is below 100%">Auto Heal<input data-heal-setting="autoHeal" type="checkbox"></label>
-            <label title="Hold food for a random duration before eating">Legit Heal<input data-heal-setting="legitHeal" type="checkbox"></label>
+            <label title="Legit Heal usa agendamento fixo de 1 ms. Hold Min/Max continuam definindo o tempo aleatório segurando comida.">Legit Heal (1 ms)<input data-heal-setting="legitHeal" type="checkbox"></label>
             <label title="Priorize cura após golpes, reconheça Katanas próximas e reduza atraso de Legit Heal somente em emergência. Não garante sobrevivência">3-Hit Guard<input data-heal-setting="threeHitGuard" type="checkbox"></label>
-            <label title="Intervalo escolhido entre tentativas de cura (1–1000 ms). Ativar Legit Heal não modifica este valor. Velocidade real depende do servidor.">Heal ms<input data-heal-setting="intervalMs" type="number" min="1" max="1000" step="1"></label>
+            <label title="Intervalo somente da cura normal (1–1000 ms); Legit Heal sempre usa 1 ms, independente desta opção.">Heal ms (normal)<input data-heal-setting="intervalMs" type="number" min="1" max="1000" step="1"></label>
             <label title="Minimum random time holding food (1–1000 milliseconds)">Hold Min<input data-heal-setting="holdMinMs" type="number" min="1" max="1000" step="1"></label>
             <label title="Maximum random time holding food (1–1000 milliseconds)">Hold Max<input data-heal-setting="holdMaxMs" type="number" min="1" max="1000" step="1"></label>
           </div>
