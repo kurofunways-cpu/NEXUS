@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.44
+// @version      1.8.45
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.44';
+    const NEXUS_VERSION = '1.8.45';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -89,6 +89,7 @@
         returnSpin: true, // legacy key retained for existing tab preferences
         spinDegreesPerSecond: 180,
         goofyNames: false,
+        smartNames: false,
         spikeMs: 1,
         trapMs: 1,
         autoPick: false,
@@ -302,6 +303,7 @@
     };
     const heal = {
         phase: 'idle', until: 0, nextAt: 0, foodSelected: false,
+        holdDeadline: 0, restore: null, observedItem: null, observedItemAt: 0,
         timer: null, timerAt: Infinity, revision: 0,
         // Server snapshots are the authority. Do not retry on stale health.
         snapshotAt: 0, lastSentAt: -Infinity, sentSnapshotAt: -Infinity,
@@ -2668,11 +2670,11 @@
         }
     }
     function restoreWeapon() {
-        if (!connected()) return;
-        transmit(session.weaponPacket);
+        if (!connected() || !transmit(session.weaponPacket)) return false;
         // Restore direction/attack only if a real, manual attack was in progress.
         const aim = settings.returnSpin && spin.aim ? spin.aim : currentAim();
         if (aim) transmit(session.attacking ? [19, ...aim] : [13, ...aim]);
+        return true;
     }
     // Background tabs throttle window timers, and may throttle workers as well.
     // The socket's incoming snapshots drive heal directly; this optional worker
@@ -2757,14 +2759,60 @@
         heal.sentInSnapshot = 0;
         heal.sentTimes.length=0;
         heal.lastDamageAt = -Infinity;
+        heal.holdDeadline=0;heal.restore=null;heal.observedItem=null;heal.observedItemAt=0;
     }
     function cancelHeal(restore = true) {
         clearWake();
-        if (restore && heal.foodSelected) restoreWeapon();
+        if (restore && heal.foodSelected) requestHealRestore();
+        if(!restore)heal.restore=null;
         heal.phase = 'idle';
         heal.foodSelected = false;
         heal.until = 0;
+        heal.holdDeadline=0;
         heal.nextAt = 0;
+    }
+    // A completed send is not evidence that food was deselected on the server.
+    // Watch only food selected by our heal; native item changes revoke ownership.
+    const HEAL_FOOD_IDS=new Set([10,12]);
+    function requestHealRestore(now=performance.now()){
+        if(!player.alive || !connected())return false;
+        transmit([18]);
+        const sent=restoreWeapon();
+        heal.restore={epoch:session.connectionEpoch,at:now,nextAt:now+160,
+            expires:now+1800,tries:0,sent};
+        return sent;
+    }
+    function watchHealRestore(now=performance.now()){
+        const r=heal.restore;
+        if(!r)return false;
+        if(!player.alive || !connected() || r.epoch!==session.connectionEpoch || now>r.expires){
+            heal.restore=null;return false;
+        }
+        if(heal.phase!=='idle' || heal.foodSelected || ageRecovery.pending ||
+            macro.selected || Object.keys(macroDefs).some(macroActive) ||
+            (bed.pending && bed.phase==='placing' && bed.locked))return false;
+        const fresh=heal.observedItemAt>r.at && now-heal.observedItemAt<=750;
+        if(fresh && !HEAL_FOOD_IDS.has(heal.observedItem)){
+            heal.restore=null;return false;
+        }
+        if(now<r.nextAt || (r.sent && !fresh))return false;
+        if(r.tries>=3){heal.restore=null;return false;}
+        if(session.ws.bufferedAmount>=2048)return true;
+        transmit([18]);
+        r.sent=restoreWeapon();
+        r.tries++;r.nextAt=now+160;
+        return true;
+    }
+    function recoverStuckHeal(now=performance.now()){
+        if(heal.phase!=='holding')return false;
+        if(heal.foodSelected && now<=heal.holdDeadline &&
+            heal.snapshotAt && now-heal.snapshotAt<=1300)return false;
+        // No more consumption attempts after the hold deadline or stale data.
+        // Mark the current snapshot used so it cannot immediately reselect food.
+        cancelHeal(true);
+        heal.sentSnapshotSerial=heal.snapshotSerial;
+        heal.nextAt=now+25;
+        return true;
     }
     function isEligible() {
         return !ageRecovery.pending && settings.autoHeal && player.alive && player.id >= 0 &&
@@ -2817,11 +2865,11 @@
         }
         session.lastAutomationAt = now;
         if (!transmit([19, ...currentAim()])) return false;
-        transmit([18]);
-        restoreWeapon();
+        requestHealRestore(now);
         heal.foodSelected = false;
         heal.phase = 'idle';
         heal.until = 0;
+        heal.holdDeadline=0;
         heal.lastSentAt = now;
         heal.sentSnapshotAt = heal.snapshotAt;
         heal.sentSnapshotSerial = heal.snapshotSerial;
@@ -2844,11 +2892,13 @@
         return low + Math.floor(Math.random() * (high - low + 1));
     }
     function evaluate() {
+        const now=performance.now();
+        if(recoverStuckHeal(now))return;
+        if(watchHealRestore(now))return;
         if (!isEligible()) {
             if (heal.phase !== 'idle' || heal.timer !== null) cancelHeal();
             return;
         }
-        const now = performance.now();
         if (heal.phase === 'holding') {
             // A newly reported lethal-risk hit interrupts the cosmetic Legit
             // hold; one item is consumed immediately, not an unbounded burst.
@@ -2883,14 +2933,17 @@
         releaseMacroSelection(); // Heal has priority over a held building.
         session.lastAutomationAt = now;
         if (session.attacking) transmit([18]);
-        if (!transmit([0, 2])) { restoreWeapon(); wakeAt(now + 50); return; }
+        if (!transmit([0, 2])) { requestHealRestore(now); wakeAt(now + 50); return; }
+        heal.restore=null;
         heal.foodSelected = true;
         heal.phase = 'holding';
         heal.until = now + (settings.legitHeal && !emergencyGuard(now) ? randomHold() : 0);
+        heal.holdDeadline=heal.until+300;
         // Normal fast heal remains synchronous. During critical danger the
         // 3-Hit Guard also bypasses the randomized Legit hold to save time.
-        if (!settings.legitHeal || emergencyGuard(now)) finishFood();
-        else wakeAt(heal.until);
+        if (!settings.legitHeal || emergencyGuard(now)) {
+            if(!finishFood() && heal.phase==='holding')wakeAt(now+25);
+        }else wakeAt(heal.until);
     }
     // Both held keys share a single scheduler. The requested interval is not
     // a promise of server throughput. This local budget is precautionary,
@@ -3717,6 +3770,55 @@
         'Bing Bong','Rizzasaurus','Soggy Toast','Aura Minus','No Brain',
         'Potato 67','Lil Pickle','Meme Goblin','Bob the Blob','Goofy Bean'
     ]);
+    const SMART_NAME_POOLS=Object.freeze({
+        streak:['Not Again','Respawn CEO','Death Streak','Again Bro','Free Kill','Death Enjoyer'],
+        fast:['Any% Death','Speedrun Death','Spawn Camper','Instant RIP','Loading RIP','Fastest NPC'],
+        long:['Final Boss','Ancient Potato','Old Man Sigma','Retired NPC','Fossil CEO','Immortal-ish'],
+        lag:['Ping Enjoyer','McDonalds WiFi','Lag Goblin','Packet Potato','WiFi Toaster','Buffer Boss'],
+        bed:['Homeless NPC','Bedless Sigma','No Bed Bro','Rent Due','Bed Evicted','Floor Enjoyer'],
+        spike:['Spike Magnet','Cactus Enjoyer','Spiky Potato','Hedgehog CEO','Prickle NPC','Spike Tourist']
+    });
+    const SMART_PREFIX=['Goofy','Sigma','Unc','Rizz','Lil','Dr','CEO','Sleepy','Lag','NPC','Mega','Tiny','Silly','Broke','Unpaid','67','Ohio','Aura','Skibidi','Cursed'];
+    const SMART_SUFFIX=['Potato','Goblin','Toaster','Nugget','Microwave','Pickle','Waffle','Bean','Pigeon','Fish','Rat','Bread','Banana','CEO','NPC','Penguin','Blob','Duck','Clown','Frog'];
+    const GOOFY_HISTORY_KEY=PREFIX+'goofy_name_history_v1';
+    let goofyHistory=[];
+    try{
+        const saved=JSON.parse(sessionStorage.getItem(GOOFY_HISTORY_KEY)||'[]');
+        if(Array.isArray(saved))goofyHistory=saved.filter(n=>typeof n==='string').slice(-100);
+    }catch(_){}
+    const smartLife={startedAt:null,streak:0,context:'',bedIds:new Set(),bedLost:false};
+    function resetSmartLife(server=false){
+        smartLife.startedAt=null;smartLife.bedIds.clear();smartLife.bedLost=false;
+        if(server){smartLife.streak=0;smartLife.context='';}
+    }
+    function observeSmartBed(packet){
+        if(!player.alive || !session.self || !(packet instanceof Uint8Array) ||
+            (packet.length-1)%19!==0)return;
+        for(let i=1;i+18<packet.length;i+=19){
+            if(packet[i]!==SPAWN_BED_ENTITY_TYPE || packet[i+1]!==session.self.sid)continue;
+            const id=packet[i+2]|packet[i+3]<<8;
+            if(packet[i+8]&2){
+                if(smartLife.bedIds.delete(id))smartLife.bedLost=true;
+            }else smartLife.bedIds.add(id);
+        }
+    }
+    function captureSmartDeath(now=performance.now()){
+        const duration=smartLife.startedAt===null?null:now-smartLife.startedAt;
+        smartLife.streak=duration!==null && duration<45000 ? smartLife.streak+1:0;
+        const nearSpike=session.self && [...deathReturn.objects.values()].some(o=>
+            [2,7,17].includes(o.type) && now-o.at<10000 &&
+            Math.hypot(o.x-session.self.x,o.y-session.self.y)<100);
+        smartLife.context=smartLife.bedLost?'bed':
+            lag.spikeCount>0 && now-lag.spikeAt<5000?'lag':
+            nearSpike?'spike':smartLife.streak>=3?'streak':
+            duration!==null && duration<12000?'fast':
+            duration!==null && duration>300000?'long':'';
+    }
+    function rememberGoofyHistory(name){
+        goofyHistory=goofyHistory.filter(n=>n!==name);
+        goofyHistory.push(name);goofyHistory=goofyHistory.slice(-100);
+        try{sessionStorage.setItem(GOOFY_HISTORY_KEY,JSON.stringify(goofyHistory));}catch(_){}
+    }
     const GOOFY_BACKUP_KEY=PREFIX+'goofy_nickname_backup_v1';
     const goofy={original:null,applied:null,last:null,pending:false};
     try{
@@ -3754,7 +3856,17 @@
     }
     function chooseGoofyNickname(maxLength,random=Math.random){
         const cap=Number.isInteger(maxLength)&&maxLength>0?maxLength:16;
-        const choices=[...new Set(GOOFY_NAMES.map(n=>n.slice(0,cap)))].filter(n=>
+        const eligible=pool=>[...new Set(pool.map(n=>n.slice(0,cap)))].filter(n=>
+            n!==goofy.last && n!==goofy.original && !goofyHistory.includes(n));
+        let choices=settings.smartNames ? eligible(SMART_NAME_POOLS[smartLife.context]||[]):[];
+        if(!choices.length){
+            const pool=[...GOOFY_NAMES];
+            for(const a of SMART_PREFIX)for(const b of SMART_SUFFIX)pool.push(a+' '+b);
+            choices=eligible(pool);
+        }
+        // A very short server name limit may exhaust all distinct strings.
+        // Relax history only when the pool is exhausted, never repeat last.
+        if(!choices.length)choices=[...new Set(GOOFY_NAMES.map(n=>n.slice(0,cap)))].filter(n=>
             n!==goofy.last && n!==goofy.original);
         if(!choices.length)return null;
         return choices[Math.min(choices.length-1,Math.floor(random()*choices.length))];
@@ -3767,6 +3879,7 @@
             goofy.applied=chooseGoofyNickname(el.maxLength);
             if(goofy.applied===null)return false;
             goofy.last=goofy.applied;
+            rememberGoofyHistory(goofy.applied);
             saveGoofyBackup();
         }
         setGameNickname(el,goofy.applied);return true;
@@ -4008,6 +4121,7 @@
         let ownSnapshotProcessed=false;
         if (id === 35) { // spawn
             finishGoofySpawn();
+            resetSmartLife();smartLife.startedAt=performance.now();
             resetTargetNotice();
             stopAutoRespawn();
             // Some fast respawns can skip the death message entirely. Preserve
@@ -4037,6 +4151,7 @@
             updateHealth();
         } else if (id === 19) { // death
             if(player.alive){
+                captureSmartDeath();
                 if(goofy.applied!==null)restoreGoofyNickname(false);
                 goofy.pending=true;
             }
@@ -4096,6 +4211,7 @@
                 // after a server tick stalled for hundreds of milliseconds.
                 const now=performance.now();
                 noteServerSnapshot(now);
+                heal.observedItem=packet[i+10];heal.observedItemAt=now;
                 session.self={x:packet[i+4]|packet[i+5]<<8,
                     y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],at:now};
                 const observedHealth=Math.max(0,Math.min(100,
@@ -4116,6 +4232,7 @@
                 // over more expensive general placement bookkeeping.
                 observeSpawnBed(packet);
                 observeReturnObjects(packet);
+                observeSmartBed(packet);
                 observePlacement(packet);
                 observeTargetProximity(packet);
             }
@@ -4147,6 +4264,7 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
+        resetSmartLife(true);
         goofy.pending=false;
         if(goofy.applied!==null)restoreGoofyNickname(!settings.goofyNames);
         resetTargetNotice();
@@ -4221,6 +4339,7 @@
                 case 0:
                 case 2: {
                     if (raw.length < 2) break;
+                    heal.restore=null; // respect an intentional manual item selection
                     ap.manualItem=raw[0]===0?raw[1]>1:!([15,...session.weaponIds].includes(raw[1]));
                     ap.manualUntil=performance.now()+(ap.manualItem?160:0);
                     if (macro.selected) {
@@ -4719,6 +4838,8 @@
             <label title="Velocidade angular em graus por segundo, sem máximo configurado. 360 = uma volta por segundo.">Velocidade 360°/s<input data-heal-setting="spinDegreesPerSecond" type="number" min="0" step="any"></label>
             <div class="nx-info-line">360 = 1 volta/s • 720 = 2 voltas/s</div>
             <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
+            <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
+            <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
           </div>
           <div class="content" data-panel="macros" hidden>
             <div class="section-intro"><span><strong>MANUAL MACROS</strong><small>F / V · controles e velocidade</small></span></div>
@@ -5002,6 +5123,10 @@
         }
     });
     document.addEventListener('resume',resumeAutomationsAfterSleep);
+    // Independent safety clock; snapshots and the normal worker still drive heals.
+    setInterval(()=>{if(player.alive && (heal.foodSelected || heal.restore)){
+        if(!recoverStuckHeal())watchHealRestore();
+    }},100);
     setInterval(()=>{if(goofy.original!==null || settings.goofyNames)syncGoofyNickname();},500);
     function spinFrame(){
         if(!document.hidden && settings.returnSpin && player.alive)driveSpin();
