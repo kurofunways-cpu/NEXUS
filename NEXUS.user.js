@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.60
+// @version      1.8.61
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.60';
+    const NEXUS_VERSION = '1.8.61';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3899,13 +3899,15 @@
     const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map(),
         traps:new Map(),contacts:new Map(),escapeActive:false,clearSince:null,clearSamples:0,navSpikeKey:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
         restorePending:false,restoreTries:0,restoreNextAt:0,restoreAt:-Infinity,restoreExpected:null,restorePacket:null,
-        breakKey:null,breakSince:0,breakAttempts:0,breakAvoid:new Map(),aim:null,aimAt:-Infinity};
+        breakKey:null,breakSince:0,breakAttempts:0,breakAvoid:new Map(),breakProgress:new Map(),
+        clanId:null,clanMembers:new Set(),lastStructureAt:-Infinity,aim:null,aimAt:-Infinity};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
         resetAuraEscape();counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
         clearAuraWeaponRestore();counter.hammerEchoUntil=0;
-        counter.breakKey=null;counter.breakSince=0;counter.breakAttempts=0;counter.breakAvoid.clear();
+        counter.breakKey=null;counter.breakSince=0;counter.breakAttempts=0;counter.breakAvoid.clear();counter.breakProgress.clear();
+        counter.lastStructureAt=-Infinity;
         counter.aim=null;counter.aimAt=-Infinity;
         resetAuraHat();
     }
@@ -3974,22 +3976,43 @@
     const AURA_TRAP_TTL=120000, AURA_ESCAPE_CLEAR_MS=700;
     function resetAuraEscape(){
         counter.traps.clear();counter.contacts.clear();counter.escapeActive=false;
-        counter.clearSince=null;counter.clearSamples=0;counter.navSpikeKey=null;counter.lastSelf=null;
+        counter.clearSince=null;counter.clearSamples=0;counter.navSpikeKey=null;counter.lastSelf=null;counter.lastStructureAt=-Infinity;
     }
     function dropAuraTrap(key){
         counter.traps.delete(key);counter.contacts.delete(key);
         if(counter.navSpikeKey===key)counter.navSpikeKey=null;
-        counter.breakAvoid.delete(key);
+        counter.breakAvoid.delete(key);counter.breakProgress.delete(key);
         if(counter.breakKey===key){counter.breakKey=null;counter.breakAttempts=0;}
     }
+    // Ownership is identified by owner SID and clan membership, not the
+    // structure's team byte (Astral Lite / Socket API public references).
+    function observeAuraClan(packet){
+        if(!(packet instanceof Uint8Array))return;
+        const op=packet[0];
+        if(op===27){counter.clanId=null;counter.clanMembers.clear();return;}
+        if((op!==16 && op!==24) || packet.length<(op===24?3:2))return;
+        const clanId=packet[1];
+        if(op===16 && counter.clanId!==null && counter.clanId!==clanId)return;
+        counter.clanId=clanId;
+        counter.clanMembers=new Set(packet.subarray(op===24?3:2));
+    }
     function auraTrapHostile(t,self){
-        return t.sid!==self.sid && !(self.team!==0 && self.team===t.team);
+        if(t.sid===self.sid)return false;
+        if(self.team!==0){
+            if(counter.clanId===self.team && counter.clanMembers.has(t.sid))return false;
+            for(const e of counter.players.values())
+                if(e.sid===t.sid && e.team===self.team && self.at-e.at<=350)return false;
+        }
+        return true;
+    }
+    function auraStructureLive(t,now){
+        return now-t.at<=AURA_TRAP_TTL && (counter.breakAvoid.get(t.key)??0)<=now;
     }
     function auraTrapDistance(t,self){return Math.hypot(t.x-self.x,t.y-self.y);}
     function auraTrapNearby(now,self){
         const result=[];
         for(const t of counter.traps.values()){
-            if(now-t.at>AURA_TRAP_TTL || !auraTrapHostile(t,self) || !auraStructureEnabled(t))continue;
+            if(!auraStructureLive(t,now) || !auraTrapHostile(t,self) || !auraStructureEnabled(t))continue;
             const c=counter.contacts.get(t.key);
             // Hysteresis keeps a confirmed capture valid at its edge, but
             // never makes a distant remembered trap a movement destination.
@@ -4012,7 +4035,7 @@
     function hostileSpikes(now,self=session.self){
         if(!settings.auraBreakSpikes || !self)return [];
         return [...counter.traps.values()].filter(t=>auraIsSpike(t) &&
-            now-t.at<=AURA_TRAP_TTL && auraTrapHostile(t,self));
+            auraStructureLive(t,now) && auraTrapHostile(t,self));
     }
     function spikeNavBlocker(from,to,now){
         if(!from || !to)return null;
@@ -4047,8 +4070,9 @@
         if(retained && (bedTask||returnTask))return retained;
         const goal=explicitGoal || (bedTask?(bed.moveOwned?bed.moveTo:bed.origin):
             returnTask?(deathReturn.moveOwned?deathReturn.moveTo:deathReturn.target):null);
-        let candidates=[];
-        if(goal)candidates=spikes.filter(t=>spikeSegmentDistance(self,goal,t)<=spikeSafetyRadius(t));
+        // An isolated nearby foreign spike is a valid target even without damage.
+        let candidates=spikes.filter(t=>auraTrapDistance(t,self)<=AURA_SPIKE_THREAT);
+        if(goal)candidates.push(...spikes.filter(t=>spikeSegmentDistance(self,goal,t)<=spikeSafetyRadius(t)));
         // A ring built around the bed can block the outward placement step
         // even when the centre itself is clear. Clear one reachable gap.
         if(bedTask && bed.origin)candidates.push(...spikes.filter(t=>auraTrapDistance(t,bed.origin)<=135));
@@ -4062,7 +4086,7 @@
             // A nearby hostile trap can pin the player while a spike just
             // outside the contact circle continues threatening damage.
             const trapped=[...counter.traps.values()].some(t=>!auraIsSpike(t) &&
-                now-t.at<=AURA_TRAP_TTL && auraTrapHostile(t,self) && auraTrapDistance(t,self)<=AURA_TRAP_RETAIN);
+                auraStructureLive(t,now) && auraTrapHostile(t,self) && auraTrapDistance(t,self)<=AURA_TRAP_RETAIN);
             if(trapped || (now-heal.lastDamageAt<=500 && ring.length>=2))candidates.push(...ring);
         }
         return candidates.sort((a,b)=>auraTrapDistance(a,self)-auraTrapDistance(b,self))[0]??null;
@@ -4088,31 +4112,35 @@
         deathReturn.learningClean=false;
     }
     function observeAuraTrap(packet,now){
-        if((!settings.killAura && !settings.auraBreakSpikes) || !player.alive || !session.self ||
-            !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
+        // Keep the world cache current even while either feature is disabled.
+        if(!player.alive || !session.self || !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
         const self=session.self;
         for(let i=1;i+18<packet.length;i+=19){
-            const type=packet[i];
-            if(type!==AURA_TRAP_TYPE && !AURA_SPIKE_TYPES.has(type))continue;
-            const sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8;
-            // Include type for spikes: deleting a spike cannot delete a trap
-            // or another spike tier sharing an owner/entity ID.
-            const key=type===AURA_TRAP_TYPE?sid+':'+id:sid+':'+type+':'+id;
-            // Delete ONLY this trap. All other traps and contacts survive.
-            if(packet[i+8]&2){
-                dropAuraTrap(key);
-                // Removal records can carry changed owner information. Match
-                // the same structure type and world index, never another type.
-                for(const [other,t] of counter.traps)if(t.type===type && t.id===id)dropAuraTrap(other);
+            const type=packet[i],sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8;
+            // The public protocol uses the world index as the entity identity.
+            const key=String(id),old=counter.traps.get(key);
+            if(packet[i+8]&2 || (type!==AURA_TRAP_TYPE && !AURA_SPIKE_TYPES.has(type))){
+                if(old)dropAuraTrap(key);
                 continue;
             }
             const t={key,type,id,sid,team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
-                y:packet[i+6]|packet[i+7]<<8,at:now};
-            if(!auraTrapHostile(t,self)){dropAuraTrap(key);continue;}
+                y:packet[i+6]|packet[i+7]<<8,hp:packet[i+13],at:now};
+            const replaced=old && (old.type!==t.type || old.sid!==t.sid ||
+                Math.hypot(old.x-t.x,old.y-t.y)>4);
+            if(replaced)dropAuraTrap(key);
+            // Only a positive-to-zero HP transition corroborates destruction;
+            // a zero on a new structure may not represent health.
+            if(old && !replaced && old.hp>0 && t.hp===0){dropAuraTrap(key);continue;}
+            if(old && !replaced && t.hp<old.hp){
+                counter.breakProgress.delete(key);counter.breakAvoid.delete(key);
+            }
+            if(counter.breakAvoid.get(key)===Infinity){
+                counter.breakAvoid.delete(key);counter.breakProgress.delete(key);
+            }
             counter.traps.set(key,t);
         }
         for(const [key,t] of counter.traps){
-            if(now-t.at>AURA_TRAP_TTL || !auraTrapHostile(t,self))dropAuraTrap(key);
+            if(now-t.at>AURA_TRAP_TTL)dropAuraTrap(key);
         }
         if(counter.traps.size>128){
             // Evict distant objects first; active contacts have priority.
@@ -4150,7 +4178,7 @@
             // active, a push into another trap can be handled immediately.
             // Recent damage plus actual spike contact is enough to react
             // during knockback, even before two stationary samples arrive.
-            if(counter.escapeActive || c?.confirmed || (auraIsSpike(t) && now-heal.lastDamageAt<=250)){
+            if(counter.escapeActive || c?.confirmed || (!auraIsSpike(t) && self.trapped===true) || (auraIsSpike(t) && now-heal.lastDamageAt<=250)){
                 counter.contacts.set(t.key,{since:c?.since??self.at,samples:c?.samples??1,confirmed:true});
                 continue;
             }
@@ -4171,23 +4199,27 @@
         const self=session.self;
         if((!settings.killAura && !settings.auraBreakSpikes) || !self || now-self.at>250)return null;
         const navSpike=auraNavigationSpike(now);
-        if(!counter.escapeActive)return navSpike;
+        if(!counter.escapeActive && !self.trapped)return navSpike;
         const reach=spikeBreakReach(now);
         // Re-evaluate ALL remaining traps on every strike/aim decision, even
         // immediately after an object-only deletion of the previous target.
         const nearby=auraTrapNearby(now,self);
         let best=null,distance=Infinity;
-        for(const {t,distance:d} of nearby){
-            if(auraIsSpike(t) && reach && d>reach)continue;
+        for(const {t,distance:d,c} of nearby){
+            if(!auraIsSpike(t) && !counter.escapeActive && !self.trapped && !c?.confirmed)continue;
+            if(reach && d>reach)continue;
             // A touching spike can inflict damage while the trap only pins us.
             // Prefer that spike, then the nearest eligible structure of its kind.
             if(!best || (auraIsSpike(t) && !auraIsSpike(best)) ||
                 (auraIsSpike(t)===auraIsSpike(best) && d<distance)){distance=d;best=t;}
         }
-        return best || navSpike;
+        // A spike selected from the wider threat radius takes priority over
+        // a contact trap, while a closer contact spike stays first.
+        return best && auraIsSpike(best)?best:navSpike||best;
     }
     function auraEscapeInProgress(now=performance.now()){
-        return !!((settings.killAura || settings.auraBreakSpikes) && (counter.escapeActive || auraNavigationSpike(now)));
+        if(!settings.killAura && !settings.auraBreakSpikes)return false;
+        return !!(auraTrapTarget(now) || now-counter.lastStructureAt<=AURA_ESCAPE_CLEAR_MS);
     }
     function noteAuraInventory(packet){
         if(!player.alive || !(packet instanceof Uint8Array) || packet[0]!==2)return;
@@ -4260,18 +4292,19 @@
     }
     function driveAuraHat(now=performance.now()){
         if(!player.alive || !connected() || ageRecovery.pending || session.ws.bufferedAmount>=1024)return;
+        const target=auraTrapTarget(now);
+        if(target)counter.lastStructureAt=now;
         const escaping=auraEscapeInProgress(now);
         const threats=auraThreatCount(now);
         auraHat.threats=threats;
         // A deletion or stale position is not proof of freedom. Keep the hat
         // during the clear-confirmation window, but never equip a new one
         // without fresh threat data. Two dangerous enemies override the delay.
-        if(escaping && threats===null)return;
-        const allow=escaping && threats!==null && threats<=1;
+        const allow=escaping && (threats===null?auraHat.owned:threats<=1);
         // Manual hat choices get priority. Do not acquire ownership based on a
         // stale or unknown pre-break hat.
         if(allow && !auraHat.owned){
-            if(now-hat.lastManualAt<1500 || hat.current===null)return;
+            if(!target || threats===null || now-hat.lastManualAt<1500 || hat.current===null)return;
             if(hat.current===AURA_DEMOLIST)return;
             auraHat.previous=hat.current;auraHat.owned=true;
             auraHat.requested=null;auraHat.tries=0;auraHat.confirmedSince=null;auraHat.sentAt=-Infinity;
@@ -4314,15 +4347,27 @@
         const id=hammer??w?.id, name=auraStructureName(t);
         if(id==null || distance>(COUNTER_REACH.get(id)??0)){counter.status=name+': aguardando arma/alcance';return false;}
         const self=session.self;
-        if(counter.breakKey!==t.key){counter.breakKey=t.key;counter.breakSince=now;counter.breakAttempts=0;}
-        const touching=auraTrapNearby(now,self).some(e=>e.t.key===t.key);
-        if(auraIsSpike(t) && !touching && counter.breakAttempts>=12 && now-counter.breakSince>=3000){
-            // No destruction evidence: try another route/structure. Do not
-            // permanently mark the real destination or a static obstacle bad.
-            counter.breakAvoid.set(t.key,now+1800);counter.navSpikeKey=null;
+        let progress=counter.breakProgress.get(t.key);
+        if(!progress){progress={since:now,attempts:0};counter.breakProgress.set(t.key,progress);}
+        // Never attack a contact ghost indefinitely. A real trapped flag
+        // permits another attempt window, but a stale absent entity needs
+        // revalidation before it can own attack/equipment again.
+        if(progress.attempts>=12 && now-progress.since>=3000){
+            const stale=now-t.at>1500;
+            const actualTrap=!auraIsSpike(t) && self.trapped===true;
+            counter.breakAvoid.set(t.key,stale && !actualTrap?Infinity:now+2500);
+            counter.breakProgress.delete(t.key);counter.contacts.delete(t.key);
+            if(counter.navSpikeKey===t.key)counter.navSpikeKey=null;
             counter.breakKey=null;counter.breakAttempts=0;
-            counter.status='Spike não confirmado destruído; recalculando passagem';return false;
+            counter.status='Estrutura sem progresso: revalidando alvo';
+            if(!auraTrapTarget(now)){
+                counter.escapeActive=false;counter.clearSince=null;counter.clearSamples=0;
+                counter.lastStructureAt=now-AURA_ESCAPE_CLEAR_MS-1;
+                driveAuraHat(now);
+            }
+            return false;
         }
+        counter.breakKey=t.key;counter.breakSince=progress.since;
         const aim=apAngleBytes(Math.atan2(t.y-self.y,t.x-self.x));
         const saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
         // A confirmed Hammer uses the secondary slot / exact item ID.
@@ -4339,7 +4384,7 @@
         const hit=transmit([19,...aim]);
         transmit([18]);
         if(temporary)restoreWeapon(); // retain watchdog even after successful send
-        if(hit)counter.breakAttempts++;
+        if(hit){progress.attempts++;counter.breakAttempts=progress.attempts;}
         counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
         counter.aim=aim;counter.aimAt=now;
         counter.status=hit?('Quebrando '+name+(hammer!==null?' com Hammer #'+id:' com arma atual')):name+': golpe não enviado';
@@ -4396,6 +4441,7 @@
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
         if(auraHat.owned || now<auraHat.echoUntil || auraEscapeInProgress(now))return false;
+        if(t?.hat===AURA_DEMOLIST){hatCopy.status='Demolist reservado à quebra de estruturas';return false;}
         if(!settings.copyNearbyHat || !player.alive || !connected() || ageRecovery.pending ||
             !t || now-t.at>350 || now<hatCopy.nextAt || now-hat.lastManualAt<1500 ||
             session.ws.bufferedAmount>=1024 || (settings.lagGuard&&networkState(now)!=='OK'))return false;
@@ -4908,6 +4954,7 @@
         if (!packet || !packet.length) return;
         const id = Number(packet[0]);
         if(id===30)observeDeathChatEcho(packet);
+        if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false;
         if (id === 35) { // spawn
             finishGoofySpawn();
@@ -5011,7 +5058,7 @@
                 noteServerSnapshot(now);
                 heal.observedItem=packet[i+10];heal.observedItemAt=now;
                 session.self={x:packet[i+4]|packet[i+5]<<8,
-                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],at:now};
+                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],trapped:!!(packet[i+8]&32),at:now};
                 const observedHealth=Math.max(0,Math.min(100,
                     packet[i + 13] * 100 / 255));
                 if(observedHealth<player.health-1.5 &&
@@ -5067,7 +5114,7 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
-        clearLifeGate();
+        clearLifeGate();counter.clanId=null;counter.clanMembers.clear();
         resetDeathChatConnection();
         resetSmartLife(true);
         goofy.pending=false;
