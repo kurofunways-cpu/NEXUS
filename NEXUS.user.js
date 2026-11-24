@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.90
+// @version      1.8.91
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -129,6 +129,12 @@
 //   não coletar em caso ambíguo. Servidor decide quem recebe ouro.
 //   Orbit Combat muda ângulo após ataques sem progresso observado de HP,
 //   sem abandonar círculo, segurança ou prioridades de cura/respawn.
+// - 1.8.91: Death Chat não depende de Auto Loot/Aura. Protocolo público
+//   550560: 19 notifica morte sem autor documentado; 32/33 nomes por SID;
+//   29 animação de ataque, NÃO confirmação de dano à vítima. Correlaciona
+//   posição, alcance, ataques e spikes recentes; "Likely by" é estimativa.
+//   Sem evidência suficiente, mantém Unknown; não atribui kill por palpite
+//   quando há vários candidatos. Limpa evidências por vida/conexão.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -138,7 +144,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.90';
+    const NEXUS_VERSION = '1.8.91';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1260,9 +1266,14 @@
             if(Number.isInteger(sid)&&sid>=0&&sid<=255&&typeof name==='string'&&name.trim())
                 killLoot.names.set(sid,name.trim());
         };
-        if(packet[0]===32)put(packet[1],packet[2]);
-        if(packet[0]===33&&Array.isArray(packet[3]))for(const row of packet[3])
-            if(Array.isArray(row))put(row[0],row[1]);
+        if(packet[0]===32){
+            if(Number.isInteger(packet[1]))killLoot.names.delete(packet[1]);
+            put(packet[1],packet[2]);
+        }
+        if(packet[0]===33&&Array.isArray(packet[3])){
+            killLoot.names.clear();
+            for(const row of packet[3])if(Array.isArray(row))put(row[0],row[1]);
+        }
     }
     function observeKillLoot(packet,now){
         if(!settings.collectKillLoot||!player.alive||!fixedDeath.anchor||fixedDeath.epoch!==session.connectionEpoch)return;
@@ -3664,7 +3675,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
-        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();resetKillLoot();resetCombatOrbit();
+        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();resetKillLoot();resetCombatOrbit();resetDeathEvidence();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -5940,6 +5951,8 @@
     // Count only deaths in this document. A new or duplicated tab and a
     // full reload start at zero; respawns in this document retain the count.
     try{sessionStorage.removeItem(PREFIX+'death_count_v1');}catch(_){}
+    const deathEvidence={players:new Map(),attacks:new Map(),spikes:new Map(),self:null};
+    function resetDeathEvidence(){deathEvidence.players.clear();deathEvidence.attacks.clear();deathEvidence.spikes.clear();deathEvidence.self=null;}
     function deathLifeStart(now=performance.now()){
         deathChat.lifeAt=now;deathChat.lifeEpoch=session.connectionEpoch;
     }
@@ -5954,9 +5967,8 @@
         if(!name||/^(unknown|undefined|null)$/i.test(name))return null;
         return Array.from(name).slice(0,24).join('');
     }
-    // The published protocol confirms opcode 19 is a death notification,
-    // but not a fixed killer-field layout. Only accept explicit attribution;
-    // opcode 28 reports OUR kills, not the player who killed us.
+    // Opcode 19 has no documented killer field; opcode 28 reports OUR kills.
+    // Explicit fields take priority over local estimates.
     function deathKiller(packet){
         if(Number(packet?.[0])!==19||!Array.isArray(packet))return null;
         for(const field of packet.slice(1)){
@@ -5970,6 +5982,70 @@
         }
         return null;
     }
+    function observeDeathEvidence(packet,now){
+        if(!player.alive||!settings.deathChat)return;
+        const ev=deathEvidence;
+        for(let i=1;i+18<packet.length;i+=19){
+            const type=packet[i],sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8,state=packet[i+8];
+            const e={id,sid,x:packet[i+4]|packet[i+5]<<8,y:packet[i+6]|packet[i+7]<<8,
+                team:packet[i+12],weapon:packet[i+10],angle:packet[i+9]*2*Math.PI/255-Math.PI,at:now};
+            if(type===0){
+                if(id===player.id){if(!(state&2))ev.self=e;continue;}
+                if(state&2||packet[i+13]===0){ev.players.delete(id);ev.attacks.delete(id);continue;}
+                // Bind the nickname when the position is observed; later SID reuse
+                // must not change the identity of an old candidate.
+                e.name=cleanKillerName(killLoot.names.get(sid));ev.players.set(id,e);
+            }else if(AURA_SPIKE_TYPES.has(type)){
+                const key=sid+':'+id;
+                if(state&2)ev.spikes.delete(key);
+                else ev.spikes.set(key,e);
+            }
+        }
+        for(const [id,e] of ev.players)if(now-e.at>2200)ev.players.delete(id);
+        for(const [id,t] of ev.attacks)if(now-t.at>2200)ev.attacks.delete(id);
+        for(const [key,t] of ev.spikes)if(now-t.at>3000)ev.spikes.delete(key);
+        for(const map of [ev.players,ev.attacks,ev.spikes])if(map.size>256)
+            for(const key of [...map.keys()].slice(0,map.size-256))map.delete(key);
+    }
+    function observeDeathAttack(packet,now){
+        if(!player.alive||!settings.deathChat||!(packet instanceof Uint8Array)||(packet.length-1)%5!==0)return;
+        const ev=deathEvidence,self=ev.self;
+        if(!self||now-self.at>500)return;
+        for(let i=1;i+4<packet.length;i+=5){
+            if(packet[i]!==0)continue;
+            const id=packet[i+1]|packet[i+2]<<8,e=ev.players.get(id);
+            if(!e||now-e.at>500||e.sid===self.sid||(self.team&&self.team===e.team))continue;
+            const weapon=packet[i+4],reach=COUNTER_REACH.get(weapon);
+            if(!reach||returnDist(e,self)>reach+25)continue;
+            const angle=Math.atan2(self.y-e.y,self.x-e.x),diff=Math.atan2(Math.sin(angle-e.angle),Math.cos(angle-e.angle));
+            if(Math.abs(diff)>Math.PI*.6)continue;
+            ev.attacks.set(id,{sid:e.sid,at:now});
+        }
+    }
+    function inferDeathKiller(now){
+        const ev=deathEvidence,self=ev.self;
+        if(!self||now-self.at>1300)return null;
+        const nearby=[...ev.players.values()].filter(e=>now-e.at<=1200&&e.sid!==self.sid&&!(self.team&&self.team===e.team)&&
+            returnDist(e,self)<=Math.max(165,(COUNTER_REACH.get(e.weapon)??130)+30));
+        const threats=new Map();
+        for(const e of nearby){
+            const attack=ev.attacks.get(e.id),recent=attack&&attack.sid===e.sid&&now-attack.at<=1000;
+            const name=e.name||cleanKillerName(killLoot.names.get(e.sid));
+            const reach=COUNTER_REACH.get(e.weapon)??135;
+            if(returnDist(e,self)>reach+25&&!recent)continue;
+            threats.set(e.sid,{name,id:e.id,sid:e.sid,attack:!!recent,source:recent?'ataque recente':'proximidade'});
+        }
+        for(const t of ev.spikes.values()){
+            if(now-t.at>2200||t.sid===self.sid||returnDist(t,self)>85||
+                (self.team&&((t.team&&t.team===self.team)||nearby.some(e=>e.sid===t.sid&&e.team===self.team)||counter.clanMembers.has(t.sid))))continue;
+            if(!threats.has(t.sid))threats.set(t.sid,{name:cleanKillerName(killLoot.names.get(t.sid)),id:null,sid:t.sid,attack:false,source:'spike próximo'});
+        }
+        const all=[...threats.values()],attacks=all.filter(e=>e.attack);
+        // One plausible attacker is useful, but never a confirmed killer.
+        // If another nearby hostile could also have caused damage, abstain.
+        const best=all.length===1?all[0]:attacks.length===1&&all.every(e=>e.attack||e.source==='proximidade')?attacks[0]:null;
+        return best?{killer:best.name||('SID '+best.sid),killerSource:best.source,killerConfirmed:false}:null;
+    }
     function deathChatMessages(){
         const d=deathChat.lastDeath,input=document.getElementById('chat');
         const limit=input&&input.maxLength>0?Math.min(35,input.maxLength):35;
@@ -5977,10 +6053,10 @@
         const fit=t=>{let out='';for(const c of t){if(!fits(out+c))break;out+=c;}return out;};
         const duration=formatDeathDuration(d?.duration??null),killer=d?.killer||'Unknown';
         const life='Deaths: '+deathChat.total+' | Alive: '+duration;
-        const full=life+' | By: '+killer;
+        const full=life+(d?.killer&&!d.killerConfirmed?' | Likely: ':' | By: ')+killer;
         if(fits(full))return [full];
         const first=fits(life)?life:fit('Deaths: '+deathChat.total+' Alive: '+duration);
-        const second=fit('Killed by: '+killer);
+        const second=fit((d?.killer&&!d.killerConfirmed?'Likely by: ':'Killed by: ')+killer);
         return [first,second].filter(Boolean);
     }
     function resetDeathChatParts(){
@@ -5998,7 +6074,8 @@
     function countDeath(packet,now=performance.now()){
         if(!player.alive)return false;
         const duration=deathChat.lifeAt!==null&&deathChat.lifeEpoch===session.connectionEpoch?Math.max(0,now-deathChat.lifeAt):null;
-        deathChat.lastDeath={duration,killer:deathKiller(packet)};
+        const confirmed=deathKiller(packet),inferred=confirmed?null:inferDeathKiller(now);
+        deathChat.lastDeath={duration,killer:confirmed||inferred?.killer||null,killerConfirmed:!!confirmed,killerSource:confirmed?'servidor':inferred?.killerSource||'sem evidência'};
         deathChat.lifeAt=null;deathChat.lifeEpoch=-1;
         deathChat.total=Math.min(Number.MAX_SAFE_INTEGER,deathChat.total+1);
         deathChat.pending=!!settings.deathChat;
@@ -6463,6 +6540,8 @@
         if(id===20&&(!(packet instanceof Uint8Array)||(packet.length-1)%19!==0))return;
         if(id===33||id===35)serverCheckRecord(session.ws,'Servidor respondeu');
         if(id===32||id===33)observeLootNames(packet);
+        if(id===29)observeDeathAttack(packet,performance.now());
+        if(id===20)observeDeathEvidence(packet,performance.now());
         if(id===28)noteOwnLootKill(packet);
         if(id===30)observeDeathChatEcho(packet);
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
@@ -6924,7 +7003,7 @@
                 hat.pending=true;hat.tries=0;hat.nextAt=0;tryRestoreHat();
             }
         }
-        if(key==='deathChat' && !settings.deathChat){deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;resetDeathChatParts();deathChat.status='Desativado';}
+        if(key==='deathChat' && !settings.deathChat){resetDeathEvidence();deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;resetDeathChatParts();deathChat.status='Desativado';}
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
             resetSpin();
@@ -7021,7 +7100,7 @@
         const lootStatus=menu.querySelector('#nx-loot-status');
         if(lootStatus)lootStatus.textContent='Loot: '+(settings.collectKillLoot?killLoot.status:'desativado');
         const countStatus=menu.querySelector('#nx-death-count');
-        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+(deathChat.lastDeath?' • Última vida: '+formatDeathDuration(deathChat.lastDeath.duration)+' • Por: '+(deathChat.lastDeath.killer||'Desconhecido'):'')+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
+        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+(deathChat.lastDeath?' • Última vida: '+formatDeathDuration(deathChat.lastDeath.duration)+(deathChat.lastDeath.killer&&!deathChat.lastDeath.killerConfirmed?' • Provável: ':' • Por: ')+(deathChat.lastDeath.killer||'Desconhecido')+' ('+deathChat.lastDeath.killerSource+')':'')+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
         if(ageStatus)ageStatus.textContent='Age: '+(settings.ageRecovery ? ageRecovery.status : 'desativado')+(clownEscapeActive()?' • Clown: '+(hat.current===3?'Jungle confirmado':'aguardando Jungle'):'');
         const bedStatus=menu.querySelector('#nx-bed-status');
