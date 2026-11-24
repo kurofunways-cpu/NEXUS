@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.74
+// @version      1.8.75
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.74';
+    const NEXUS_VERSION = '1.8.75';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -5191,12 +5191,49 @@
     // documented binary chat command, not DOM overlays or clan chat.
     const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=1500;
     const deathChat={total:0,pending:false,readyAt:Infinity,lastAt:-Infinity,epoch:-1,
-        echo:null,nativeTry:null,status:'Aguardando morte'};
+        echo:null,nativeTry:null,status:'Aguardando morte',lifeAt:null,lifeEpoch:-1,lastDeath:null};
     // Count only deaths in this document. A new or duplicated tab and a
     // full reload start at zero; respawns in this document retain the count.
     try{sessionStorage.removeItem(PREFIX+'death_count_v1');}catch(_){}
-    function countDeath(){
+    function deathLifeStart(now=performance.now()){
+        deathChat.lifeAt=now;deathChat.lifeEpoch=session.connectionEpoch;
+    }
+    function formatDeathDuration(ms){
+        if(ms===null||!Number.isFinite(ms))return '?';
+        const seconds=Math.max(0,Math.floor(ms/1000)),h=Math.floor(seconds/3600),min=Math.floor(seconds/60)%60,sec=seconds%60;
+        return (h?h+'h ':'')+(min?min+'m ':'')+sec+'s';
+    }
+    function cleanKillerName(value){
+        if(typeof value!=='string')return null;
+        const name=value.replace(/[\u0000-\u001f\u007f]/g,' ').trim();
+        if(!name||/^(unknown|undefined|null)$/i.test(name))return null;
+        return Array.from(name).slice(0,24).join('');
+    }
+    // The published protocol confirms opcode 19 is a death notification,
+    // but not a fixed killer-field layout. Only accept explicit attribution;
+    // opcode 28 reports OUR kills, not the player who killed us.
+    function deathKiller(packet){
+        if(Number(packet?.[0])!==19||!Array.isArray(packet))return null;
+        for(const field of packet.slice(1)){
+            if(typeof field==='string'){
+                const match=field.match(/^(?:you (?:were|got) killed by|killed by|killer:)\s*[:\-]?\s*(.+)$/i);
+                if(match){const name=cleanKillerName(match[1]);if(name)return name;}
+            }else if(field&&typeof field==='object'&&!Array.isArray(field)){
+                const name=cleanKillerName(field.killerName??field.killedBy??field.killer?.name??field.killer);
+                if(name)return name;
+            }
+        }
+        return null;
+    }
+    function deathChatMessage(){
+        const d=deathChat.lastDeath;
+        return 'Deaths: '+deathChat.total+' | Alive: '+formatDeathDuration(d?.duration??null)+' | By: '+(d?.killer||'Unknown');
+    }
+    function countDeath(packet,now=performance.now()){
         if(!player.alive)return false;
+        const duration=deathChat.lifeAt!==null&&deathChat.lifeEpoch===session.connectionEpoch?Math.max(0,now-deathChat.lifeAt):null;
+        deathChat.lastDeath={duration,killer:deathKiller(packet)};
+        deathChat.lifeAt=null;deathChat.lifeEpoch=-1;
         deathChat.total=Math.min(Number.MAX_SAFE_INTEGER,deathChat.total+1);
         deathChat.pending=!!settings.deathChat;
         deathChat.epoch=session.connectionEpoch;
@@ -5262,7 +5299,7 @@
             !connected() || deathChat.epoch!==session.connectionEpoch ||
             now<deathChat.readyAt || now-deathChat.lastAt<DEATH_CHAT_GAP ||
             !session.self || session.ws.bufferedAmount>=1024)return false;
-        const message='Deaths: '+deathChat.total;
+        const message=deathChatMessage();
         // A stationary player need not have a fresh position to send chat.
         // Respect a real user's open chat/draft rather than interrupting it.
         const input=document.getElementById('chat');
@@ -5284,10 +5321,11 @@
     }
     function resetDeathChatConnection(){
         deathChat.readyAt=Infinity;deathChat.epoch=-1;deathChat.echo=null;deathChat.nativeTry=null;
+        deathChat.lifeAt=null;deathChat.lifeEpoch=-1;
         if(deathChat.pending)deathChat.status='Aguardando respawn';
     }
     function resetDeathCount(){
-        deathChat.total=0;deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;
+        deathChat.total=0;deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;deathChat.lastDeath=null;
         deathChat.readyAt=Infinity;deathChat.status='Aguardando morte';
     }
     // FUN: change the nickname once per observed death, before native Play.
@@ -5656,6 +5694,7 @@
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false,apSnapshotProcessed=false;
         if (id === 35) { // spawn
+            const newDeathLife=!player.alive||deathChat.lifeEpoch!==session.connectionEpoch||deathChat.lifeAt===null;
             finishGoofySpawn();
             resetSmartLife();smartLife.startedAt=performance.now();
             resetTargetNotice();
@@ -5679,7 +5718,7 @@
             player.id = Number(packet[1]);
             player.alive = Number.isInteger(player.id) && player.id >= 0;
             player.health = 100;
-            if(player.alive)armDeathChat();
+            if(player.alive){if(newDeathLife)deathLifeStart();armDeathChat();}
             resetRespawnHat();
             armAgeRecoverySpawn();
             resetSpawnBed();
@@ -5692,7 +5731,7 @@
             updateHealth();
         } else if (id === 19) { // death
             markLifeDeath();
-            countDeath();
+            countDeath(packet);
             if(player.alive){
                 captureSmartDeath();
                 if(goofy.applied!==null)restoreGoofyNickname(false);
@@ -6163,7 +6202,7 @@
         const counterStatus=menu.querySelector('#nx-counter-status');
         if(counterStatus)counterStatus.textContent=(settings.killAura?'Kill Aura: ':settings.auraBreakSpikes?'Proteção spikes: ':'Kill Aura: ')+((settings.killAura||settings.auraBreakSpikes)?counter.status+(auraEscapeInProgress()?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
         const countStatus=menu.querySelector('#nx-death-count');
-        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
+        if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+(deathChat.lastDeath?' • Última vida: '+formatDeathDuration(deathChat.lastDeath.duration)+' • Por: '+(deathChat.lastDeath.killer||'Desconhecido'):'')+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
         if(ageStatus)ageStatus.textContent='Age: '+(settings.ageRecovery ? ageRecovery.status : 'desativado');
         const bedStatus=menu.querySelector('#nx-bed-status');
