@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.79
+// @version      1.8.80
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -64,6 +64,13 @@
 //   O eco não é garantido; pode haver uma duplicata. Testar tudo no jogo.
 // - 1.8.79: Jungle tem prioridade inclusive preso; Age Recovery espera o fim
 //   do Clown. Cancelar aproximação da cama libera o destino temporário.
+// - 1.8.80: varredura de construções dentro do círculo fixo por ativação/âncora.
+//   Inclui estruturas próprias e alheias, inclusive camas dentro do círculo.
+//   Pausa AP/Replace/Aura/Push sem alterar preferências; retoma após 2s sem
+//   estruturas observadas perto do centro. Reativar para nova varredura.
+//   O servidor pode impedir dano a estruturas amigas; não presumir destruição.
+// - AP: reserva prolongada, espera confirmação de spike por alvo e evita
+//   redundância quando o inimigo já está coberto. Validar no jogo.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -73,7 +80,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.79';
+    const NEXUS_VERSION = '1.8.80';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -122,6 +129,7 @@
         fixedDeathCircle: true,
         bedOutsideFixed: true,
         fixedDeathFollow: true,
+        clearDeathStructures: false,
         fixedDeathRadius: 120,
         returnSpin: true, // legacy key retained for existing tab preferences
         spinDegreesPerSecond: 180,
@@ -1099,9 +1107,9 @@
         if(!settings.fixedDeathReturn || !anchor || !self || !deathReturn.target ||
             fixedDeath.epoch!==session.connectionEpoch || deathReturn.manualMove || bed.approach)return;
         if(!fixedDeath.entered && returnDist(self,anchor)<=settings.fixedDeathRadius)fixedDeath.entered=true;
-        const cleaning=trapCleanupActive(now);
-        const enemy=fixedDeath.entered&&!cleaning?fixedDeathEnemy(now):null;
-        let goal=cleaning?trapCleanupGoal(now,anchor,self)||anchor:anchor;
+        const sweeping=areaCleanupActive(now),cleaning=!sweeping&&trapCleanupActive(now);
+        const enemy=fixedDeath.entered&&!cleaning&&!sweeping?fixedDeathEnemy(now):null;
+        let goal=sweeping?areaCleanupGoal(now,anchor,self):cleaning?trapCleanupGoal(now,anchor,self)||anchor:anchor;
         if(enemy){
             const d=returnDist(self,enemy);
             goal=d<=42?{x:self.x,y:self.y}:{
@@ -1121,7 +1129,7 @@
         deathReturn.bad=[];deathReturn.fails=0;deathReturn.attempted=0;
         deathReturn.phase='ready';deathReturn.startedAt=now;deathReturn.nextAt=now;
         deathReturn.learningClean=false;deathReturn.recorded=[];
-        deathReturn.status=cleaning?'Liberando vagas de traps':enemy?'Seguindo alvo #'+enemy.id:'Voltando ao ponto fixo';
+        deathReturn.status=sweeping?'Limpando estruturas da área':cleaning?'Liberando vagas de traps':enemy?'Seguindo alvo #'+enemy.id:'Voltando ao ponto fixo';
         if(continuous){
             deathReturn.route=[{...goal}];deathReturn.step=0;
             if(!returnMoveTo(goal,now))stopReturnMovement();
@@ -1166,7 +1174,7 @@
         deathReturn.moveOwned=false;
     }
     function resetReturnForServer() {
-        resetFixedDeath();stopReturnMovement(false);deathReturn.withoutBed=false;
+        resetFixedDeath();resetAreaCleanup(true);stopReturnMovement(false);deathReturn.withoutBed=false;
         deathReturn.epoch++;
         deathReturn.target=null;deathReturn.lastSelf=null;
         deathReturn.aliveTrail=[];deathReturn.recorded=[];
@@ -1316,6 +1324,7 @@
     const RETURN_MOVING_TTL=850;
     function observeReturnObjects(packet,now=performance.now()) {
         if(!(packet instanceof Uint8Array)||(packet.length-1)%19!==0)return;
+        observeAreaStructures(packet,now);
         const objects=deathReturn.objects, movers=deathReturn.movers;
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8;
@@ -1999,7 +2008,7 @@
         releaseSpinVisual();spin.lastSentAt=-Infinity;spin.lastAt=null;spin.angle=0;spin.aim=null;
     }
     function spinCanAim(now){
-        return settings.returnSpin && player.alive && connected() && !session.attacking &&
+        return settings.returnSpin && player.alive && connected() && !session.attacking && !areaCleanupActive(now) &&
             !auraAimTarget(now) &&
             session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
             !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
@@ -2082,7 +2091,7 @@
                 (recentHit && distance>RETURN_ARRIVED+4);
             if(!displaced){
                 deathReturn.driftSamples=0;
-                deathReturn.status=fixedDeath.targetId!==null?'Acompanhando alvo #'+fixedDeath.targetId:'Fixado no local da morte';
+                deathReturn.status=areaCleanupActive(now)?'Limpeza: '+areaSweep.status:fixedDeath.targetId!==null?'Acompanhando alvo #'+fixedDeath.targetId:'Fixado no local da morte';
                 return;
             }
             // No extra snapshot required: server position itself confirms
@@ -2115,7 +2124,7 @@
                 deathReturn.verifiedPath.push({x:deathReturn.self.x,y:deathReturn.self.y});
             stopReturnMovement();deathReturn.phase='arrived';
             deathReturn.driftSamples=0;deathReturn.arrivals++;
-            deathReturn.status=fixedDeath.targetId!==null?'Acompanhando alvo #'+fixedDeath.targetId:'Fixado no local da morte';
+            deathReturn.status=areaCleanupActive(now)?'Limpeza: '+areaSweep.status:fixedDeath.targetId!==null?'Acompanhando alvo #'+fixedDeath.targetId:'Fixado no local da morte';
             saveSuccessfulReturn();return;
         }
         if(deathReturn.phase==='moving'){
@@ -3797,7 +3806,7 @@
         return [n&255,(n>>>8)&255];
     }
     function queueAutoReplace(key, old, now) {
-        if (!settings.autoReplace || !old || !ap.self || old.sid!==ap.self.sid || now-old.at>AP_OBJECT_TTL) return;
+        if (!settings.autoReplace || !old || !ap.self || old.sid!==ap.self.sid || now-old.at>AP_OBJECT_TTL || areaCleanupActive(now) || (counter.cleanupMarks.get(key)??0)>now) return;
         if(old.type===6&&(trapCleanupActive(now)||(counter.cleanupMarks.get(String(old.id))??0)>now))return;
         const kind=placementTypes.KeyF.has(old.type)?'KeyF':placementTypes.KeyV.has(old.type)?'KeyV':null;
         if (!kind || ap.replaceQueue.has(key) || apDistance(old,ap.self)>AP_RADIUS+AR_TOLERANCE+85) return;
@@ -3884,8 +3893,8 @@
         const angle=i*Math.PI/60-Math.PI;
         return {angle,dx:AP_RADIUS*Math.cos(angle),dy:AP_RADIUS*Math.sin(angle)};
     });
-    const AP_CONFIRM_WINDOW=850;
-    function apReservationMs(){return Math.max(85,Math.min(210,ap.tick*1.45));}
+    const AP_CONFIRM_WINDOW=1100;
+    function apReservationMs(){return Math.max(300,Math.min(850,ap.tick*3.5));}
     function apPendingActive(p,now){return now-p.at<apReservationMs();}
     function apExpire(now) {
         const timeout=apReservationMs();
@@ -3894,7 +3903,7 @@
             if(!p.expired && now-p.at>=timeout){p.expired=true;ap.misses.push({...p,at:now});}
             return true;
         }).slice(-64);
-        ap.misses=ap.misses.filter(p=>now-p.at<220).slice(-64);
+        ap.misses=ap.misses.filter(p=>now-p.at<1000).slice(-64);
         ap.confirmed=ap.confirmed.filter(t=>now-t<1000);
         ap.replaced=ap.replaced.filter(t=>now-t<1000);
         for (const [id,r] of ap.replaceQueue) {
@@ -3961,9 +3970,11 @@
             const pendingTrap=ap.pending.some(p=>p.key==='KeyF'&&p.target===e.id&&apPendingActive(p,now)&&
                 (apDistance(p,path[0])<=AP_TRAP_CONTACT || apDistance(p,path[1])<=AP_TRAP_CONTACT));
             const nearSpike=spikes.some(o=>apDistance(o,e)<=AP_SPIKE_CONTACT);
+            const pendingSpike=ap.pending.some(p=>p.key==='KeyV'&&p.target===e.id&&now-p.at<AP_CONFIRM_WINDOW);
+            const recentSpike=ap.misses.some(p=>p.key==='KeyV'&&p.target===e.id&&now-p.at<350);
             const inReach=dist<=165;
             const threat=Math.max(0,AP_MAX_RANGE-dist)+Math.max(0,apDistance(origin,path[0])-apDistance(origin,path[2]))*.5+(ap.target===e.id&&now<ap.targetUntil?12:0);
-            return {e,capture,path,dist,pendingTrap,nearSpike,threat,inReach};
+            return {e,capture,path,dist,pendingTrap,pendingSpike,recentSpike,nearSpike,threat,inReach};
         }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>b.threat-a.threat).slice(0,4);
         if(!enemies.length){ap.target=null;ap.status='No enemy';return [];}
         const candidates=[];
@@ -3977,7 +3988,7 @@
                 const failures=ap.misses.filter(p=>p.key===key&&apDistance(point,p)<27).length;
                 if(failures>=2)continue;
                 for(const x of enemies){
-                    const {e,capture,path,pendingTrap,nearSpike,inReach}=x;
+                    const {e,capture,path,pendingTrap,pendingSpike,recentSpike,nearSpike,inReach}=x;
                     // A defensive trap occupies the attacker's approach even
                     // if their predicted centre is outside the capture circle.
                     const cover=defending&&trap&&!capture&&inReach;
@@ -3990,11 +4001,13 @@
                             if(facing<=0 || cross>105 || traps.some(t=>apDistance(t,point)<65))continue;
                         }else if(cross>AP_TRAP_CONTACT || (distances[0]>48&&distances[1]>distances[0]+8&&distances[2]>distances[1]))continue;
                     }else{
-                        if(cross>AP_SPIKE_CONTACT || (!capture&&distances[0]>AP_SPIKE_CONTACT&&distances[1]>distances[0]))continue;
-                        if(nearSpike&&Math.min(...distances)>60)continue;
+                        if(pendingSpike||recentSpike||capture&&nearSpike)continue;
+                        if(cross>AP_SPIKE_CONTACT || (!capture&&Math.min(distances[0],distances[1],distances[2])>58))continue;
+                        if(!capture&&distances[1]>distances[0]+8&&distances[2]>=distances[1])continue;
+                        if(!capture&&nearSpike&&spikes.some(o=>path.slice(0,3).some(p=>apDistance(o,p)<=55)))continue;
                     }
                     const immediateSpike=!trap&&Math.min(distances[0],distances[1])<=48&&x.dist<=110;
-                    const priority=cover?7:capture&&!trap?8:immediateSpike?5:trap?4:2;
+                    const priority=cover?7:capture&&!trap?8:trap?5:immediateSpike?4:2;
                     const intercept=trap?Math.min(distances[0]+5,distances[1],distances[2]+8,distances[3]+18):Math.min(...distances);
                     const score=120-intercept*1.25-cross*.3+x.threat*.35+Math.min(15,margin)*.4-failures*24+(capture&&!trap?20:0);
                     candidates.push({key,angle:r.angle,point,score,priority,target:e.id,defensive:cover||defending&&!!capture&&!trap});
@@ -4091,6 +4104,7 @@
         const self=ap.self;
         if(!settings.autoPush)return 'Desativado';
         if(clownEscapeActive())return 'Clown: fuga prioritária';
+        if(areaCleanupActive(now))return 'Limpeza da área';
         if(!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL)return 'Aguardando posição';
         if(push.manual||deathReturn.manualMove||session.attacking)return 'Controle manual';
         if(trapCleanupActive(now))return 'Liberando vagas de traps';
@@ -4145,7 +4159,7 @@
         return true;
     }
     function planAutoReplace(self,entities,now) {
-        if (!settings.autoReplace) return [];
+        if (!settings.autoReplace || areaCleanupActive(now)) return [];
         apExpire(now);
         const lead=Math.max(25,Math.min(85,ap.tick*.55));
         const origin=apPredict(self,Math.max(0,now-self.at)+lead*.4);
@@ -4232,6 +4246,8 @@
         return !document.hidden && editing({target:active}) && !(menu&&menu.contains(active));
     }
     function apCombatBlocked(now){
+        if(areaCleanupActive(now))return 'Limpeza da área';
+        if(clownEscapeActive())return 'Clown: fuga prioritária';
         if(now-ap.self.at>AP_PLAYER_TTL)return 'Waiting update';
         if(apTyping())return 'Digitando no jogo';
         if(ap.manualItem||now<ap.manualUntil)return 'Manual item';
@@ -4253,7 +4269,7 @@
     function runAutoPlace(now=performance.now()) {
         if(!autoPlacementEnabled()||!player.alive||!connected()||!ap.self)return false;
         const blocked=apCombatBlocked(now);
-        if(blocked)return apBlocked(blocked,now,blocked==='Digitando no jogo'||blocked==='Waiting update'?null:blocked==='Heal'?8:20);
+        if(blocked)return apBlocked(blocked,now,['Digitando no jogo','Waiting update','Limpeza da área','Clown: fuga prioritária'].includes(blocked)?null:blocked==='Heal'?8:20);
         if(now<ap.nextAt){scheduleAutoPlace(ap.nextAt-now);return false;}
         const defending=apDefending(now);
         if(!defending && (settings.killAura||settings.auraBreakSpikes||trapCleanupActive(now))&&now>=counter.nextStrikeAt){
@@ -4290,7 +4306,7 @@
                 if (ap.replaceQueue.size) ap.status='Replace waiting';
                 else if (!settings.autoPlace) ap.status='Replace idle';
             }
-            scheduleAutoPlace(Math.max(15,Math.min(35,ap.tick*.35)));return false;
+            scheduleAutoPlace(Math.max(45,Math.min(110,ap.tick)));return false;
         }
         const capacity=Math.floor((macro.tokens-overhead)/3);
         // Send the best valid placement immediately; never wait to fill a batch.
@@ -4958,7 +4974,7 @@
         return plans.filter(p=>slots[p.key]>0&&--slots[p.key]>=0);
     }
     function trapCleanupActive(now){
-        if(!settings.trapSlotRecovery||!settings.autoPlace||!player.alive||!session.self){
+        if(areaCleanupActive(now)||!settings.trapSlotRecovery||!settings.autoPlace||!player.alive||!session.self){
             counter.cleanupActive=false;return false;
         }
         const count=ownTrapCount(now);
@@ -4992,6 +5008,104 @@
         if(d<1)return {x:self.x,y:self.y};
         const goal={x:self.x+(t.x-self.x)*step/d,y:self.y+(t.y-self.y)*step/d};
         return returnDist(goal,anchor)<=settings.fixedDeathRadius?goal:{x:self.x,y:self.y};
+    }
+    // A sweep is explicit, scoped to the fixed anchor, and does not mutate user settings.
+    const AREA_STRUCTURE_TYPES=new Set([2,6,7,8,9,10,13,15,16,17,18,22,26,37]);
+    const areaSweep={objects:new Map(),signature:null,done:false,emptySince:null,lastPacket:-Infinity,
+        target:null,goal:null,status:'Aguardando área'};
+    function resetAreaCleanup(clearObjects=false){
+        if(clearObjects)areaSweep.objects.clear();
+        areaSweep.signature=null;areaSweep.done=false;areaSweep.emptySince=null;
+        areaSweep.lastPacket=-Infinity;areaSweep.target=null;areaSweep.goal=null;
+        areaSweep.status='Aguardando área';
+    }
+    function areaCleanupSignature(){
+        const a=fixedDeath.anchor;
+        return settings.clearDeathStructures&&settings.fixedDeathReturn&&a&&
+            fixedDeath.epoch===session.connectionEpoch?
+            [session.connectionEpoch,a.x,a.y,settings.fixedDeathRadius].join(':'):null;
+    }
+    function areaCleanupActive(now=performance.now()){
+        const signature=areaCleanupSignature();
+        if(signature!==areaSweep.signature){
+            areaSweep.signature=signature;areaSweep.done=false;areaSweep.emptySince=null;
+            areaSweep.target=null;areaSweep.goal=null;
+            if(signature){ap.replaceQueue.clear();stopAutoPush();}
+        }
+        return !!(signature&&!areaSweep.done&&player.alive&&returnAuthorized());
+    }
+    function observeAreaStructures(packet,now){
+        areaSweep.lastPacket=now;
+        for(let i=1;i+18<packet.length;i+=19){
+            const type=packet[i],id=packet[i+2]|packet[i+3]<<8,key=String(id);
+            const old=areaSweep.objects.get(key);
+            if(packet[i+8]&2||!AREA_STRUCTURE_TYPES.has(type)){areaSweep.objects.delete(key);continue;}
+            const t={key,id,type,sid:packet[i+1],team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
+                y:packet[i+6]|packet[i+7]<<8,hp:packet[i+13],at:now};
+            if(old&&old.type===type&&old.sid===t.sid&&old.x===t.x&&old.y===t.y){
+                if(old.hp>0&&t.hp===0){areaSweep.objects.delete(key);continue;}
+                if(t.hp<old.hp){counter.breakProgress.delete(key);counter.breakAvoid.delete(key);}
+            }else if(old){counter.breakProgress.delete(key);counter.breakAvoid.delete(key);}
+            areaSweep.objects.set(key,t);
+        }
+        for(const [key,t] of areaSweep.objects)
+            if(now-t.at>RETURN_MAP_TTL)areaSweep.objects.delete(key);
+        if(areaSweep.objects.size>900){
+            const a=fixedDeath.anchor||session.self||{x:0,y:0};
+            const far=[...areaSweep.objects.values()].sort((x,y)=>returnDist(y,a)-returnDist(x,a));
+            for(const t of far.slice(0,areaSweep.objects.size-900))areaSweep.objects.delete(t.key);
+        }
+    }
+    function areaCleanupCandidates(now){
+        if(!areaCleanupActive(now))return [];
+        const a=fixedDeath.anchor,r=settings.fixedDeathRadius;
+        return [...areaSweep.objects.values()].filter(t=>returnDist(t,a)<=r);
+    }
+    function areaCleanupWeaponReach(now){
+        const w=counterWeapon(now),h=auraHammerAvailable();
+        return Math.max(COUNTER_REACH.get(w?.id)??0,COUNTER_REACH.get(h)??0,
+            COUNTER_REACH.get(session.weaponIds[0])??0);
+    }
+    function areaCleanupTarget(now,reachable=false){
+        const self=session.self;
+        if(!self||now-self.at>250)return null;
+        const reach=areaCleanupWeaponReach(now),all=areaCleanupCandidates(now);
+        const targets=all.filter(t=>(counter.breakAvoid.get(t.key)??0)<=now&&
+            (!reachable||returnDist(t,self)<=reach));
+        targets.sort((a,b)=>returnDist(a,self)-returnDist(b,self));
+        return targets.find(t=>t.key===areaSweep.target&&returnDist(t,self)<=reach)||targets[0]||null;
+    }
+    function areaCleanupGoal(now,anchor,self){
+        const all=areaCleanupCandidates(now),reach=areaCleanupWeaponReach(now),r=settings.fixedDeathRadius;
+        if(!all.length){
+            areaSweep.target=null;areaSweep.goal=null;
+            if(returnDist(anchor,self)<=Math.min(r,65)&&now-areaSweep.lastPacket<=250){
+                if(areaSweep.emptySince===null)areaSweep.emptySince=now;
+                if(now-areaSweep.emptySince>=2000){
+                    areaSweep.done=true;areaSweep.status='Área limpa; automações retomadas';ap.nextAt=now;return anchor;
+                }
+                areaSweep.status='Confirmando área vazia';return {x:self.x,y:self.y};
+            }
+            areaSweep.emptySince=null;areaSweep.status='Inspecionando área';return anchor;
+        }
+        areaSweep.emptySince=null;
+        const t=areaCleanupTarget(now,true)||areaCleanupTarget(now);
+        if(!t||!reach){areaSweep.status='Estruturas pendentes: aguardando arma/revalidação ('+all.length+')';return {x:self.x,y:self.y};}
+        if(areaSweep.target!==t.key){areaSweep.target=t.key;areaSweep.goal=null;}
+        areaSweep.status='Restam '+all.length+' • alvo #'+t.id;
+        if(returnDist(t,self)<=reach){areaSweep.goal=null;return {x:self.x,y:self.y};}
+        if(areaSweep.goal&&returnDist(t,areaSweep.goal)<=reach)return areaSweep.goal;
+        const obs=returnObstacles(now,self),base=Math.atan2(self.y-t.y,self.x-t.x);
+        let best=null,score=Infinity;
+        for(let i=0;i<16;i++){
+            const angle=base+(i%2?-1:1)*Math.ceil(i/2)*Math.PI/8,distance=Math.max(35,reach-8);
+            const p={x:t.x+Math.cos(angle)*distance,y:t.y+Math.sin(angle)*distance};
+            if(p.x<30||p.y<30||p.x>65505||p.y>65505||
+                returnDist(p,anchor)>r+reach||obs.some(o=>returnDist(o,p)<o.radius+15))continue;
+            const value=returnDist(p,self)+(returnSegmentClear(self,p,obs,15)?0:60);
+            if(value<score){score=value;best=p;}
+        }
+        areaSweep.goal=best;return best||{x:self.x,y:self.y};
     }
     function auraTrapTarget(now){
         const self=session.self;
@@ -5159,11 +5273,12 @@
     }
     function strikeAuraTrap(t,now,w){
         const distance=auraTrapDistance(t,session.self);
-        const available=selfPinned(now)?auraHammerAvailable():null;
+        const sweeping=areaCleanupActive(now);
+        const available=(sweeping||selfPinned(now))?auraHammerAvailable():null;
         const hammer=available!==null && distance<=(COUNTER_REACH.get(available)??0)?available:null;
         const main=session.weaponIds[0];
-        if(hammer===null && auraIsSpike(t) && KATANA_WEAPONS.has(main))w={id:main,select:true,packet:[0,0]};
-        const id=hammer??w?.id, name=auraStructureName(t);
+        if(hammer===null && ((auraIsSpike(t)&&KATANA_WEAPONS.has(main))||(sweeping&&COUNTER_REACH.has(main)&&distance>(COUNTER_REACH.get(w?.id)??0))))w={id:main,select:true,packet:[0,0]};
+        const id=hammer??w?.id, name=sweeping?'estrutura #'+t.id:auraStructureName(t);
         if(id==null || distance>(COUNTER_REACH.get(id)??0)){counter.status=name+': aguardando arma/alcance';return false;}
         const self=session.self;
         let progress=counter.breakProgress.get(t.key);
@@ -5173,9 +5288,9 @@
         // revalidation before it can own attack/equipment again.
         if(progress.attempts>=12 && now-progress.since>=3000){
             const stale=now-t.at>1500;
-            const actualTrap=!auraIsSpike(t) && self.trapped===true;
+            const actualTrap=t.type===AURA_TRAP_TYPE && self.trapped===true;
             const damageEvidence=auraIsSpike(t)&&auraTrapDistance(t,self)<=82&&now-heal.lastDamageAt<=350;
-            counter.breakAvoid.set(t.key,stale&&!actualTrap&&!damageEvidence?Infinity:now+1500);
+            counter.breakAvoid.set(t.key,!sweeping&&stale&&!actualTrap&&!damageEvidence?Infinity:now+1500);
             counter.breakProgress.delete(t.key);counter.contacts.delete(t.key);
             if(counter.navSpikeKey===t.key)counter.navSpikeKey=null;
             counter.breakKey=null;counter.breakAttempts=0;
@@ -5205,7 +5320,7 @@
         transmit([18]);
         if(temporary)restoreWeapon(!settings.returnSpin); // retain watchdog even after successful send
         if(hit){progress.attempts++;counter.breakAttempts=progress.attempts;}
-        counter.lastAt=now;counter.lastStructureStrike=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
+        counter.lastAt=now;counter.lastStructureStrike=now;counter.nextStrikeAt=now+(sweeping?Math.max(140,Math.min(400,(AURA_STATS.get(id)?.[1]??300)*.6)):AURA_BREAK_ATTEMPT_MS);
         counter.aim=aim;counter.aimAt=now;
         counter.status=hit?((t.sid===self.sid&&!auraIsSpike(t)?'Liberando vaga: trap própria':'Quebrando '+name)+(hammer!==null?' com Hammer #'+id:' com arma atual')):name+': golpe não enviado';
         return true;
@@ -5228,6 +5343,7 @@
     // Aim ownership is independent of swing cooldown. Food's atomic select /
     // consume / restore transaction can share the same angle safely.
     function auraAimTarget(now){
+        if(areaCleanupActive(now))return null;
         if((!settings.killAura && !settings.auraBreakSpikes && !trapCleanupActive(now)) || !player.alive || !connected() || session.attacking ||
             !session.self || now-session.self.at>250 || ageRecovery.pending ||
             (bed.pending && bed.phase==='placing' && bed.locked) ||
@@ -5298,15 +5414,17 @@
     function driveCounter(now=performance.now()){
         if(clownEscapeActive()&&!selfPinned(now))return false;
         driveAuraHat(now);
-        const hostile=auraTrapTarget(now),cleanup=trapCleanupTarget(now);
-        const structure=hostile||cleanup;
+        const sweeping=areaCleanupActive(now);
+        const hostile=auraTrapTarget(now),cleanup=sweeping?areaCleanupTarget(now,true):trapCleanupTarget(now);
+        const structure=sweeping?(selfPinned(now)&&hostile?hostile:cleanup):hostile||cleanup;
         if(recoverAuraWeapon(now,!!structure))return true;
-        if((!settings.killAura&&!settings.auraBreakSpikes&&!trapCleanupActive(now))||!player.alive||!connected())return false;
+        if((!sweeping&&!settings.killAura&&!settings.auraBreakSpikes&&!trapCleanupActive(now))||!player.alive||!connected())return false;
         const aiming=driveAuraAim(now),blocked=counterBlockReason(now);
         if(blocked){counter.status='Pausado: '+blocked;return aiming;}
         if(now<counter.nextStrikeAt)return aiming;
         const w=counterWeapon(now);
-        const enemy=(settings.killAura||trapCleanupActive(now))&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
+        const enemy=!sweeping&&(settings.killAura||trapCleanupActive(now))&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
+        if(sweeping&&!structure){counter.status='Limpeza: '+areaSweep.status;return false;}
         const urgent=counterUrgentStructure(structure,now);
         // True capture/contact damage retains priority. Otherwise alternate
         // reachable structure work and enemy defense instead of monopolizing
@@ -6251,6 +6369,11 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
+        if(key==='clearDeathStructures'){
+            resetAreaCleanup(false);ap.replaceQueue.clear();ap.nextAt=performance.now();
+            if(settings.clearDeathStructures){stopAutoPush();areaCleanupActive();}
+            if(deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;deathReturn.nextAt=performance.now();}
+        }
         if(key==='killAura'){
             // Toggle does not erase current-life inventory or restoration state.
             counter.target=null;
@@ -6369,7 +6492,9 @@
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
         if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
-        if(counterStatus)counterStatus.textContent=(settings.killAura?'Kill Aura: ':settings.auraBreakSpikes?'Proteção spikes: ':'Kill Aura: ')+((settings.killAura||settings.auraBreakSpikes)?counter.status+(auraEscapeInProgress()?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
+        if(counterStatus)counterStatus.textContent=areaCleanupActive()?'Limpeza: '+counter.status:(settings.killAura?'Kill Aura: ':settings.auraBreakSpikes?'Proteção spikes: ':'Kill Aura: ')+((settings.killAura||settings.auraBreakSpikes)?counter.status+(auraEscapeInProgress()?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
+        const sweepStatus=menu.querySelector('#nx-area-cleanup-status');
+        if(sweepStatus)sweepStatus.textContent=!settings.clearDeathStructures?'Limpeza desativada':areaSweep.done?'Área limpa; automações retomadas':areaCleanupActive()?areaSweep.status+' • AP/Aura/Replace/Push pausados':'Aguardando ponto fixo';
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+(deathChat.lastDeath?' • Última vida: '+formatDeathDuration(deathChat.lastDeath.duration)+' • Por: '+(deathChat.lastDeath.killer||'Desconhecido'):'')+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
@@ -6672,6 +6797,8 @@
             <label>Mostrar círculo do ponto fixo<input data-heal-setting="fixedDeathCircle" type="checkbox"></label>
             <label title="Constrói camas novas fora do círculo com margem; não destrói camas existentes.">Cama fora da área fixa<input data-heal-setting="bedOutsideFixed" type="checkbox"></label>
             <label>Seguir inimigos dentro do círculo<input data-heal-setting="fixedDeathFollow" type="checkbox"></label>
+            <label title="Uma varredura por ativação ou novo ponto fixo. Inclui construções próprias e inimigas e camas dentro do círculo. Pausa Auto Place, Auto Replace, Kill Aura e Auto Push até concluir. Desligue e ligue para repetir.">Limpar estruturas da área<input data-heal-setting="clearDeathStructures" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-area-cleanup-status"></div>
             <label>Raio de detecção (u)<input data-heal-setting="fixedDeathRadius" type="number" min="30" max="1000" step="1"></label>
             <div class="nx-info-line" id="nx-fixed-status"></div>
             <div class="pick-actions"><button type="button" id="nx-fixed-mark">Marcar área aqui</button><button type="button" id="nx-fixed-mark-all" title="Usa as coordenadas desta aba em todas as abas conectadas ao mesmo servidor">Marcar área para todos</button><button type="button" id="nx-fixed-reset">Limpar ponto fixo</button></div>
