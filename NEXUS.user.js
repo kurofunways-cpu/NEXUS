@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.96
+// @version      1.8.97
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -164,6 +164,12 @@
 //   Astral tem prioridade se ambos ligados; usa mesmo dono de movimento,
 //   validação de propriedade/área e watchdog do NEXUS. Sem código externo
 //   executado; não replica o teste de array sempre verdadeiro do original.
+// - 1.8.97: recuo estratégico após 3 s sem reduzir HP na borda.
+//   Planeja movimento para o centro, pausa Push e reengaja se causar
+//   dano ou o alvo entrar. Durante recuo, Katana observada (17/36/37/40)
+//   ataca construções próprias/aliadas/inimigas ao alcance, sem desviar;
+//   não ataca loot nem natureza. Cura, cama e comando manual prevalecem.
+//   Dados/ranges públicos são aproximações; não houve teste no jogo.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -173,7 +179,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.96';
+    const NEXUS_VERSION = '1.8.97';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -225,6 +231,7 @@
         fixedDeathFollow: true,
         collectKillLoot: true,
         orbitCombat: true,
+        edgeRetreat: true,
         idleAreaCleanup: true,
         fixedDeathRadius: 120,
         returnSpin: true, // legacy key retained for existing tab preferences
@@ -1123,7 +1130,7 @@
     const fixedDeath={anchor:null,epoch:-1,entered:false,targetId:null,lastPlanAt:-Infinity,circle:null,liveMarked:false,camera:null};
     function returnEnabled(){return settings.returnAfterBed || settings.fixedDeathReturn;}
     function resetFixedDeath(){
-        collectiveMark.active=false;
+        resetEdgeRetreat();collectiveMark.active=false;
         resetFixedFocus();
         fixedDeath.anchor=null;fixedDeath.epoch=-1;fixedDeath.entered=false;fixedDeath.liveMarked=false;
         fixedDeath.targetId=null;fixedDeath.lastPlanAt=-Infinity;fixedDeath.camera=null;
@@ -1348,6 +1355,89 @@
     function resetCombatOrbit(){
         Object.assign(combatOrbit,{id:null,sid:null,hp:null,since:0,attempts:0,until:0,point:null,center:null,side:1,nextAt:0});
     }
+    const edgeRetreat={id:null,sid:null,hp:null,watchSince:0,active:false,goal:null,until:0,cooldown:0,lastKatanaAt:-Infinity,status:'Aguardando luta na borda'};
+    function resetEdgeRetreat(){
+        Object.assign(edgeRetreat,{id:null,sid:null,hp:null,watchSince:0,active:false,goal:null,until:0,cooldown:0,lastKatanaAt:-Infinity,status:'Aguardando luta na borda'});
+    }
+    function finishEdgeRetreat(now,status){
+        if(!edgeRetreat.active)return false;
+        edgeRetreat.active=false;edgeRetreat.goal=null;edgeRetreat.cooldown=Math.max(edgeRetreat.cooldown,now+4200);edgeRetreat.watchSince=now;edgeRetreat.status=status;return true;
+    }
+    function planEdgeRetreat(e,self,a,now){
+        const r=settings.fixedDeathRadius,dx=e.x-a.x,dy=e.y-a.y,len=Math.max(1,Math.hypot(dx,dy)),ux=dx/len,uy=dy/len;
+        const obs=returnObstacles(now,self),risks=returnRiskZones(now,self);
+        let goal=null,best=Infinity;
+        for(const f of [-.28,0,-.42,-.15])for(const side of [0,.22,-.22,.4,-.4]){
+            const p={x:a.x+r*(ux*f-uy*side),y:a.y+r*(uy*f+ux*side)};
+            if(returnDist(p,a)>r*.65||returnDist(self,p)<30||p.x<30||p.y<30||p.x>65505||p.y>65505||
+                returnBadEdge(self,p,now)||spikeNavBlocker(self,p,now)||obs.some(o=>returnDist(o,p)<o.radius+14))continue;
+            const score=returnDist(self,p)+(!returnSegmentClear(self,p,obs,15)?65:0)+(returnRiskOnSegment(self,p,risks)?100:0)+returnLoopPenalty(p,self,now)*.4;
+            if(score<best){best=score;goal=p;}
+        }
+        return goal;
+    }
+    function refreshEdgeRetreat(e,self,now){
+        const a=fixedDeath.anchor,r=settings.fixedDeathRadius,t=edgeRetreat;
+        if(!settings.edgeRetreat||!settings.fixedDeathReturn||!settings.fixedDeathFollow||!settings.killAura||
+            !a||!self||now-self.at>250||r<80||!returnCanMove(now)||bed.pending||!e||
+            now-e.at>350||lootClaimPending(now)){
+            finishEdgeRetreat(now,'Recuo interrompido');return false;
+        }
+        if(t.id!==e.id||t.sid!==e.sid){
+            resetEdgeRetreat();Object.assign(t,{id:e.id,sid:e.sid,hp:e.hp,watchSince:now});
+        }
+        if(Number.isFinite(e.hp)&&Number.isFinite(t.hp)&&e.hp<t.hp-1){
+            t.hp=e.hp;finishEdgeRetreat(now,'Dano observado: retomando combate');t.watchSince=now;return false;
+        }
+        if(Number.isFinite(e.hp))t.hp=e.hp;
+        const eRadius=returnDist(e,a),selfRadius=returnDist(self,a);
+        if(t.active){
+            if(now>=t.until||!t.goal||returnDist(self,t.goal)<=18||eRadius<r*.61||eRadius>r+15){
+                finishEdgeRetreat(now,'Recuo concluído');return false;
+            }
+            return true;
+        }
+        const border=eRadius>=r*.77&&selfRadius>=r*.68&&returnDist(e,self)<245;
+        if(!border||now<t.cooldown){t.watchSince=now;return false;}
+        const fighting=(counter.target?.id===e.id&&now-counter.lastEnemyStrike<=1600)||
+            (autoPushEnabled()&&push.target===e.id&&now-push.lastAt<=1000)||
+            (settings.autoPlace&&ap.target===e.id&&now-ap.lastBatchAt<=1100);
+        if(!fighting){t.watchSince=now;return false;}
+        if(now-t.watchSince<3000){t.status='Borda: observando 3 s sem dano';return false;}
+        const goal=planEdgeRetreat(e,self,a,now);
+        if(!goal){t.watchSince=now;t.status='Borda: sem trajeto interno seguro';return false;}
+        t.active=true;t.goal=goal;t.until=now+3500;t.cooldown=now+8000;t.status='Recuando para atrair ao centro';
+        stopAutoPush();return true;
+    }
+    function retreatKatana(now){
+        const w=counterWeapon(now);
+        if(w&&KATANA_WEAPONS.has(w.id))return {id:w.id,select:w.select?w.packet:null,restore:false};
+        for(let slot=0;slot<2;slot++)if(KATANA_WEAPONS.has(session.weaponIds[slot]))
+            return {id:session.weaponIds[slot],select:[0,slot],restore:true};
+        return null;
+    }
+    function strikeRetreatStructure(now){
+        if(!edgeRetreat.active||!session.self||now-session.self.at>250||
+            now-areaSweep.lastPacket>650||counter.restorePending)return false;
+        const w=retreatKatana(now);if(!w)return false;
+        const self=session.self,reach=Math.min(145,(COUNTER_REACH.get(w.id)??0)-15);
+        const targets=[...areaSweep.objects.values()].filter(o=>AREA_STRUCTURE_TYPES.has(o.type)&&o.hp>0&&
+            now-o.at<=650&&returnDist(o,self)<=reach&&
+            returnDist(o,fixedDeath.anchor)<=settings.fixedDeathRadius+30&&
+            (counter.breakAvoid.get(o.key)??0)<=now);
+        if(!targets.length)return false;
+        targets.sort((a,b)=>returnDist(a,self)-returnDist(b,self));
+        const target=targets[0],saved=[...session.weaponPacket];
+        if(w.select&&!transmit(w.select))return false;
+        const hit=transmit([19,...targetAim(target)]);
+        transmit([18]);
+        if(w.restore)transmit(saved);
+        if(!hit)return false;
+        counter.lastAt=now;counter.lastStructureStrike=now;
+        counter.nextStrikeAt=now+Math.max(245,(AURA_STATS.get(w.id)?.[1]??300)*.85);
+        counter.status='Recuo: Katana #'+w.id+' estrutura #'+target.id;edgeRetreat.lastKatanaAt=now;
+        return true;
+    }
     function observeLootNames(packet){
         if(!Array.isArray(packet))return;
         const put=(sid,name)=>{
@@ -1500,6 +1590,7 @@
         const d=returnDist(self,enemy),radius=settings.fixedDeathRadius;
         const placing=settings.autoPlace&&settings.autoPlaceSpike;
         const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110;
+        if(edgeRetreat.active&&edgeRetreat.goal)return edgeRetreat.goal;
         const orbit=orbitCombatGoal(enemy,self,anchor,now,reach);if(orbit)return orbit;
         if(!placing){
             const desired=Math.max(55,Math.min(100,reach-20));
@@ -1567,7 +1658,7 @@
             if(offset>radius)goal={x:anchor.x+(goal.x-anchor.x)*radius/offset,
                 y:anchor.y+(goal.y-anchor.y)*radius/offset};
         }
-        const id=loot?'loot:'+loot.key:enemy?.id??null,changed=id!==fixedDeath.targetId;
+        const id=loot?'loot:'+loot.key:enemy?(edgeRetreat.active?'recuo:'+enemy.id:enemy.id):null,changed=id!==fixedDeath.targetId;
         if((sweeping||enemy||loot)&&returnDist(goal,self)<=6&&deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;}
         if(!changed && returnDist(goal,deathReturn.target)<=(sweeping?3:10))return;
         if(!changed && enemy && now-fixedDeath.lastPlanAt<85)return;
@@ -1580,7 +1671,7 @@
         deathReturn.fails=0;deathReturn.attempted=0;
         deathReturn.phase='ready';deathReturn.startedAt=now;deathReturn.nextAt=now;
         deathReturn.learningClean=false;deathReturn.recorded=[];
-        deathReturn.status=sweeping?'Limpando estruturas da área':cleaning?'Liberando vagas de traps':loot?'Coletando caixa da kill própria':enemy?(combatOrbit.point?'Contornando alvo #':'Seguindo alvo #')+enemy.id:'Voltando ao ponto fixo';
+        deathReturn.status=sweeping?'Limpando estruturas da área':cleaning?'Liberando vagas de traps':loot?'Coletando caixa da kill própria':enemy?(edgeRetreat.active?'Recuo estratégico do alvo #':combatOrbit.point?'Contornando alvo #':'Seguindo alvo #')+enemy.id:'Voltando ao ponto fixo';
         if(continuous){
             deathReturn.route=[{...goal}];deathReturn.step=0;
             if(!returnMoveTo(goal,now))stopReturnMovement();
@@ -2520,7 +2611,10 @@
             deathReturn.nextAt=now;deathReturn.status='Preso: quebrando trap/spike sem andar';
             deathReturn.learningClean=false;return;
         }
-        if((push.owned||(autoPushEnabled()&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
+        if(settings.edgeRetreat&&settings.fixedDeathReturn&&fixedDeath.entered&&!deathReturn.manualMove)
+            refreshEdgeRetreat(fixedDeathEnemy(now),deathReturn.self,now);
+        else if(edgeRetreat.active)finishEdgeRetreat(now,'Recuo interrompido');
+        if(!edgeRetreat.active&&(push.owned||(autoPushEnabled()&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
         refreshFixedDeathGoal(now);
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
@@ -3799,7 +3893,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
-        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();resetKillLoot();resetCombatOrbit();resetDeathEvidence();
+        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();resetKillLoot();resetCombatOrbit();resetEdgeRetreat();resetDeathEvidence();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -4699,6 +4793,7 @@
         const self=ap.self;
         if(!autoPushEnabled())return 'Desativado';
         if(ownLootTarget(now))return 'Coleta de caixa própria';
+        if(edgeRetreat.active)return 'Recuo estratégico para o centro';
         if(settings.orbitCombat&&combatOrbit.point&&now<combatOrbit.until)return 'Contornando inimigo';
         if(clownEscapeActive())return 'Clown: fuga prioritária';
         if(areaCleanupActive(now))return 'Limpeza da área';
@@ -6085,6 +6180,10 @@
         const enemy=!sweeping&&(settings.killAura||trapCleanupActive(now))&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
         if(sweeping&&!structure){counter.status='Limpeza: '+areaSweep.status;return false;}
         const urgent=counterUrgentStructure(structure,now);
+        if(edgeRetreat.active&&!selfPinned(now)&&!urgent){
+            if(strikeRetreatStructure(now))return true;
+            counter.status='Recuo: '+(retreatKatana(now)?'sem estrutura próxima':'Katana indisponível');return aiming;
+        }
         if(loot&&!urgent&&w&&returnDist(loot,session.self)<=COUNTER_REACH.get(w.id)){
             if(w.select&&!transmit(w.packet||session.weaponPacket))return false;
             if(transmit([19,...targetAim(loot)])){
@@ -7191,6 +7290,7 @@
                 session.nativeAim)transmit([13,...session.nativeAim]);
         }
         // Speed changes preserve the existing phase, avoiding an angle reset.
+        if(key==='edgeRetreat'&&!settings.edgeRetreat){finishEdgeRetreat(performance.now(),'Recuo desligado');fixedDeath.lastPlanAt=-Infinity;}
         if(key==='auraLockAim' && !settings.auraLockAim && !settings.returnSpin && !auraTrapTarget(performance.now()) && session.nativeAim && player.alive && connected() && !session.attacking)transmit([13,...session.nativeAim]);
         if(key==='fixedDeathReturn'){
             if(!settings.fixedDeathReturn){collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;resetFixedDeath();cancelReturn('Ponto fixo desativado; aguarda nova morte');deathReturn.target=null;}
@@ -7198,7 +7298,7 @@
         }
         if(key==='fixedDeathCircle'||key==='fixedDeathRadius')drawFixedDeathCircle();
         if(key==='fixedDeathRadius'||key==='fixedDeathFollow'){
-            fixedDeath.lastPlanAt=-Infinity;
+            resetEdgeRetreat();fixedDeath.lastPlanAt=-Infinity;
             if(player.alive&&connected())driveReturn();
         }
         if(key==='trapSlotRecovery'||key==='autoPlaceTrap'||key==='autoPlaceSpike'||key==='defensivePlace'){
@@ -7268,6 +7368,8 @@
         const apStatus=menu.querySelector('#nx-ap-status');
         const paused=areaCleanupActive();
         if(apStatus)apStatus.textContent='Auto Place: '+(paused?'pausado pela limpeza':!autoPlacementEnabled()?'desativado':ap.status)+' • cálculo '+ap.lastPlanMs.toFixed(1)+' ms • '+(ap.blockedAt!==null?'bloqueado '+Math.round(performance.now()-ap.blockedAt)+' ms':'última espera '+Math.round(ap.lastBlockMs)+' ms');
+        const edgeLine=menu.querySelector('#nx-edge-retreat-status');
+        if(edgeLine)edgeLine.textContent='Recuo: '+(settings.edgeRetreat?edgeRetreat.status:'desativado')+(edgeRetreat.active&&edgeRetreat.lastKatanaAt>0?' • Katana atacando estruturas':'');
         const pushStatus=menu.querySelector('#nx-push-status');
         if(pushStatus)pushStatus.textContent='Auto Push '+(settings.astralPush?'Astral':settings.autoPush?'NEXUS':'')+': '+(paused&&autoPushEnabled()?'pausado pela limpeza':autoPushEnabled()?push.status:'desativado');
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
@@ -7582,6 +7684,8 @@
             <label>Seguir inimigos dentro do círculo<input data-heal-setting="fixedDeathFollow" type="checkbox"></label>
             <label>Auto Loot (kill própria)<input data-heal-setting="collectKillLoot" type="checkbox"></label>
             <label>Contornar inimigo sem progresso<input data-heal-setting="orbitCombat" type="checkbox"></label>
+            <label title="Em luta travada por ~3 segundos na borda, recua para atrair adversário ao centro. Katana confirmada golpeia estruturas próximas ao passar, sem persegui-las.">Recuo estratégico na borda<input data-heal-setting="edgeRetreat" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-edge-retreat-status">Recuo: aguardando combate na borda</div>
             <div class="nx-info-line" id="nx-loot-status">Loot: aguardando kill própria</div>
             <label title="Limpa continuamente construções próprias, aliadas e inimigas dentro do círculo quando não há inimigos. Pausa Auto Place/Replace/Push e ataques a jogadores durante a limpeza. Retoma combate na entrada de um inimigo. Inclui camas; exclui caixas de ouro.">Limpar área sem inimigos<input data-heal-setting="idleAreaCleanup" type="checkbox"></label>
             <div class="nx-info-line" id="nx-area-cleanup-status"></div>
