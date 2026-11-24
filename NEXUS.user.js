@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.65
+// @version      1.8.66
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.65';
+    const NEXUS_VERSION = '1.8.66';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1816,7 +1816,7 @@
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
             const nav=t && auraIsSpike(t)?t:auraNavigationSpike(now);
-            if(nav){pauseReturnForSpike(nav,now);return;}
+            if(nav && (counterUrgentStructure(nav,now)||spikeSegmentDistance(deathReturn.self,deathReturn.moveTo||deathReturn.target,nav)<=spikeSafetyRadius(nav))){pauseReturnForSpike(nav,now);return;}
             if(deathReturn.moveOwned && spikeNavBlocker(deathReturn.self,deathReturn.moveTo,now)){
                 stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;
                 deathReturn.nextAt=now+50;deathReturn.status='Spike novo na rota';return;
@@ -2646,7 +2646,7 @@
         if(settings.auraBreakSpikes && !bed.handoffMove && !bed.manualAfterPlacement){
             const t=auraTrapTarget(now);
             const nav=t && auraIsSpike(t)?t:auraNavigationSpike(now);
-            if(nav){pauseBedForSpike(nav,now);return;}
+            if(nav && (counterUrgentStructure(nav,now)||(bed.self&&(bed.moveTo||bed.origin)&&spikeSegmentDistance(bed.self,bed.moveTo||bed.origin,nav)<=spikeSafetyRadius(nav)))){pauseBedForSpike(nav,now);return;}
             if(bed.moveOwned && spikeNavBlocker(bed.self,bed.moveTo,now)){
                 stopBedMovement();bed.phase='await-position';bed.route=[];bed.waypoint=0;bed.nextAt=now+50;return;
             }
@@ -2859,8 +2859,15 @@
             // never promote itself to the saved primary weapon.
             if(now<counter.hammerEchoUntil || counter.restorePending || session.weapon===0)return;
         }
-        // Never learn the temporarily selected food/building or a delayed
-        // pre-selection snapshot as a new manual weapon choice.
+        // Non-Hammer melee observations are authoritative equipment data.
+        // A busy Auto Place or Heal must not prevent learning the primary
+        // forever. Preserve the quiet-window guard for secondary/ranged items.
+        if(session.weapon===0 && session.weaponPacket[0]===0 &&
+            COUNTER_REACH.has(id) && !AURA_HAMMERS.has(id) &&
+            now-session.lastNativeWeaponAt>=120){
+            session.weaponIds[0]=id;
+            return;
+        }
         if (heal.phase !== 'idle' || macro.selected || now-session.lastAutomationAt < 250 ||
             now-session.lastNativeWeaponAt < 250) return;
         if (AURA_HAMMERS.has(id)) {
@@ -3770,6 +3777,12 @@
         const blocked=apCombatBlocked(now);
         if(blocked)return apBlocked(blocked,now,blocked==='Digitando no jogo'||blocked==='Waiting update'?null:blocked==='Heal'?8:20);
         if(now<ap.nextAt){scheduleAutoPlace(ap.nextAt-now);return false;}
+        if((settings.killAura||settings.auraBreakSpikes)&&now>=counter.nextStrikeAt){
+            const before=counter.lastAt;
+            driveCounter(now);
+            if(counter.lastAt!==before){scheduleAutoPlace(12);return false;}
+        }
+        if(now-counter.lastAt<12){scheduleAutoPlace(12-(now-counter.lastAt));return false;}
         const rate=document.hidden?Math.min(240,settings.autoPlaceRate):settings.autoPlaceRate;
         macro.tokens=Math.min(AP_BURST,macro.tokens+Math.max(0,now-macro.last)*rate/1000);
         macro.last=now;
@@ -4116,14 +4129,14 @@
         traps:new Map(),contacts:new Map(),escapeActive:false,clearSince:null,clearSamples:0,navSpikeKey:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
         restorePending:false,restoreTries:0,restoreNextAt:0,restoreAt:-Infinity,restoreExpected:null,restorePacket:null,
         breakKey:null,breakSince:0,breakAttempts:0,breakAvoid:new Map(),breakProgress:new Map(),
-        clanId:null,clanMembers:new Set(),lastStructureAt:-Infinity,aim:null,aimAt:-Infinity};
+        clanId:null,clanMembers:new Set(),lastStructureAt:-Infinity,lastEnemyStrike:-Infinity,lastStructureStrike:-Infinity,aim:null,aimAt:-Infinity};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
         resetAuraEscape();counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
         clearAuraWeaponRestore();counter.hammerEchoUntil=0;
         counter.breakKey=null;counter.breakSince=0;counter.breakAttempts=0;counter.breakAvoid.clear();counter.breakProgress.clear();
-        counter.lastStructureAt=-Infinity;
+        counter.lastStructureAt=-Infinity;counter.lastEnemyStrike=-Infinity;counter.lastStructureStrike=-Infinity;
         counter.aim=null;counter.aimAt=-Infinity;
         resetAuraHat();
     }
@@ -4131,20 +4144,17 @@
         hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.status='Aguardando jogador';
     }
     function counterWeapon(now){
-        const r=heal.restore;
-        if(counter.restorePending || (AURA_HAMMERS.has(heal.observedItem) && (now<counter.hammerEchoUntil || session.weapon===0))){
-            const id=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
-            return COUNTER_REACH.has(id)?{id,select:true}:null;
-        }
-        // WebSocket sends are ordered. Once the restore selection was sent,
-        // the next attack can select that same known weapon explicitly.
-        if(r && r.sent && r.epoch===session.connectionEpoch &&
-            now-r.at<=250){
-            const id=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
-            return COUNTER_REACH.has(id)?{id,select:true}:null;
-        }
-        return now-heal.observedItemAt<=250 && COUNTER_REACH.has(heal.observedItem)?
-            {id:heal.observedItem,select:false}:null;
+        const fresh=now-heal.observedItemAt<=250,id=heal.observedItem;
+        const saved=counter.restorePending && counter.restorePacket?counter.restorePacket:session.weaponPacket;
+        const known=saved[0]===2?saved[1]:session.weaponIds[saved[1]];
+        // A fresh non-temporary melee observation is stronger than a stale
+        // remembered item, including immediately after an upgrade.
+        if(fresh && COUNTER_REACH.has(id) &&
+            !(AURA_HAMMERS.has(id)&&(session.weapon===0||counter.restorePending||now<counter.hammerEchoUntil)))
+            return {id,select:false};
+        if(fresh && COUNTER_REACH.has(known))
+            return {id:known,select:true,packet:saved};
+        return null;
     }
     function observeCounter(packet,now){
         if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn) || !player.alive || !session.self ||
@@ -4463,8 +4473,13 @@
     function auraRestoreConfirmed(){
         if(!counter.restorePending || heal.observedItemAt<=counter.restoreAt)return false;
         const id=heal.observedItem;
-        return counter.restoreExpected!==null?id===counter.restoreExpected:
-            !AURA_HAMMERS.has(id) && COUNTER_REACH.has(id);
+        if(counter.restoreExpected!==null && id===counter.restoreExpected)return true;
+        const p=counter.restorePacket;
+        if(p?.[0]===0 && p[1]===0 && session.weapon===0 &&
+            COUNTER_REACH.has(id) && !AURA_HAMMERS.has(id)){
+            session.weaponIds[0]=id;return true;
+        }
+        return counter.restoreExpected===null && !AURA_HAMMERS.has(id) && COUNTER_REACH.has(id);
     }
     function recoverAuraWeapon(now,breaking=false){
         if(!counter.restorePending)return false;
@@ -4602,7 +4617,7 @@
         transmit([18]);
         if(temporary)restoreWeapon(); // retain watchdog even after successful send
         if(hit){progress.attempts++;counter.breakAttempts=progress.attempts;}
-        counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
+        counter.lastAt=now;counter.lastStructureStrike=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
         counter.aim=aim;counter.aimAt=now;
         counter.status=hit?('Quebrando '+name+(hammer!==null?' com Hammer #'+id:' com arma atual')):name+': golpe não enviado';
         return true;
@@ -4630,12 +4645,11 @@
             macro.selected || Object.keys(macroDefs).some(macroActive) ||
             ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024)return null;
         const trap=auraTrapTarget(now);
-        if(trap)return trap;
-        if(!settings.killAura || !settings.auraLockAim)return null;
-        const w=counterWeapon(now);
-        const saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
+        if(counterUrgentStructure(trap,now))return trap;
+        const w=counterWeapon(now),saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
         const reach=COUNTER_REACH.get(w?.id??saved);
-        return reach?selectAuraTarget(now,reach):null;
+        const enemy=settings.killAura&&settings.auraLockAim&&reach?selectAuraTarget(now,reach):null;
+        return enemy||trap;
     }
     function targetAim(t){
         return apAngleBytes(Math.atan2(t.y-session.self.y,t.x-session.self.x));
@@ -4670,38 +4684,49 @@
         hatCopy.tries++;hatCopy.nextAt=now+1500;hatCopy.status='Tentando chapéu #'+t.hat;
         return true;
     }
+    function counterUrgentStructure(t,now){
+        if(!t||!session.self)return false;
+        if(session.self.trapped===true)return true;
+        const d=auraTrapDistance(t,session.self);
+        return d<=82 && now-heal.lastDamageAt<=450;
+    }
+    function counterBlockReason(now){
+        if(!session.self||now-session.self.at>250)return 'Aguardando posição';
+        if(session.attacking)return 'Ataque manual';
+        if(heal.phase!=='idle'||heal.foodSelected||(isEligible()&&now>=heal.nextAt&&heal.snapshotSerial>heal.sentSnapshotSerial))return 'Cura';
+        if(ageRecovery.pending)return 'Recuperação de idade';
+        if(bed.pending&&bed.phase==='placing'&&bed.locked)return 'Cama';
+        if(macro.selected||Object.keys(macroDefs).some(macroActive)||ap.manualItem||now<ap.manualUntil)return 'Item/macro manual';
+        if(session.ws.bufferedAmount>=1024||apLagBlocked(now))return 'Lag/fila';
+        return '';
+    }
     function driveCounter(now=performance.now()){
         driveAuraHat(now);
-        if(recoverAuraWeapon(now,!!auraTrapTarget(now)))return true;
-        if((!settings.killAura && !settings.auraBreakSpikes) || !player.alive || !connected())return false;
-        const aiming=driveAuraAim(now);
-        if(!session.self || now-session.self.at>250 || session.attacking ||
-            heal.phase!=='idle' || heal.foodSelected ||
-            (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ||
-            ageRecovery.pending || (bed.pending && bed.phase==='placing' && bed.locked) ||
-            macro.selected || Object.keys(macroDefs).some(macroActive) ||
-            ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024 ||
-            (settings.lagGuard && networkState(now)!=='OK') ||
-            now<counter.nextStrikeAt)return aiming;
-        const trap=auraTrapTarget(now);
+        const structure=auraTrapTarget(now);
+        if(recoverAuraWeapon(now,!!structure))return true;
+        if((!settings.killAura&&!settings.auraBreakSpikes)||!player.alive||!connected())return false;
+        const aiming=driveAuraAim(now),blocked=counterBlockReason(now);
+        if(blocked){counter.status='Pausado: '+blocked;return aiming;}
+        if(now<counter.nextStrikeAt)return aiming;
         const w=counterWeapon(now);
-        // Give an already sent placement a short ordered-command window;
-        // real trap escape keeps priority, normal aura yields briefly.
-        if(now-ap.lastBatchAt<12 && !session.self?.trapped)return aiming;
-        if(trap)return strikeAuraTrap(trap,now,w);
-        if(auraEscapeInProgress(now)){
-            counter.status='Confirmando saída de traps/spikes';return aiming;
+        const enemy=settings.killAura&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
+        const urgent=counterUrgentStructure(structure,now);
+        // True capture/contact damage retains priority. Otherwise alternate
+        // reachable structure work and enemy defense instead of monopolizing
+        // the weapon with a harmless spike or a stale escape flag.
+        if(structure && (urgent || !enemy || counter.lastEnemyStrike>=counter.lastStructureStrike))
+            return strikeAuraTrap(structure,now,w);
+        if(!enemy){
+            counter.status=!settings.killAura?'Sem spikes perigosos próximos':!w?'Aguardando arma observada':'Nenhum inimigo no alcance';
+            return aiming;
         }
-        if(!settings.killAura){counter.status='Sem spikes perigosos próximos';return false;}
-        if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return aiming;}
-        const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
-        if(!t){counter.status=trap?'Preso em trap; Hammer indisponível':'Nenhum inimigo no alcance';return false;}
-        if(w.select && !transmit(session.weaponPacket))return false;
-        const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
-        if(!transmit([19,...apAngleBytes(angle)]))return false;
+        if(w.select&&!transmit(w.packet||session.weaponPacket))return false;
+        const aim=targetAim(enemy);
+        if(!transmit([19,...aim]))return false;
         transmit([18]);
-        counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;counter.target=t;counter.status='Mirando inimigo #'+t.id;
-        counter.aim=targetAim(t);counter.aimAt=now;
+        counter.lastAt=now;counter.lastEnemyStrike=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;
+        counter.target=enemy;counter.status='Ataque ao inimigo #'+enemy.id;
+        counter.aim=aim;counter.aimAt=now;
         if(!settings.auraLockAim){
             if(settings.returnSpin)driveSpin(now);
             else if(currentAim())transmit([13,...currentAim()]);
