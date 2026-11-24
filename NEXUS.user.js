@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.73
+// @version      1.8.74
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.73';
+    const NEXUS_VERSION = '1.8.74';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1890,8 +1890,79 @@
     }
     // Spin all selected items, not just weapons. Keep native aim separately
     // for explicit macro/bed actions; spin never selects, places or attacks.
+    const spinVisual={active:false,dispatching:false,lastAt:-Infinity,real:null,savedAim:null};
+    function spinCanvas(){return document.getElementById('game-canvas');}
+    function spinScreenPoint(angle,rect){
+        const radius=Math.min(rect.width,rect.height)*.38;
+        return {x:rect.left+rect.width/2+Math.cos(angle)*radius,
+            y:rect.top+rect.height/2+Math.sin(angle)*radius};
+    }
+    function spinPointerAim(point,rect){
+        if(!point||!rect.width||!rect.height)return null;
+        const dx=point.x-rect.left-rect.width/2,dy=point.y-rect.top-rect.height/2;
+        return dx||dy?apAngleBytes(Math.atan2(dy,dx)):null;
+    }
+    function dispatchSpinMouse(canvas,point){
+        if(!canvas||!point||typeof MouseEvent!=='function')return false;
+        spinVisual.dispatching=true;
+        try{
+            canvas.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,cancelable:true,
+                view:window,clientX:point.x,clientY:point.y,buttons:0}));
+            return true;
+        }catch(_){return false;}
+        finally{spinVisual.dispatching=false;}
+    }
+    function releaseSpinVisual(){
+        if(!spinVisual.active)return;
+        const canvas=spinCanvas(),saved=spinVisual.savedAim;
+        const rect=canvas?.getBoundingClientRect();
+        let point=spinVisual.real;
+        if(!point&&rect&&saved){
+            const angle=(saved[0]+256*saved[1])*2*Math.PI/65535-Math.PI;
+            point=spinScreenPoint(angle,rect);
+        }
+        if(rect&&point){
+            const aim=spinPointerAim(point,rect)||saved;
+            if(aim)session.nativeAim=aim;
+            dispatchSpinMouse(canvas,point);
+        }else if(saved)session.nativeAim=saved;
+        spinVisual.active=false;spinVisual.lastAt=-Infinity;spinVisual.savedAim=null;
+    }
+    function drawLocalSpin(now=performance.now()){
+        if(document.hidden||!spinCanAim(now)||!spin.aim){
+            releaseSpinVisual();return false;
+        }
+        if(now-spin.lastSentAt>250){releaseSpinVisual();return false;}
+        const canvas=spinCanvas(),rect=canvas?.getBoundingClientRect();
+        if(!rect||!rect.width||!rect.height){releaseSpinVisual();return false;}
+        if(now-spinVisual.lastAt<SPIN_INTERVAL_MS-.75)return true;
+        if(!spinVisual.active){
+            spinVisual.savedAim=session.nativeAim?[...session.nativeAim]:null;
+            spinVisual.active=true;
+        }
+        const ok=dispatchSpinMouse(canvas,spinScreenPoint(spin.angle*Math.PI/180,rect));
+        if(ok)spinVisual.lastAt=now;
+        else releaseSpinVisual();
+        return ok;
+    }
+    // Synthetic visual events never become saved manual aim.
+    window.addEventListener('mousemove',event=>{
+        if(!event.isTrusted||spinVisual.dispatching)return;
+        spinVisual.real={x:event.clientX,y:event.clientY};
+        if(spinVisual.active){
+            const rect=spinCanvas()?.getBoundingClientRect();
+            const aim=rect&&spinPointerAim(spinVisual.real,rect);
+            if(aim){spinVisual.savedAim=aim;session.nativeAim=aim;}
+        }
+    },true);
+    window.addEventListener('mousedown',event=>{
+        if(event.isTrusted&&event.target===spinCanvas()&&spinVisual.active){
+            spinVisual.real={x:event.clientX,y:event.clientY};
+            releaseSpinVisual();
+        }
+    },true);
     function resetSpin(){
-        spin.lastSentAt=-Infinity;spin.lastAt=null;spin.angle=0;spin.aim=null;
+        releaseSpinVisual();spin.lastSentAt=-Infinity;spin.lastAt=null;spin.angle=0;spin.aim=null;
     }
     function spinCanAim(now){
         return settings.returnSpin && player.alive && connected() && !session.attacking &&
@@ -5818,6 +5889,8 @@
                 return;
             if (bed.handoffMove && (raw[0]===1 || raw[0]===6 || raw[0]===15))
                 bed.handoffMove=false; // Native client has resumed control.
+            // Suppress synchronous aim echoes from synthetic visual input.
+            if(spinVisual.dispatching&&raw[0]===13)return;
             switch (raw[0]) {
                 case 1:
                 case 6: // Sploop keyboard movement may also use a direction bitmask.
@@ -5850,8 +5923,14 @@
                 }
                 case 13:
                 case 19:
-                    if (raw.length >= 3) {
-                        session.nativeAim = [raw[1], raw[2]];
+                    if(raw[0]===19&&spinVisual.active){
+                        releaseSpinVisual();
+                        if(raw.length===3&&session.nativeAim){
+                            data=new Uint8Array([19,...session.nativeAim]);
+                            arguments[0]=data;
+                        }
+                    }else if(raw.length>=3&&!(raw[0]===13&&spinVisual.active)){
+                        session.nativeAim=[raw[1],raw[2]];
                     }
                     // Manual attack direction always belongs to the native
                     // client. Aim-only spin must not redirect a held attack.
@@ -6712,6 +6791,7 @@
         resumeAutomationsAfterSleep();
     });
     document.addEventListener('visibilitychange', () => {
+        if(document.hidden)releaseSpinVisual();
         if (document.hidden) {
             hideTargetNotice();
             clearMacros();backupGameSettings();
@@ -6744,7 +6824,7 @@
     },500);
     function spinFrame(){
         if(!document.hidden && player.alive){driveCounter();driveSpin();}
-        drawFixedDeathCircle();requestAnimationFrame(spinFrame);
+        drawLocalSpin();drawFixedDeathCircle();requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
     setInterval(()=>{if(push.owned)driveAutoPush();},100);
