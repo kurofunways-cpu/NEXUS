@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.83
+// @version      1.8.84
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -89,6 +89,13 @@
 //   Ban Check do Astral confunde 1005/1006 com ban. NEXUS observa apenas
 //   conexões reais e registra motivo explícito de ban; sem sondar servidores.
 //   Geometria/knockback atuais precisam de medição, não copiar números cegamente.
+// - 1.8.84: regressões confirmadas por comparação 1.8.76/79/83: reservas
+//   longas, bloqueio global de spike por alvo e limite de push a 65u.
+//   Restaurada resposta rápida; bloquear posições repetidas, permitir
+//   dois spikes em ângulos distintos por alvo capturado e pressão até
+//   estagnação. Push pode assumir seguimento na área, não retorno inicial.
+//   Força real é do servidor; testar no jogo. Não reduzir agressividade
+//   com bloqueios globais quando a geometria local já evita sobreposição.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -98,7 +105,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.83';
+    const NEXUS_VERSION = '1.8.84';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1150,7 +1157,7 @@
             }
             return false;
         };
-        if(d>=72&&d<=130&&(!trapped||waiting||covered||canSpike(self)))return {x:self.x,y:self.y};
+        if(d>=65&&d<=120&&(waiting||canSpike(self)||(!trapped&&d<=95)))return {x:self.x,y:self.y};
         const base=d>1?Math.atan2(self.y-enemy.y,self.x-enemy.x):0;
         let best=null,score=Infinity;
         for(let i=0;i<16;i++)for(const distance of [desired,desired+20,desired-18]){
@@ -1158,7 +1165,7 @@
             const p={x:enemy.x+Math.cos(a)*distance,y:enemy.y+Math.sin(a)*distance};
             if(returnDist(p,anchor)>radius||p.x<30||p.y<30||p.x>65505||p.y>65505||
                 obs.some(o=>returnDist(o,p)<o.radius+15)||spikeNavBlocker(self,p,now))continue;
-            const value=returnDist(p,self)+(returnSegmentClear(self,p,obs,15)?0:50)+(trapped&&!waiting&&!covered&&!canSpike(p)?120:0);
+            const value=returnDist(p,self)+(returnSegmentClear(self,p,obs,15)?0:50)+(!waiting&&!canSpike(p)?90:0);
             if(value<score){score=value;best=p;}
         }
         // Avoid pushing a pinned enemy while searching for a viable angle.
@@ -2132,7 +2139,7 @@
             deathReturn.nextAt=now;deathReturn.status='Preso: quebrando trap/spike sem andar';
             deathReturn.learningClean=false;return;
         }
-        if(push.owned && driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
+        if((push.owned||(settings.autoPush&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
         refreshFixedDeathGoal(now);
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
@@ -3851,9 +3858,9 @@
     const apTrackingEnabled=()=>autoPlacementEnabled()||settings.autoPush;
     const ap={entities:new Map(), self:null, nextAt:0, manualUntil:0, manualItem:false,
         pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off',plannedAt:-Infinity,revision:0,plannedRevision:-1,lastPlanMs:0,blockedAt:null,blockedReason:'',lastBlockMs:0};
-    const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,bestGap:Infinity,stage:null,progressAt:0,cooldown:0,status:'Desativado'};
+    const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,bestGap:Infinity,stage:null,progressAt:0,cooldown:0,avoid:new Map(),status:'Desativado'};
     function resetAutoPlace() {
-        stopAutoPush();push.manual=false;push.cooldown=0;ap.plannedAt=-Infinity;
+        stopAutoPush();push.manual=false;push.cooldown=0;push.avoid.clear();ap.plannedAt=-Infinity;
         ap.revision=0;ap.plannedRevision=-1;ap.lastPlanMs=0;ap.blockedAt=null;ap.blockedReason='';ap.lastBlockMs=0;
         if (ap.timer!==null) clearTimeout(ap.timer); ap.timer=null; ap.timerAt=Infinity;
         ap.entities.clear(); ap.self=null; ap.nextAt=0; ap.manualUntil=0;
@@ -3958,8 +3965,8 @@
         const angle=i*Math.PI/60-Math.PI;
         return {angle,dx:AP_RADIUS*Math.cos(angle),dy:AP_RADIUS*Math.sin(angle)};
     });
-    const AP_CONFIRM_WINDOW=1100;
-    function apReservationMs(){return Math.max(300,Math.min(850,ap.tick*3.5));}
+    const AP_CONFIRM_WINDOW=850;
+    function apReservationMs(){return Math.max(100,Math.min(240,ap.tick*1.6));}
     function apPendingActive(p,now){return now-p.at<apReservationMs();}
     function apExpire(now) {
         const timeout=apReservationMs();
@@ -3968,7 +3975,7 @@
             if(!p.expired && now-p.at>=timeout){p.expired=true;ap.misses.push({...p,at:now});}
             return true;
         }).slice(-64);
-        ap.misses=ap.misses.filter(p=>now-p.at<1000).slice(-64);
+        ap.misses=ap.misses.filter(p=>now-p.at<450).slice(-64);
         ap.confirmed=ap.confirmed.filter(t=>now-t<1000);
         ap.replaced=ap.replaced.filter(t=>now-t<1000);
         for (const [id,r] of ap.replaceQueue) {
@@ -4039,10 +4046,10 @@
                 (apDistance(p,path[0])<=AP_TRAP_CONTACT || apDistance(p,path[1])<=AP_TRAP_CONTACT));
             const nearSpike=spikes.some(o=>apDistance(o,e)<=58);
             const pendingSpike=ap.pending.some(p=>p.key==='KeyV'&&p.target===e.id&&apPendingActive(p,now));
-            const recentSpike=ap.misses.some(p=>p.key==='KeyV'&&p.target===e.id&&now-p.at<350);
+            const nearbySpikes=spikes.filter(o=>apDistance(o,e)<=AP_SPIKE_CONTACT);
             const inReach=dist<=165;
             const threat=Math.max(0,AP_MAX_RANGE-dist)+Math.max(0,apDistance(origin,path[0])-apDistance(origin,path[2]))*.5+(ap.target===e.id&&now<ap.targetUntil?12:0);
-            return {e,capture,path,dist,pendingTrap,pendingSpike,recentSpike,nearSpike,threat,inReach};
+            return {e,capture,path,dist,pendingTrap,pendingSpike,nearbySpikes,nearSpike,threat,inReach};
         }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>b.threat-a.threat).slice(0,4);
         if(!enemies.length){ap.target=null;ap.status='No enemy';return [];}
         const candidates=[];
@@ -4056,12 +4063,12 @@
                 const failures=ap.misses.filter(p=>p.key===key&&apDistance(point,p)<27).length;
                 if(failures>=2)continue;
                 for(const x of enemies){
-                    const {e,capture,path,pendingTrap,pendingSpike,recentSpike,nearSpike,inReach}=x;
+                    const {e,capture,path,pendingTrap,pendingSpike,nearbySpikes,nearSpike,inReach}=x;
                     // A defensive trap occupies the attacker's approach even
                     // if their predicted centre is outside the capture circle.
                     const cover=defending&&trap&&!capture&&inReach;
                     if(trap&&(capture||pendingTrap&&!cover))continue;
-                    if(!trap&&pendingTrap&&!capture)continue;
+                    // A pending trap must not block immediate spike contact.
                     const distances=path.map(p=>apDistance(point,p));
                     const cross=Math.min(...path.slice(1).map((p,i)=>apSegmentDistance(point,path[i],p)));
                     if(trap){
@@ -4070,16 +4077,20 @@
                             if(facing<=0 || cross>105 || traps.some(t=>apDistance(t,point)<65))continue;
                         }else if(cross>AP_TRAP_CONTACT || (distances[0]>48&&distances[1]>distances[0]+8&&distances[2]>distances[1]))continue;
                     }else{
-                        if(pendingSpike||recentSpike||capture&&nearSpike)continue;
-                        if(cross>AP_SPIKE_CONTACT || (!capture&&Math.min(distances[0],distances[1],distances[2])>58))continue;
+                        if(cross>AP_SPIKE_CONTACT || (!capture&&distances[0]>AP_SPIKE_CONTACT&&distances[1]>distances[0]))continue;
                         if(!capture&&distances[1]>distances[0]+8&&distances[2]>=distances[1])continue;
-                        if(!capture&&nearSpike&&spikes.some(o=>path.slice(0,3).some(p=>apDistance(o,p)<=55)))continue;
+                        // A trapped target needs angles around the trap body.
+                        // Do not impose a contact radius smaller than its
+                        // minimum placement clearance (40+45-17=68).
+                        if(!capture&&nearSpike&&Math.min(...distances)>65)continue;
+                        if(nearbySpikes.some(o=>apDistance(o,point)<72))continue;
+                        if(ap.pending.some(p=>p.key==='KeyV'&&p.target===e.id&&apPendingActive(p,now)&&apDistance(p,point)<78))continue;
                     }
                     const immediateSpike=!trap&&Math.min(distances[0],distances[1])<=48&&x.dist<=110;
-                    const priority=capture&&!trap?10:cover?7:immediateSpike?6:trap?5:2;
+                    const priority=capture&&!trap?10:cover?7:immediateSpike?8:trap?5:3;
                     const intercept=trap?Math.min(distances[0]+5,distances[1],distances[2]+8,distances[3]+18):Math.min(...distances);
                     const score=120-intercept*1.25-cross*.3+x.threat*.35+Math.min(15,margin)*.4-failures*24+(capture&&!trap?20:0);
-                    candidates.push({key,angle:r.angle,point,score,priority,target:e.id,defensive:cover||defending&&!!capture&&!trap});
+                    candidates.push({key,angle:r.angle,point,score,priority,target:e.id,captured:!!capture,defensive:cover||defending&&!!capture&&!trap});
                 }
             }
         }
@@ -4087,7 +4098,9 @@
         const chosen=[];
         for(const c of candidates){
             if(!slots[c.key])continue;
-            if(chosen.some(p=>p.target===c.target||apDistance(p.point,c.point)<75))continue;
+            if(chosen.some(p=>apDistance(p.point,c.point)<78))continue;
+            const same=chosen.filter(p=>p.target===c.target);
+            if(same.length&&(!c.captured||c.key!=='KeyV'||same.some(p=>p.key!=='KeyV')||same.length>=2))continue;
             if(chosen.length&&c.priority===chosen[0].priority&&c.score<chosen[0].score-32)continue;
             chosen.push(c);slots[c.key]--;if(chosen.length>=count)break;
         }
@@ -4130,7 +4143,7 @@
         if(!settings.fixedDeathReturn || !settings.fixedDeathFollow || !fixedDeath.entered ||
             !fixedDeath.anchor || fixedDeath.epoch!==session.connectionEpoch ||
             !['ready','moving','arrived'].includes(deathReturn.phase) ||
-            deathReturn.moveOwned || deathReturn.manualMove)return false;
+            deathReturn.manualMove)return false;
         const a=fixedDeath.anchor,r=settings.fixedDeathRadius,preferred=fixedDeathEnemy(now);
         if(!preferred||preferred.id!==enemy.id)return false;
         return apDistance(self,a)<=r+20&&apDistance(enemy,a)<=r&&apDistance(goal,a)<=r;
@@ -4141,18 +4154,20 @@
         const spikes=objects.filter(o=>placementTypes.KeyV.has(o.type)&&apPushOwnStructure(o,self,now));
         const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=300);
         let best=null;
+        for(const [key,until] of push.avoid)if(now>=until)push.avoid.delete(key);
         for(const e of enemies){
             if(!apCapture(e,traps))continue;
             for(const spike of spikes){
                 if(spike.sid===e.sid)continue;
                 const gap=apDistance(e,spike);
-                if(gap<=65||gap>150)continue; // already in spike contact: do not push continuously
+                if(gap<25||gap>150||(push.avoid.get(e.id+':'+spike.id)??0)>now)continue;
                 const ux=(e.x-spike.x)/gap,uy=(e.y-spike.y)/gap;
                 const offset=Math.max(64,Math.min(86,64+(gap-65)*.24));
                 const behind={x:e.x+ux*offset,y:e.y+uy*offset};
                 if(apDistance(behind,self)>285)continue;
                 const dot=(self.x-e.x)*ux+(self.y-e.y)*uy,side=Math.abs((self.x-e.x)*uy-(self.y-e.y)*ux);
                 const aligned=dot>=0 && (side<=32 || (push.target===e.id&&push.spike===spike.id&&push.stage==='push'&&side<=48));
+                const contact={x:e.x+ux*50,y:e.y+uy*50};
                 // Keep moving towards the enemy after reaching the alignment
                 // point. Do not stop 32 units away or turn back at contact.
                 let goals=aligned?[{x:e.x,y:e.y}]:[behind];
@@ -4162,9 +4177,11 @@
                     goals.push({x:behind.x+uy*58*sign,y:behind.y-ux*58*sign});
                 }
                 for(const goal of goals){
-                    if(!pushReturnAllowed(self,e,goal,now)||!apPushPathClear(self,goal,objects,self,now))continue;
+                    // Test approach to contact rather than enemy centre.
+                    const safeEnd=aligned?(dot<=50?{x:self.x,y:self.y}:contact):goal;
+                    if(!pushReturnAllowed(self,e,goal,now)||!apPushPathClear(self,safeEnd,objects,self,now)||spikeNavBlocker(self,safeEnd,now))continue;
                     const score=apDistance(self,goal)*.65+gap*1.65-(push.target===e.id&&push.spike===spike.id?24:0)+(goal!==goals[0]?35:0);
-                    if(!best||score<best.score)best={enemy:e,spike,goal,aligned,gap,score};
+                    if(!best||score<best.score)best={enemy:e,spike,goal,aligned,gap,score,pressureAngle:Math.atan2(-uy,-ux)};
                 }
             }
         }
@@ -4180,7 +4197,7 @@
         if(trapCleanupActive(now))return 'Liberando vagas de traps';
         if(bed.pending||bed.locked||bed.handoffMove)return 'Cama no respawn';
         if(returnEnabled()&&deathReturn.target&&(!settings.fixedDeathReturn||!settings.fixedDeathFollow||
-            !fixedDeath.entered||!fixedDeath.anchor||deathReturn.moveOwned||
+            !fixedDeath.entered||!fixedDeath.anchor||
             !['ready','moving','arrived'].includes(deathReturn.phase)))return 'Retorno ao ponto';
         if(ageRecovery.pending)return 'Recuperação de idade';
         if(selfPinned(now))return 'Preso em trap';
@@ -4207,6 +4224,7 @@
         if(!apPushOwnStructure(plan.spike,self,now)||plan.spike.sid===plan.enemy.sid){
             stopAutoPush();push.status='Proprietário do spike não confirmado';return false;
         }
+        if(deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;deathReturn.nextAt=now;deathReturn.learningClean=false;}
         const distance=apDistance(self,plan.goal),stage=plan.aligned?'push':'align';
         if(push.target!==plan.enemy.id||push.spike!==plan.spike.id){
             stopAutoPush();push.target=plan.enemy.id;push.spike=plan.spike.id;
@@ -4216,12 +4234,14 @@
         if(distance<push.best-3||plan.gap<push.bestGap-3){
             push.best=Math.min(distance,push.best);push.bestGap=Math.min(plan.gap,push.bestGap);push.progressAt=now;
         }
-        if(now-push.startedAt>5500||now-push.progressAt>1200){
-            stopAutoPush();push.cooldown=now+500;push.status='Sem progresso; reavaliando';return false;
+        if(now-push.startedAt>5500||now-push.progressAt>(plan.aligned?1550:1200)){
+            push.avoid.set(plan.enemy.id+':'+plan.spike.id,now+1200);
+            stopAutoPush();push.cooldown=now+100;push.status='Sem progresso; procurando outro ângulo';return false;
         }
-        if(distance<2){stopAutoPush();push.status='Contato com alvo';return false;}
+        if(distance<2&&!plan.aligned){stopAutoPush();push.status='Alinhamento atingido';return false;}
         if(now-push.lastAt<Math.max(35,Math.min(80,ap.tick*.6)))return true;
-        if(!transmit([1,...apAngleBytes(Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x))])){
+        const angle=plan.aligned&&distance<45?plan.pressureAngle:Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x);
+        if(!transmit([1,...apAngleBytes(angle)])){
             stopAutoPush();push.status='Falha no envio';return false;
         }
         push.owned=true;push.epoch=session.connectionEpoch;push.lastAt=now;
@@ -4377,7 +4397,7 @@
                 if (ap.replaceQueue.size) ap.status='Replace waiting';
                 else if (!settings.autoPlace) ap.status='Replace idle';
             }
-            scheduleAutoPlace(Math.max(45,Math.min(110,ap.tick)));return false;
+            scheduleAutoPlace(Math.max(15,Math.min(35,ap.tick*.35)));return false;
         }
         const capacity=Math.floor((macro.tokens-overhead)/3);
         // Send the best valid placement immediately; never wait to fill a batch.
