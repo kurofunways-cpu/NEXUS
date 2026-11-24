@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.63
+// @version      1.8.64
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.63';
+    const NEXUS_VERSION = '1.8.64';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3086,6 +3086,7 @@
         // normal onGameMessage tail will use that newer position instead.
         if(bed.pending && bed.self && session.self && bed.self.at>=session.self.at)
             trySpawnBed(now);
+        if(autoPlacementEnabled()&&ap.self&&session.self&&ap.self.at>=session.self.at)runAutoPlace(now);
         if(!driveCounter(now))driveSpin(now); // Resume aim immediately after food.
         return true;
     }
@@ -3335,10 +3336,11 @@
     const autoPlacementEnabled=()=>settings.autoPlace||settings.autoReplace;
     const apTrackingEnabled=()=>autoPlacementEnabled()||settings.autoPush;
     const ap={entities:new Map(), self:null, nextAt:0, manualUntil:0, manualItem:false,
-        pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off',plannedAt:-Infinity};
+        pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off',plannedAt:-Infinity,revision:0,plannedRevision:-1,lastPlanMs:0,blockedAt:null,blockedReason:'',lastBlockMs:0};
     const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,progressAt:0,cooldown:0,status:'Desativado'};
     function resetAutoPlace() {
         stopAutoPush();push.manual=false;push.cooldown=0;ap.plannedAt=-Infinity;
+        ap.revision=0;ap.plannedRevision=-1;ap.lastPlanMs=0;ap.blockedAt=null;ap.blockedReason='';ap.lastBlockMs=0;
         if (ap.timer!==null) clearTimeout(ap.timer); ap.timer=null; ap.timerAt=Infinity;
         ap.entities.clear(); ap.self=null; ap.nextAt=0; ap.manualUntil=0;
         ap.manualItem=false; ap.replaceQueue.clear(); ap.replaced=[]; ap.pending=[]; ap.attempts=[]; ap.confirmed=[]; ap.misses=[]; ap.tick=100; ap.lastBatchAt=-Infinity; ap.target=null; ap.targetUntil=0; ap.status='Idle';
@@ -3364,30 +3366,32 @@
     }
     function observeAutoPlace(packet, now) {
         if (!apTrackingEnabled() || (packet.length-1)%19!==0) return false;
-        apExpire(now);
         let selfSeen=false;
         const removed=new Set();
         for (let i=1;i+18<packet.length;i+=19) {
             if (!(packet[i+8]&2)) continue;
             const id=packet[i+2]|packet[i+3]<<8;
             removed.add(id);
-            for(const [key,e] of ap.entities)if(e.id===id){queueAutoReplace(key,e,now);ap.entities.delete(key);}
+            const key=String(id),old=ap.entities.get(key);
+            if(old){queueAutoReplace(key,old,now);ap.entities.delete(key);}
         }
         for (let i=1;i+18<packet.length;i+=19) {
             const type=packet[i], sid=packet[i+1], id=packet[i+2]|packet[i+3]<<8;
-            const key=`${type}:${id}`;
+            const key=String(id);
             if (removed.has(id)) continue;
-            for(const [k,e] of ap.entities)if(e.id===id && k!==key)ap.entities.delete(k);
             const x=packet[i+4]|packet[i+5]<<8, y=packet[i+6]|packet[i+7]<<8;
-            const prior=ap.entities.get(key),old=prior && prior.sid===sid?prior:null,dt=old?now-old.at:0;
+            const prior=ap.entities.get(key),old=prior && prior.sid===sid && prior.type===type?prior:null,dt=old?now-old.at:0;
             if (type!==0 && !old && ap.self && sid===ap.self.sid) {
                 let match=-1, bestDistance=45;
                 for (let j=0;j<ap.pending.length;j++) {
                     const p=ap.pending[j], d=apDistance(p,{x,y});
-                    if (placementTypes[p.key].has(type) && d<bestDistance) { match=j; bestDistance=d; }
+                    if (now-p.at<=AP_CONFIRM_WINDOW && placementTypes[p.key].has(type) && d<bestDistance) { match=j; bestDistance=d; }
                 }
                 const confirmed=match>=0?ap.pending.splice(match,1)[0]:null;
-                if (confirmed) ap.confirmed.push(now);
+                if (confirmed){
+                    ap.confirmed.push(now);
+                    ap.misses=ap.misses.filter(p=>p.key!==confirmed.key||apDistance(p,confirmed)>27);
+                }
                 // Clear the queue if the location is already rebuilt. Only count
                 // REP when a matching attempted replacement was observed nearby.
                 let closest=null, closestDistance=AR_TOLERANCE+8;
@@ -3428,7 +3432,7 @@
             const victims=[...ap.entities.entries()].filter(([k,e])=>e!==ap.self).sort((a,b)=>apDistance(b[1],center)-apDistance(a[1],center));
             for(const [k] of victims.slice(0,ap.entities.size-512))ap.entities.delete(k);
         }
-        apExpire(now);
+        apExpire(now);ap.revision++;
         return selfSeen || !!ap.self;
     }
     // Geometry is approximate; server-observed objects are the only evidence of success.
@@ -3436,13 +3440,17 @@
         const angle=i*Math.PI/60-Math.PI;
         return {angle,dx:AP_RADIUS*Math.cos(angle),dy:AP_RADIUS*Math.sin(angle)};
     });
+    const AP_CONFIRM_WINDOW=850;
+    function apReservationMs(){return Math.max(85,Math.min(210,ap.tick*1.45));}
+    function apPendingActive(p,now){return now-p.at<apReservationMs();}
     function apExpire(now) {
-        const timeout=Math.max(160,Math.min(650,ap.tick*3.2));
+        const timeout=apReservationMs();
         ap.pending=ap.pending.filter(p=>{
-            if (now-p.at<timeout) return true;
-            ap.misses.push({...p,at:now}); return false;
-        });
-        ap.misses=ap.misses.filter(p=>now-p.at<650).slice(-64);
+            if(now-p.at>AP_CONFIRM_WINDOW)return false;
+            if(!p.expired && now-p.at>=timeout){p.expired=true;ap.misses.push({...p,at:now});}
+            return true;
+        }).slice(-64);
+        ap.misses=ap.misses.filter(p=>now-p.at<220).slice(-64);
         ap.confirmed=ap.confirmed.filter(t=>now-t<1000);
         ap.replaced=ap.replaced.filter(t=>now-t<1000);
         for (const [id,r] of ap.replaceQueue) {
@@ -3472,10 +3480,10 @@
     function apStatic(e,now){
         return e.type!==0 && !BED_NAV_DYNAMIC.has(e.type) && e.type!==12 && now-e.at<=AP_OBJECT_TTL;
     }
-    function apPlacementSpace(point,radius,objects,allies){
+    function apPlacementSpace(point,radius,objects,allies,now){
         if(point.x<1||point.y<1||point.x>65534||point.y>65534||
             allies.some(e=>apDistance(point,e)<radius+24) ||
-            ap.pending.some(p=>apDistance(point,p)<radius+(p.key==='KeyF'?40:45)-12))return null;
+            ap.pending.some(p=>apPendingActive(p,now)&&apDistance(point,p)<radius+(p.key==='KeyF'?40:45)-12))return null;
         let margin=Infinity;
         for(const o of objects){
             const clearance=apDistance(point,o)-(AP_OBJECT_RADII[o.type]??BED_ENTITY_RADII[o.type]??48)-radius;
@@ -3491,6 +3499,9 @@
         const nearby=entities.filter(e=>apDistance(origin,e)<=AP_MAX_RANGE+150);
         const players=nearby.filter(e=>e.type===0 && e.id!==self.id && e.health>0 && now-e.at<=AP_PLAYER_TTL);
         const objects=nearby.filter(e=>apStatic(e,now));
+        // Only obstacles whose collision circles can touch the build ring
+        // need the per-angle collision check.
+        const ringObjects=objects.filter(o=>apDistance(o,origin)<=AP_RADIUS+(AP_OBJECT_RADII[o.type]??BED_ENTITY_RADII[o.type]??48)+45);
         const friendly=objects.filter(o=>apFriendly(o,self));
         const traps=friendly.filter(o=>o.type===6),spikes=friendly.filter(o=>placementTypes.KeyV.has(o.type));
         const allies=players.filter(e=>apFriendly(e,self)).map(e=>apPredict(e,Math.max(0,now-e.at)+lead));
@@ -3498,7 +3509,8 @@
             const age=Math.max(0,now-e.at),capture=apCapture(e,traps);
             const path=[0,lead*.7,lead*1.5,lead*2.4].map(dt=>capture?{x:e.x,y:e.y}:apPredict(e,age+dt));
             const dist=Math.min(...path.map(p=>apDistance(origin,p)));
-            const pendingTrap=ap.pending.some(p=>p.key==='KeyF'&&p.target===e.id);
+            const pendingTrap=ap.pending.some(p=>p.key==='KeyF'&&p.target===e.id&&apPendingActive(p,now)&&
+                (apDistance(p,path[0])<=AP_TRAP_CONTACT || apDistance(p,path[1])<=AP_TRAP_CONTACT));
             const nearSpike=spikes.some(o=>apDistance(o,e)<=AP_SPIKE_CONTACT);
             const threat=Math.max(0,AP_MAX_RANGE-dist)+Math.max(0,apDistance(origin,path[0])-apDistance(origin,path[2]))*.5+(ap.target===e.id&&now<ap.targetUntil?12:0);
             return {e,capture,path,dist,pendingTrap,nearSpike,threat};
@@ -3510,7 +3522,7 @@
             for(const key of ['KeyF','KeyV']){
                 const trap=key==='KeyF',radius=trap?40:45;
                 if(!(trap?settings.autoPlaceTrap:settings.autoPlaceSpike))continue;
-                const margin=apPlacementSpace(point,radius,objects,allies);
+                const margin=apPlacementSpace(point,radius,ringObjects,allies,now);
                 if(margin===null)continue;
                 const failures=ap.misses.filter(p=>p.key===key&&apDistance(point,p)<27).length;
                 if(failures>=2)continue;
@@ -3557,7 +3569,7 @@
         return true;
     }
     function planAutoPush(self,entities,now){
-        const objects=entities.filter(e=>apStatic(e,now));
+        const objects=entities.filter(e=>apStatic(e,now)&&apDistance(e,self)<=410);
         const traps=objects.filter(o=>o.type===6&&apFriendly(o,self));
         const spikes=objects.filter(o=>placementTypes.KeyV.has(o.type)&&apFriendly(o,self));
         const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=220);
@@ -3628,7 +3640,7 @@
             if (Math.abs(distance-AP_RADIUS)>AR_TOLERANCE) continue;
             const angle=Math.atan2(r.y-origin.y,r.x-origin.x);
             const point={x:origin.x+AP_RADIUS*Math.cos(angle),y:origin.y+AP_RADIUS*Math.sin(angle)};
-            if (point.x<0 || point.y<0 || allies.some(e=>apDistance(point,e)<60) || ap.pending.some(p=>apDistance(point,p)<48)) continue;
+            if (point.x<0 || point.y<0 || allies.some(e=>apDistance(point,e)<60) || ap.pending.some(p=>apPendingActive(p,now)&&apDistance(point,p)<48)) continue;
             const radius=r.key==='KeyF'?40:45;
             if (entities.some(o=>apStatic(o,now) &&
                 apDistance(point,o)<(AP_OBJECT_RADII[o.type]??48)+radius-17)) continue;
@@ -3676,71 +3688,71 @@
         ap.timerAt=due;
         ap.timer=setTimeout(()=>{ ap.timer=null; ap.timerAt=Infinity; runAutoPlace(performance.now()); },Math.max(1,Math.ceil(delay)));
     }
-    function runAutoPlace(now) {
-        if (!autoPlacementEnabled() || !player.alive || !connected() || !ap.self) return;
-        if(auraTrapTarget(now)){ap.status='Fuga de estruturas';scheduleAutoPlace(70);return;}
-        if (bed.pending && bed.unlocked && bed.origin &&
-            (bed.phase==='moving' || bed.phase==='placing' || bed.phase==='await-position')) {
-            ap.status='Respawn bed';scheduleAutoPlace(70);return;
-        }
-        if (deathReturn.phase==='moving' || deathReturn.phase==='ready') {
-            ap.status='Retorno ao local da morte';scheduleAutoPlace(70);return;
-        }
-        if (pauseAutoPlaceForLag(now)) {
-            // When the game pauses or the browser backs up outbound frames,
-            // do not stack speculative builds ahead of the next heal command.
-            ap.status='Lag Guard · '+networkState(now);
-            scheduleAutoPlace(65);
-            return;
-        }
-        if (now-ap.self.at>AP_PLAYER_TTL) { ap.status='Waiting update'; return; }
-        // Auto Place is autonomous: loss of document focus is not a reason
-        // to suspend it, but visible text fields and an open HUD are.
-        // In hidden tabs, require a *fresh* authoritative player snapshot.
-        if (!document.hidden && (editing({target:document.activeElement}) || (menu&&!menu.hidden))) {
-            ap.status='Paused';return;
-        }
-        const blocked = ap.manualItem || now<ap.manualUntil ? 'Manual item' :
-            macro.selected || Object.keys(macroDefs).some(macroActive) ? 'Manual macro' :
-            ageRecovery.pending || counter.restorePending || heal.foodSelected || heal.phase!=='idle' || (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ? 'Heal/weapon restore' : !currentAim() ? 'No aim' : '';
-        if (blocked) { ap.status=blocked; scheduleAutoPlace(5); return; }
-        if (now<ap.nextAt) { scheduleAutoPlace(ap.nextAt-now); return; }
-        // Reserve more background bandwidth for Heal/Age Recovery. Auto Place
-        // does not need to saturate the WebSocket while the game is unseen.
-        const rate=document.hidden ? Math.min(240,settings.autoPlaceRate) : settings.autoPlaceRate;
+    function apBlocked(reason,now,delay=20){
+        if(ap.blockedReason!==reason){ap.blockedReason=reason;ap.blockedAt=now;}
+        ap.status=reason;
+        if(delay!==null)scheduleAutoPlace(delay);
+        return false;
+    }
+    function apLagBlocked(now){
+        if(!settings.lagGuard)return false;
+        const state=networkState(now);
+        // One fresh stable update and an empty queue are enough for a small
+        // bounded batch. The global recovery timeout still governs macros.
+        return state==='RECOVERY' ?
+            !(lag.stableTicks>=1 && session.ws.bufferedAmount<1024) : state!=='OK';
+    }
+    function apCombatBlocked(now){
+        if(now-ap.self.at>AP_PLAYER_TTL)return 'Waiting update';
+        if(!document.hidden && (editing({target:document.activeElement})||(menu&&!menu.hidden)))return 'Paused';
+        if(ap.manualItem||now<ap.manualUntil)return 'Manual item';
+        if(macro.selected||Object.keys(macroDefs).some(macroActive))return 'Manual macro';
+        if(ageRecovery.pending)return 'Age recovery';
+        if(heal.foodSelected||heal.phase!=='idle'||(isEligible()&&now>=heal.nextAt&&heal.snapshotSerial>heal.sentSnapshotSerial))return 'Heal';
+        // Only an actual building-selection transaction owns the item slot.
+        // Bed navigation and return movement are independent of item packets.
+        if(bed.locked&&bed.phase==='placing')return 'Respawn bed';
+        const structure=auraTrapTarget(now);
+        if(structure && session.self?.trapped===true)return 'Fuga de trap';
+        if(structure && now-heal.lastDamageAt<=220 && auraTrapDistance(structure,session.self)<=82)return 'Fuga de estruturas';
+        if(apLagBlocked(now))return 'Lag Guard · '+networkState(now);
+        if(!currentAim())return 'No aim';
+        return '';
+    }
+    function runAutoPlace(now=performance.now()) {
+        if(!autoPlacementEnabled()||!player.alive||!connected()||!ap.self)return false;
+        const blocked=apCombatBlocked(now);
+        if(blocked)return apBlocked(blocked,now,blocked==='Paused'||blocked==='Waiting update'?null:blocked==='Heal'?8:20);
+        if(now<ap.nextAt){scheduleAutoPlace(ap.nextAt-now);return false;}
+        const rate=document.hidden?Math.min(240,settings.autoPlaceRate):settings.autoPlaceRate;
         macro.tokens=Math.min(AP_BURST,macro.tokens+Math.max(0,now-macro.last)*rate/1000);
         macro.last=now;
-        const attacking=session.attacking, overhead=attacking?3:2;
-        const cost=overhead+3;
-        const queueLimit=document.hidden?2048:65536;
-        if (macro.tokens<cost || session.ws.bufferedAmount>=queueLimit) {
-            ap.status=session.ws.bufferedAmount>=queueLimit?'Socket queue':'Budget';
-            scheduleAutoPlace(Math.max(1,(cost-macro.tokens)*1000/rate,
-                session.ws.bufferedAmount>=queueLimit?40:0));return;
-        }
-        const planGap=Math.max(15,Math.min(50,ap.tick*.35));
-        if(now-ap.plannedAt<planGap){scheduleAutoPlace(planGap-(now-ap.plannedAt));return;}
-        ap.plannedAt=now;
+        const attacking=session.attacking,overhead=attacking?3:2,cost=overhead+3;
+        if(macro.tokens<cost||session.ws.bufferedAmount>=2048)
+            return apBlocked(session.ws.bufferedAmount>=2048?'Socket queue':'Budget',now,
+                Math.max(5,(cost-macro.tokens)*1000/rate,session.ws.bufferedAmount>=2048?25:0));
+        // A fresh packet invalidates the previous plan. Timers can try a new
+        // predicted position, but never scan the same scene every millisecond.
+        const planGap=ap.plannedRevision===ap.revision?Math.max(15,Math.min(32,ap.tick*.4)):8;
+        if(now-ap.plannedAt<planGap){scheduleAutoPlace(planGap-(now-ap.plannedAt));return false;}
+        ap.plannedAt=now;ap.plannedRevision=ap.revision;
+        const planStart=performance.now();
+        if(ap.blockedAt!==null){ap.lastBlockMs=now-ap.blockedAt;ap.blockedAt=null;ap.blockedReason='';}
         const entities=[...ap.entities.values()];
         const combat=settings.autoPlace?planAutoPlace(ap.self,entities,now,AP_BATCH_MAX):[];
         const combatStatus=ap.status;
         const replacements=planAutoReplace(ap.self,entities,now);
         const candidates=mergePlacementPlans(combat,replacements,!settings.autoPlace||combatStatus==='No enemy');
+        ap.lastPlanMs=performance.now()-planStart;
         if (!candidates.length) {
             if (!settings.autoPlace || combatStatus==='No enemy') {
                 if (ap.replaceQueue.size) ap.status='Replace waiting';
                 else if (!settings.autoPlace) ap.status='Replace idle';
             }
-            scheduleAutoPlace(document.hidden?65:Math.max(20,ap.tick*.5));return;
+            scheduleAutoPlace(document.hidden?40:Math.max(15,Math.min(35,ap.tick*.35)));return false;
         }
         const capacity=Math.floor((macro.tokens-overhead)/3);
-        // First placement is immediate. During sustained placement, amortize the
-        // weapon/aim restore across two or three distinct positions when available.
-        const target=Math.min(candidates.length,2);
-        const wait=(overhead+3*target-macro.tokens)*1000/rate;
-        if (!candidates[0].replaceId && settings.autoPlaceMs<=5 && now-ap.lastBatchAt<100 && capacity<target && wait>0 && wait<=13) {
-            ap.status='Batch'; scheduleAutoPlace(wait); return;
-        }
+        // Send the best valid placement immediately; never wait to fill a batch.
         const plans=candidates.slice(0,Math.min(AP_BATCH_MAX,capacity));
         ap.nextAt=now+settings.autoPlaceMs; ap.lastBatchAt=now;
         // Restore native weapon and aim once per batch.
@@ -3751,6 +3763,7 @@
             if (!transmit([0,macroDefs[plan.key].id]) || !transmit([19,...apAngleBytes(plan.angle)])) { complete=false; break; }
             apCps(now); ap.attempts.push(now);
             ap.pending.push({...plan.point,key:plan.key,target:plan.target,at:now,replaceId:plan.replaceId});
+            if(ap.pending.length>64)ap.pending.splice(0,ap.pending.length-64);
             if (plan===plans[0] && plan.target!==undefined) { ap.target=plan.target; ap.targetUntil=now+220; }
             if (plan.replaceId) {
                 const r=ap.replaceQueue.get(plan.replaceId);
@@ -3764,7 +3777,7 @@
         if (!complete) transmit([18]);
         restoreWeapon();
         if (!complete) ap.status='Send failed';
-        scheduleAutoPlace(Math.max(1,ap.nextAt-performance.now()));
+        scheduleAutoPlace(Math.max(8,ap.nextAt-performance.now()));return true;
     }
     function apCps(now=performance.now()) {
         while (ap.attempts.length && ap.attempts[0]<=now-1000) ap.attempts.shift();
@@ -4625,6 +4638,9 @@
             now<counter.nextStrikeAt)return aiming;
         const trap=auraTrapTarget(now);
         const w=counterWeapon(now);
+        // Give an already sent placement a short ordered-command window;
+        // real trap escape keeps priority, normal aura yields briefly.
+        if(now-ap.lastBatchAt<12 && !session.self?.trapped)return aiming;
         if(trap)return strikeAuraTrap(trap,now,w);
         if(auraEscapeInProgress(now)){
             counter.status='Confirmando saída de traps/spikes';return aiming;
@@ -5118,7 +5134,7 @@
         const id = Number(packet[0]);
         if(id===30)observeDeathChatEcho(packet);
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
-        let ownSnapshotProcessed=false;
+        let ownSnapshotProcessed=false,apSnapshotProcessed=false;
         if (id === 35) { // spawn
             finishGoofySpawn();
             resetSmartLife();smartLife.startedAt=performance.now();
@@ -5211,7 +5227,7 @@
                 observeAgeRecoveryHat(packet[i + 11]);
                 if (ap.manualItem && performance.now()>=ap.manualUntil &&
                     (AURA_STATS.has(packet[i+10])||[4,11,26,27,50,59,60,61,62,...session.weaponIds].includes(packet[i+10])) &&
-                    heal.phase==='idle' && !macro.selected && performance.now()-session.lastAutomationAt>160) {
+                    heal.phase==='idle' && !macro.selected && !counter.restorePending) {
                     ap.manualItem=false;
                 }
                 // Prioritize healing over costly placement/entity bookkeeping.
@@ -5232,6 +5248,7 @@
                 noteHealthSnapshot(observedHealth,now);
                 observeCounter(packet,now);
                 observeAuraTrap(packet,now);
+                if(apTrackingEnabled()){observeAutoPlace(packet,now);apSnapshotProcessed=true;}
                 updateHealth();
                 evaluate();
                 ownSnapshotProcessed=true;
@@ -5270,7 +5287,7 @@
         }
         if (id===20 && packet instanceof Uint8Array && player.alive && apTrackingEnabled()) {
             const now=performance.now();
-            if (observeAutoPlace(packet,now)){driveAutoPush(now);runAutoPlace(now);}
+            if(apSnapshotProcessed||observeAutoPlace(packet,now)){runAutoPlace(now);driveAutoPush(now);}
         }
         if(player.alive){if(!driveCounter())driveSpin();driveHatCopy();announceDeathCount();}
     }
@@ -5588,6 +5605,8 @@
     }
     function refreshInputs() {
         if (!menu) return;
+        const apStatus=menu.querySelector('#nx-ap-status');
+        if(apStatus)apStatus.textContent='Auto Place: '+ap.status+' • cálculo '+ap.lastPlanMs.toFixed(1)+' ms • '+(ap.blockedAt!==null?'bloqueado '+Math.round(performance.now()-ap.blockedAt)+' ms':'última espera '+Math.round(ap.lastBlockMs)+' ms');
         const pushStatus=menu.querySelector('#nx-push-status');
         if(pushStatus)pushStatus.textContent='Auto Push: '+(settings.autoPush?push.status:'desativado');
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
@@ -5936,6 +5955,7 @@
           <div class="content" data-panel="place" hidden>
             <div class="section-intro"><span><strong>SMART PLACEMENT</strong><small>Intercepção e reconstrução</small></span></div>
             <label title="Predict nearby opponent movement and search placement angles">Smart Auto Place<input data-heal-setting="autoPlace" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-ap-status">Auto Place: aguardando</div>
             <label title="Rebuild removed own traps; spikes only at approved finisher positions">Auto Replace<input data-heal-setting="autoReplace" type="checkbox"></label>
             <label title="Prioritize trapping free opponents before placing spikes">Auto Trap<input data-heal-setting="autoPlaceTrap" type="checkbox"></label>
             <label title="Spikes para inimigos capturados ou em contato previsto, sem limite artificial de HP">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
