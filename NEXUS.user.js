@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.70
+// @version      1.8.71
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.70';
+    const NEXUS_VERSION = '1.8.71';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3579,6 +3579,9 @@
             if (removed.has(id)) continue;
             const x=packet[i+4]|packet[i+5]<<8, y=packet[i+6]|packet[i+7]<<8;
             const prior=ap.entities.get(key),old=prior && prior.sid===sid && prior.type===type?prior:null,dt=old?now-old.at:0;
+            if(old&&(type===6||placementTypes.KeyV.has(type))&&old.health>0&&packet[i+13]===0){
+                queueAutoReplace(key,old,now);ap.entities.delete(key);continue;
+            }
             if (type!==0 && !old && ap.self && sid===ap.self.sid) {
                 let match=-1, bestDistance=45;
                 for (let j=0;j<ap.pending.length;j++) {
@@ -3770,10 +3773,24 @@
         push.owned=false;push.target=null;push.spike=null;push.lastAt=-Infinity;
         push.best=Infinity;push.bestGap=Infinity;push.stage=null;push.progressAt=0;push.startedAt=0;
     }
-    function apPushPathClear(a,b,objects,self){
+    function apPushOwnStructure(o,self,now){
+        const live=session.self;
+        if(!o||!self||!live||self.id!==player.id||self.sid!==live.sid||
+            now-live.at>250||now-self.at>AP_PLAYER_TTL||
+            !Number.isInteger(o.sid)||o.sid!==live.sid||
+            (o.state&2)||now-o.at>AP_OBJECT_TTL)return false;
+        if(o.type!==6&&!placementTypes.KeyV.has(o.type))return false;
+        // A newer record of a reused world index overrides any old AP
+        // ownership. Do not infer ownership from the object's clan byte.
+        const latest=counter.traps.get(String(o.id));
+        if(latest&&latest.at>=o.at&&(latest.sid!==o.sid||latest.type!==o.type||
+            apDistance(latest,o)>4))return false;
+        return true;
+    }
+    function apPushPathClear(a,b,objects,self,now){
         if(b.x<1||b.y<1||b.x>65534||b.y>65534)return false;
         for(const o of objects){
-            if(o.type===6&&apFriendly(o,self))continue;
+            if(o.type===6&&apPushOwnStructure(o,self,now))continue;
             const radius=(AP_OBJECT_RADII[o.type]??BED_ENTITY_RADII[o.type]??48)+26;
             if(apSegmentDistance(o,a,b)<radius&&(apDistance(o,a)>=radius||apDistance(o,b)<=apDistance(o,a)+2))return false;
         }
@@ -3794,13 +3811,14 @@
     }
     function planAutoPush(self,entities,now){
         const objects=entities.filter(e=>apStatic(e,now)&&apDistance(e,self)<=410);
-        const traps=objects.filter(o=>o.type===6&&apFriendly(o,self));
-        const spikes=objects.filter(o=>placementTypes.KeyV.has(o.type)&&apFriendly(o,self));
+        const traps=objects.filter(o=>o.type===6&&apPushOwnStructure(o,self,now));
+        const spikes=objects.filter(o=>placementTypes.KeyV.has(o.type)&&apPushOwnStructure(o,self,now));
         const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=300);
         let best=null;
         for(const e of enemies){
             if(!apCapture(e,traps))continue;
             for(const spike of spikes){
+                if(spike.sid===e.sid)continue;
                 const gap=apDistance(e,spike);
                 if(gap<25||gap>150)continue;
                 const ux=(e.x-spike.x)/gap,uy=(e.y-spike.y)/gap;
@@ -3817,7 +3835,7 @@
                     goals.push({x:behind.x+uy*58*sign,y:behind.y-ux*58*sign});
                 }
                 for(const goal of goals){
-                    if(!pushReturnAllowed(self,e,goal,now)||!apPushPathClear(self,goal,objects,self))continue;
+                    if(!pushReturnAllowed(self,e,goal,now)||!apPushPathClear(self,goal,objects,self,now))continue;
                     const score=apDistance(self,goal)*.65+gap*1.25-(push.target===e.id&&push.spike===spike.id?32:0)+(goal!==goals[0]?35:0);
                     if(!best||score<best.score)best={enemy:e,spike,goal,aligned,gap,score};
                 }
@@ -3852,7 +3870,14 @@
         const blocked=autoPushBlock(now);
         if(blocked){stopAutoPush();push.status=blocked;return false;}
         const self=ap.self,plan=planAutoPush(self,[...ap.entities.values()],now);
-        if(!plan){stopAutoPush();push.status='Sem combinação trap + spike alcançável';return false;}
+        if(!plan){
+            stopAutoPush();
+            const hasOwn=[...ap.entities.values()].some(o=>placementTypes.KeyV.has(o.type)&&apPushOwnStructure(o,self,now)&&apDistance(o,self)<=410);
+            push.status=hasOwn?'Sem combinação trap + spike próprio alcançável':'Sem spike próprio confirmado';return false;
+        }
+        if(!apPushOwnStructure(plan.spike,self,now)||plan.spike.sid===plan.enemy.sid){
+            stopAutoPush();push.status='Proprietário do spike não confirmado';return false;
+        }
         const distance=apDistance(self,plan.goal),stage=plan.aligned?'push':'align';
         if(push.target!==plan.enemy.id||push.spike!==plan.spike.id){
             stopAutoPush();push.target=plan.enemy.id;push.spike=plan.spike.id;
@@ -3871,7 +3896,7 @@
             stopAutoPush();push.status='Falha no envio';return false;
         }
         push.owned=true;push.epoch=session.connectionEpoch;push.lastAt=now;
-        push.status=plan.aligned?'Empurrando para spike':'Alinhando atrás do alvo';
+        push.status=(plan.aligned?'Empurrando para spike próprio':'Alinhando para spike próprio')+' #'+plan.spike.id;
         return true;
     }
     function planAutoReplace(self,entities,now) {
@@ -6359,7 +6384,7 @@
             <label title="Ao observar seis traps próprias, suspende perseguição e tenta liberar duas vagas. Mantém defesa e cura.">Liberar vagas de traps<input data-heal-setting="trapSlotRecovery" type="checkbox"></label>
             <div class="nx-info-line" id="nx-trap-slots"></div>
             <label title="Spikes para inimigos capturados ou em contato previsto, sem limite artificial de HP">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
-            <label title="Alinha o personagem atrás de inimigos presos para empurrá-los contra spikes próprios/aliados. Respeita movimento manual, cama e retorno inicial. No ponto fixo, pode empurrar o alvo prioritário dentro do círculo.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
+            <label title="Alinha o personagem atrás de inimigos presos em traps próprias para empurrá-los exclusivamente contra spikes próprios confirmados. Respeita movimento manual, cama e retorno inicial. No ponto fixo, pode empurrar o alvo prioritário dentro do círculo.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
             <div class="nx-info-line" id="nx-push-status">Auto Push: desativado</div>
             <label title="Minimum interval between automatic attempts; server updates may be slower">Place ms<input data-heal-setting="autoPlaceMs" type="number" min="1" max="1000" step="1"></label>
             <label title="Local Auto Place packet budget only; higher values may cause lag or rejection">AP packets/s<input data-heal-setting="autoPlaceRate" type="number" min="240" max="480" step="20"></label>
