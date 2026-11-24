@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.71
+// @version      1.8.72
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.71';
+    const NEXUS_VERSION = '1.8.72';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -439,15 +439,36 @@
 
     // Per-tab preference for last worn hat: separate tabs may use different hats.
     const HAT_SESSION_KEY = PREFIX + 'last_hat_session';
-    const hat = { current:null, wanted:null, pending:false, tries:0, nextAt:0, epoch:0, lastManualAt:-Infinity, observedAt:-Infinity };
+    const hat = { current:null, wanted:null, pending:false, tries:0, nextAt:0, epoch:0, lastManualAt:-Infinity, observedAt:-Infinity, lastGood:null, manualNone:false, requestId:null, requestAt:-Infinity, requestOwner:null };
     try {
         const saved=Number(sessionStorage.getItem(HAT_SESSION_KEY));
         if (Number.isInteger(saved) && saved>=1 && saved<=12) hat.wanted=saved;
     } catch (_) {}
+    function validCombatHat(id){return Number.isInteger(id)&&id>0&&id<=12&&id!==AURA_DEMOLIST;}
+    function fallbackHat(){
+        return [hat.lastGood,hat.wanted].find(validCombatHat)||null;
+    }
+    function resetHatRequest(){
+        hat.requestId=null;hat.requestAt=-Infinity;hat.requestOwner=null;
+    }
+    // One shared transaction gate for all automated hat owners. Repeated
+    // selection of an already equipped hat can toggle it off in clients.
+    // A successful send is NOT an equipment confirmation.
+    function requestHat(id,owner,now=performance.now()){
+        if(!Number.isInteger(id)||id<=0||id>12||!player.alive||!connected()||
+            session.ws.bufferedAmount>=1024)return false;
+        if(hat.current===id&&hat.observedAt>=hat.requestAt)return false;
+        if(now-hat.requestAt<180)return false;
+        if(hat.requestId!==null&&hat.observedAt<=hat.requestAt&&now-hat.requestAt<450)return false;
+        if(!transmit([5,id]))return false;
+        hat.requestId=id;hat.requestAt=now;hat.requestOwner=owner;
+        return true;
+    }
     function rememberHat(id) {
         if (!Number.isInteger(id) || id < 0 || id > 12) return;
         hat.current = id;
         hat.wanted = id > 0 ? id : null;
+        if(validCombatHat(id))hat.lastGood=id;
         hat.pending = false;
         try {
             if (hat.wanted) sessionStorage.setItem(HAT_SESSION_KEY, String(hat.wanted));
@@ -536,7 +557,8 @@
         if(ageRecovery.phase==='equip') {
             if(session.ws.bufferedAmount>4096){wakeAgeRecovery(50);return;}
             // Public clients use opcode 5 for hats and ID 6 for Immunity Gear.
-            if(!transmit([5,6])){finishAgeRecovery('Immunity Gear não enviado');return;}
+            if(hat.current!==6 && !requestHat(6,'age',now)){wakeAgeRecovery(80);return;}
+            if(hat.current===6)ageRecovery.hatConfirmed=true;
             ageRecovery.equipAt=now;
             ageRecovery.phase='food';
             ageRecovery.status='Aguardando equipamento; 1 comida pendente';
@@ -583,42 +605,44 @@
     }
 
     function resetRespawnHat() {
-        hat.epoch++;
+        hat.epoch++;resetHatRequest();hat.manualNone=false;hat.observedAt=-Infinity;
         hat.tries=0; hat.nextAt=0;
         hat.pending=!!(settings.autoLastHat && hat.wanted && player.alive);
         hat.current=null;
     }
     function observeSelfHat(id, now=performance.now()) {
         if (!Number.isInteger(id) || id<0 || id>12) return;
+        const previous=hat.current;
         hat.current=id;hat.observedAt=now;
+        if(id>0&&id===hat.requestId&&now>hat.requestAt)hat.requestOwner=null;
+        if(ageRecovery.pending)return;
+        if(validCombatHat(id)&&!auraHat.owned&&!(id===6&&now<auraHat.echoUntil))hat.lastGood=id;
+        if(hat.pending && id===hat.wanted){hat.pending=false;hat.tries=0;}
+        if(id===0&&!hat.manualNone&&(settings.autoLastHat||settings.copyNearbyHat)&&fallbackHat()){
+            if(previous!==0){hat.tries=0;hat.nextAt=now;}
+            hat.pending=true;
+        }
         if(auraHat.owned || now<auraHat.echoUntil)return;
-        if(hat.pending && id===hat.wanted){hat.pending=false;return;}
         if(settings.copyNearbyHat){
-            if(hatCopy.target && id===hatCopy.target.hat){hatCopy.status='Chapéu confirmado #'+id;hatCopy.tries=0;}
-            if(!hat.wanted&&id>0&&id!==AURA_DEMOLIST&&!ageRecovery.pending&&id!==6)rememberHat(id);
-            if(id===0&&settings.autoLastHat&&hat.wanted&&!hat.pending){hat.pending=true;hat.tries=0;hat.nextAt=now;}
+            if(hatCopy.target&&id===hatCopy.target.hat){hatCopy.status='Chapéu confirmado #'+id;hatCopy.tries=0;}
+            if(!hat.wanted&&validCombatHat(id)&&id!==6)rememberHat(id);
             return;
         }
-        if (hat.pending) {
-            if (id===hat.wanted) { hat.pending=false; return; }
-            // Keep the pre-death hat during the un-equipped respawn phase.
-            return;
-        }
-        if (id>0 && id!==hat.wanted && now-hat.lastManualAt>650) rememberHat(id);
-        // Keep old hat ID after death until the next user choice. A zero in a
-        // fresh spawn snapshot doesn't mean the previous hat was unequipped.
+        if(hat.pending)return;
+        if(validCombatHat(id)&&id!==hat.wanted&&now-hat.lastManualAt>650)rememberHat(id);
     }
     function tryRestoreHat(now=performance.now()) {
-        if(ageRecovery.pending||auraHat.owned||now<auraHat.echoUntil)return;
-        if(settings.copyNearbyHat&&hatCopy.target&&hat.current>0&&!hat.pending)return;
-        if (!hat.pending || !settings.autoLastHat || !player.alive || !connected() ||
-            !hat.wanted || now<hat.nextAt ||
-            session.ws.bufferedAmount>2048) return;
-        // The game/server still decides whether the hat can be equipped.
-        if (transmit([5,hat.wanted])) {
-            hat.tries++;
-            hat.nextAt=now+(hat.tries<=3?750:2000);
-        }
+        if(ageRecovery.pending||auraHat.owned||hat.manualNone)return false;
+        if(!player.alive||!connected()||now<hat.nextAt||now-hat.lastManualAt<350)return false;
+        const empty=hat.current===0;
+        const recovery=empty&&(settings.autoLastHat||settings.copyNearbyHat);
+        if(!recovery&&(!hat.pending||!settings.autoLastHat||now<auraHat.echoUntil))return false;
+        const desired=recovery?fallbackHat():hat.wanted;
+        if(!desired)return false;
+        if(hat.current===desired){hat.pending=false;hat.tries=0;return false;}
+        if(!requestHat(desired,recovery?'empty':'restore',now))return false;
+        hat.tries++;hat.nextAt=now+(empty?Math.min(800,250+hat.tries*50):750);
+        return true;
     }
     // The Cosy Bed is aimed at the first confirmed spawn position. Movement is
     // driven primarily by server snapshots so hidden tabs can keep working;
@@ -4367,7 +4391,7 @@
         breakKey:null,breakSince:0,breakAttempts:0,breakAvoid:new Map(),breakProgress:new Map(),
         ownTraps:new Map(),cleanupMarks:new Map(),cleanupActive:false,
         clanId:null,clanMembers:new Set(),lastStructureAt:-Infinity,lastEnemyStrike:-Infinity,lastStructureStrike:-Infinity,aim:null,aimAt:-Infinity};
-    const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
+    const hatCopy={target:null,nextAt:0,tries:0,candidateId:null,candidateSince:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
         resetAuraEscape();counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
@@ -4379,7 +4403,7 @@
         resetAuraHat();
     }
     function resetHatCopy(){
-        hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.status='Aguardando jogador';
+        hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.candidateId=null;hatCopy.candidateSince=0;hatCopy.status='Aguardando jogador';
     }
     function counterWeapon(now){
         const fresh=now-heal.observedItemAt<=250,id=heal.observedItem;
@@ -4854,13 +4878,13 @@
         // Manual hat choices get priority. Do not acquire ownership based on a
         // stale or unknown pre-break hat.
         if(allow && !auraHat.owned){
-            if(!target || threats===null || now-hat.lastManualAt<1500 || hat.current===null)return;
-            if(hat.current===AURA_DEMOLIST)return;
+            if(!target || threats===null || now-hat.lastManualAt<1500 || !validCombatHat(hat.current)||hat.manualNone)return;
             auraHat.previous=hat.current;auraHat.owned=true;
             auraHat.requested=null;auraHat.tries=0;auraHat.confirmedSince=null;auraHat.sentAt=-Infinity;
         }
         if(!auraHat.owned)return;
-        const desired=allow?AURA_DEMOLIST:auraHat.previous;
+        const desired=allow?AURA_DEMOLIST:(validCombatHat(auraHat.previous)?auraHat.previous:fallbackHat());
+        if(!desired){resetAuraHat();return;}
         if(desired!==auraHat.requested){
             auraHat.requested=desired;auraHat.tries=0;
             auraHat.confirmedSince=null;auraHat.sentAt=-Infinity;
@@ -4881,12 +4905,18 @@
             return;
         }
         auraHat.confirmedSince=null;
-        if(now<auraHat.nextAt)return;
-        if(transmit([5,desired])){
+        // A fresh observation of the desired hat is already confirmation;
+        // never send another selection just to obtain a synthetic ACK.
+        if(hat.current===desired){
+            if(!allow&&hat.observedAt>=hat.requestAt){auraHat.owned=false;auraHat.previous=null;auraHat.requested=null;auraHat.echoUntil=now+350;}
+            return;
+        }
+        if(now<auraHat.nextAt&&!(hat.current===0&&now-hat.requestAt>=250))return;
+        if(requestHat(desired,'aura',now)){
             auraHat.tries++;auraHat.sentAt=now;
             // Bounded cadence, not bounded lifetime: cooldown or a rejected
             // request must not permanently strand the player in Demolist.
-            auraHat.nextAt=now+(allow?1500:auraHat.tries<=3?450:1500);
+            auraHat.nextAt=now+(hat.current===0?300:allow?750:450);
             auraHat.echoUntil=now+2000;
         }
     }
@@ -4997,14 +5027,18 @@
         const t=hatCopy.target;
         if(auraHat.owned || now<auraHat.echoUntil || auraEscapeInProgress(now))return false;
         if(t?.hat===AURA_DEMOLIST||t?.hat===0){hatCopy.status='Sem chapéu copiável';return false;}
-        if(hat.pending&&settings.autoLastHat&&hat.wanted&&hat.current===0&&hat.tries<3)return false;
+        if(hat.manualNone)return false;
+        if(hat.current===0&&fallbackHat()&&hat.tries<3)return false;
+        if(hat.pending&&settings.autoLastHat&&hat.current!==0)return false;
         if(!settings.copyNearbyHat || !player.alive || !connected() || ageRecovery.pending ||
             !t || now-t.at>350 || now<hatCopy.nextAt || now-hat.lastManualAt<1500 ||
             session.ws.bufferedAmount>=1024 || (settings.lagGuard&&networkState(now)!=='OK'))return false;
         if(hat.current===t.hat){hatCopy.status='Chapéu confirmado #'+t.hat;return false;}
+        if(hatCopy.candidateId!==t.hat){hatCopy.candidateId=t.hat;hatCopy.candidateSince=now;return false;}
+        if(hat.current>0&&now-hatCopy.candidateSince<300)return false;
         if(hatCopy.tries>=2&&hat.current>0){hatCopy.status='Chapéu não confirmado; mantendo o equipado';return false;}
-        if(!transmit([5,t.hat]))return false;
-        hatCopy.tries++;hatCopy.nextAt=now+(hatCopy.tries<=2?1500:3000);hatCopy.status='Tentando chapéu #'+t.hat;
+        if(!requestHat(t.hat,'copy',now))return false;
+        hatCopy.tries++;hatCopy.nextAt=now+(hat.current===0?350:1000);hatCopy.status='Tentando chapéu #'+t.hat;
         return true;
     }
     function counterUrgentStructure(t,now){
@@ -5681,7 +5715,7 @@
         retryUpgradeChoice();
         // React to respawn and newly unlocked beds using fresh server events,
         // without arbitrary timers that get throttled in hidden tabs.
-        if (player.alive) { tryRestoreHat(); trySpawnBed(); driveReturn(); }
+        if (player.alive) { driveAuraHat();tryRestoreHat(); trySpawnBed(); driveReturn(); }
         if (id===20 && packet instanceof Uint8Array && player.alive && apTrackingEnabled()) {
             const now=performance.now();
             if(apSnapshotProcessed||observeAutoPlace(packet,now)){runAutoPlace(now);driveAutoPush(now);}
@@ -5713,7 +5747,7 @@
         bed.preSpawnUnlockAt=0;bed.origin=null;bed.self=null;bed.nearby.clear();
         clearMacros(false);resetPlacementTracking();cancelHeal(false);
         resetHealTelemetry();resetLagGuard();resetKatanaGuard();resetCombatState();
-        hat.pending=false;resetUpgrades(true);updateHealth();
+        hat.pending=false;resetHatRequest();hat.manualNone=false;hat.current=null;resetUpgrades(true);updateHealth();
     }
     function bindGameSocket(ws) {
         if(session.ws===ws)return;
@@ -5826,7 +5860,11 @@
         // Record a native choice only after the original send succeeds.
         if (this === session.ws && raw && raw.length === 2) {
             if (raw[0] === 14) { clearUpgradeRetry(); recordChoice(raw[1]); }
-            if (raw[0] === 5 && player.alive) { resetAuraHat();rememberHat(raw[1]);hat.lastManualAt=performance.now(); }
+            if (raw[0] === 5 && player.alive && Number.isInteger(raw[1]) && raw[1]<=12) {
+                const now=performance.now();resetAuraHat();rememberHat(raw[1]);
+                hat.manualNone=raw[1]===0;hat.lastManualAt=now;
+                hat.requestAt=now;hat.requestId=raw[1];hat.requestOwner='manual';
+            }
         }
         return result;
     };
