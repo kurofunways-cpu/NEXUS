@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.85
+// @version      1.8.86
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -103,6 +103,11 @@
 //   desligar cama não cancela ponto fixo autorizado. Limpeza exige amostras
 //   recentes consecutivas, não tempo decorrido sem dados. AP mantém a
 //   agressividade da 1.8.84. Limites físicos permanecem estimativas.
+// - 1.8.86: cama com centro bloqueado ou rota inviável escolhe outro
+//   centro próximo, evitando tentativas recentes e preservando o círculo
+//   de morte. Fora da área, admite desvios laterais para achar passagem.
+//   Confirmações tardias são comparadas às posições realmente tentadas.
+//   Não aprender rotas de centro original após deslocar a cama.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -112,7 +117,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.85';
+    const NEXUS_VERSION = '1.8.86';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -802,7 +807,7 @@
         socketEpoch:0,layoutKey:null,layoutCandidate:null,layoutCandidateCount:0,
         trace:[],lastLearned:false,usedLearned:false,
         failedThisRun:0,lastFailureAt:0,placementFailures:0,
-        knownBedIds:new Set(),seenSnapshots:0};
+        knownBedIds:new Set(),seenSnapshots:0,site:null,failedSites:[],attemptSites:[],relocated:false,detours:[]};
     const bedClock={worker:null,unavailable:false};
     function makeBedWorker() {
         if (bedClock.worker || bedClock.unavailable) return bedClock.worker;
@@ -994,7 +999,7 @@
         bed.trace=[];bed.lastLearned=false;bed.usedLearned=false;
         bed.failedThisRun=0;bed.lastFailureAt=0;bed.placementFailures=0;
         bed.handoffMove=false;bed.manualAfterPlacement=false;bed.moveKeys.clear();
-        bed.knownBedIds.clear();bed.seenSnapshots=0;
+        bed.knownBedIds.clear();bed.seenSnapshots=0;bed.site=null;bed.failedSites=[];bed.attemptSites=[];bed.relocated=false;bed.detours=[];
     }
     // RETURN AFTER BED: guard the same death-position anchor continuously
     // after the bed is server-confirmed. Displacements trigger another path
@@ -2400,7 +2405,7 @@
                     bed.spawnCandidate={x:self.x,y:self.y,at:now};
                     bed.spawnCandidateCount=1;
                 } else if(++bed.spawnCandidateCount>=2) {
-                    bed.origin={x:candidate.x,y:candidate.y,at:now};
+                    bed.origin={x:candidate.x,y:candidate.y,at:now};bed.site={...bed.origin};
                     bed.spawnAnchorConfirmed=true;
                 }
             }
@@ -2442,8 +2447,7 @@
                 bed.knownBedIds.add(key);
             if (type===SPAWN_BED_ENTITY_TYPE && packet[i+1]===bed.sid &&
                 !bed.knownBedIds.has(key) &&
-                Math.hypot(x-bed.origin.x,y-bed.origin.y)<=BED_POSITION_TOLERANCE &&
-                bed.lastAt>0) {
+                bed.attemptSites.some(p=>now-p.at<=5000&&bedDistance(p,{x,y})<=BED_POSITION_TOLERANCE)) {
                 // Server confirmed the new bed: STOP immediately, even when
                 // moveOwned is already false. Release WASD before learning or
                 // writing to storage, which can take additional time.
@@ -2454,7 +2458,7 @@
                 bed.route=[];bed.waypoint=0;bed.moveTo=null;
                 releaseBedInput();
                 if(bedOutsideActive())bed.outsidePlaced=returnDist({x,y},fixedDeath.anchor)>settings.fixedDeathRadius;
-                if(!bed.outsideTravel && bed.outsidePlaced===null)rememberBedSuccess({x,y},now);
+                if(!bed.outsideTravel&&!bed.relocated && bed.outsidePlaced===null)rememberBedSuccess({x,y},now);
                 // Early input release in 1.8.18 could leave a synthetic WASD
                 // handoff active permanently. The opted-in return owns movement
                 // once this bed is confirmed; clear that stale handoff.
@@ -2701,7 +2705,10 @@
         return entry.badGoals.some(p=>Math.hypot(x-p.x,y-p.y)<=17);
     }
     function rememberBedFailure(point,to=bed.moveTo) {
-        if(bed.outsideTravel)return;
+        if(bed.outsideTravel||bed.relocated){
+            if(to){bed.detours.push({x:to.x,y:to.y,at:performance.now()});if(bed.detours.length>16)bed.detours.shift();}
+            return;
+        }
         if(!point || !to || !bed.pending || !bed.origin ||
             bed.socketEpoch!==session.connectionEpoch)return;
         const distance=bedDistance(point,to);
@@ -2994,6 +3001,76 @@
     function bedOutsideActive(){
         return settings.bedOutsideFixed&&settings.fixedDeathReturn&&!!fixedDeath.anchor&&fixedDeath.epoch===session.connectionEpoch;
     }
+    // The bed center is a preference, not an immutable navigation goal.
+    // Keep failed placement centers in world coordinates for this life only.
+    function bedSiteRejected(p,now){
+        return bed.failedSites.some(q=>now-q.at<12000&&bedDistance(p,q)<38);
+    }
+    function bedCandidateClear(self,p,objects,now){
+        if(bedSiteRejected(p,now)||!bedPointFree(p.x,p.y,objects,0)||
+            !bedSegmentFree(self,p,objects,0)||spikeNavBlocker(self,p,now))return false;
+        // Traps/platforms can be walkable but still occupy a build site.
+        for(const o of bed.nearby.values()){
+            if(BED_NAV_DYNAMIC.has(o.type)||now-o.at>BED_NEARBY_TTL||o.type===12)continue;
+            if(bedDistance(o,p)<Math.max(12,(BED_ENTITY_RADII[o.type]??30)-8))return false;
+        }
+        return true;
+    }
+    function bedFindAlternative(self,site,objects,now,allowed=()=>true,preferred=site){
+        let best=null;
+        for(let i=0;i<48;i++){
+            const a=i*Math.PI/24,p={x:self.x+BED_BUILD_DISTANCE*Math.cos(a),y:self.y+BED_BUILD_DISTANCE*Math.sin(a)};
+            if(!allowed(p)||!bedCandidateClear(self,p,objects,now))continue;
+            // Favor clearance without treating estimated edge overlap as proof
+            // of rejection. Prefer the original spawn neighborhood.
+            let margin=55;
+            for(const o of objects)margin=Math.min(margin,bedDistance(p,o)-o.radius);
+            const score=margin*.8-bedDistance(p,preferred)*.45;
+            if(!best||score>best.score)best={point:p,place:true,score};
+        }
+        return best;
+    }
+    function bedAlternativeMove(self,objects,now,allowed,preferred){
+        let best=null;
+        for(const length of [65,105,145])for(let i=0;i<24;i++){
+            const a=i*Math.PI/12,p={x:self.x+length*Math.cos(a),y:self.y+length*Math.sin(a)};
+            if(!bedRouteSegment(self,p,objects,20)||spikeNavBlocker(self,p,now)||
+                localEnemyTrap(now,{...session.self,x:p.x,y:p.y,trapped:false})||
+                bed.detours.some(q=>now-q.at<4000&&bedDistance(q,p)<32))continue;
+            const build=bedFindAlternative(p,preferred,objects,now,allowed,preferred);
+            if(!build)continue;
+            const score=build.score-length*.35-(returnRiskOnSegment(self,p,returnRiskZones(now,self))?120:0);
+            if(!best||score>best.score)best={point:p,place:false,score};
+        }
+        return best;
+    }
+    function relocateBed(now,objects,reason){
+        if(!bed.self||!bed.origin||!bedCanWork(now)||bed.handoffMove||bed.manualAfterPlacement)return false;
+        if(bed.lastAt&&now-bed.lastAt<Math.max(250,ap.tick*2.5)){
+            bed.nextAt=now+80;return true;
+        }
+        const old=bed.origin,site=bed.site||old;
+        if(!bedSiteRejected(old,now)){
+            bed.failedSites.push({x:old.x,y:old.y,at:now});if(bed.failedSites.length>20)bed.failedSites.shift();
+        }
+        const outside=bedOutsideActive(),anchor=fixedDeath.anchor,r=settings.fixedDeathRadius;
+        const allowed=outside?p=>{const d=bedDistance(p,anchor);return d>=r+95&&d<=r+225;}:p=>bedDistance(p,site)<=250;
+        const plan=bedFindAlternative(bed.self,site,objects,now,allowed)||bedAlternativeMove(bed.self,objects,now,allowed,site);
+        if(!plan)return false;
+        stopBedMovement();bed.relocated=true;bed.route=[];bed.waypoint=0;bed.layoutKey=null;
+        bed.layoutCandidate=null;bed.layoutCandidateCount=0;bed.localBlocked=[];bed.blocked=[];
+        bed.tries=0;bed.lastAt=0;bed.awaitFreshAt=0;bed.nextAt=now;bed.phase='await-position';
+        bed.retryReason=reason+'; procurando posição alternativa';
+        if(plan.place){
+            bed.origin={...plan.point,at:now};if(outside)bed.outsideGoal={...plan.point};
+            return true;
+        }
+        // Keep the old center until the next fresh snapshot; re-evaluate the
+        // build ring after this short, collision-tested detour.
+        bed.detours.push({...plan.point,at:now});if(bed.detours.length>16)bed.detours.shift();
+        bed.route=[plan.point];bed.waypoint=0;
+        return driveBedWaypoint(now,plan.point);
+    }
     function planOutsideBed(self,anchor,radius,objects,now){
         const current=returnDist(self,anchor),preferred=radius+145;
         const radial=current<1?0:Math.atan2(self.y-anchor.y,self.x-anchor.x);
@@ -3004,7 +3081,7 @@
             const angle=base+i*Math.PI/16;
             const p={x:self.x+BED_BUILD_DISTANCE*Math.cos(angle),y:self.y+BED_BUILD_DISTANCE*Math.sin(angle)};
             const distance=returnDist(p,anchor);
-            if(distance<min||distance>max||!bedPointFree(p.x,p.y,objects,0)||!bedSegmentFree(self,p,objects,0)||spikeNavBlocker(self,p,now))continue;
+            if(distance<min||distance>max||!bedCandidateClear(self,p,objects,now))continue;
             const score=-Math.abs(distance-preferred);
             if(!best||score>best.score)best={point:p,place:true,score};
         }
@@ -3013,7 +3090,10 @@
             const delta=(i%2?-1:1)*Math.ceil(i/2)*Math.PI/12;
             const angle=base+delta,p={x:self.x+length*Math.cos(angle),y:self.y+length*Math.sin(angle)};
             const advance=Math.abs(current-preferred)-Math.abs(returnDist(p,anchor)-preferred);
-            if(advance<3||!bedRouteSegment(self,p,objects,20)||spikeNavBlocker(self,p,now))continue;
+            if(!bedRouteSegment(self,p,objects,20)||spikeNavBlocker(self,p,now)||
+                bed.detours.some(q=>now-q.at<4000&&bedDistance(q,p)<32))continue;
+            // Tangential steps and short retreats may be required around walls.
+            if(advance<3&&!bedFindAlternative(p,anchor,objects,now,q=>{const d=returnDist(q,anchor);return d>=min&&d<=max;}))continue;
             if(localEnemyTrap(now,{...session.self,x:p.x,y:p.y,trapped:false}))continue;
             const risk=returnRiskOnSegment(self,p,returnRiskZones(now,self));
             const score=advance+(risk?-120:0)-Math.abs(delta)*4;
@@ -3036,7 +3116,7 @@
             stopReturnMovement();deathReturn.target={...a};
             deathReturn.phase='waiting';deathReturn.route=[];deathReturn.step=0;
             deathReturn.withoutBed=false;deathReturn.nextAt=now;
-            bed.approach=false;bed.origin={...self};bed.spawnAt=now;
+            bed.approach=false;bed.origin={...self};bed.site={...self};bed.spawnAt=now;
             bed.outsideTravel=false;bed.outsideGoal=null;bed.lastAt=0;bed.tries=0;
             bed.moveTries=0;bed.earlyBeds.clear();bed.knownBedIds.clear();
             bed.localBlocked=[];bed.blocked=[];bed.layoutKey=null;bed.nextAt=now;
@@ -3083,7 +3163,8 @@
             bed.nextAt=now;return false;
         }
         bed.phase='await-position';bed.retryReason='Saindo da área antes de construir cama';
-        if(!driveBedWaypoint(now,plan.point))bed.nextAt=now+75;
+        if(driveBedWaypoint(now,plan.point)){bed.detours.push({...plan.point,at:now});if(bed.detours.length>16)bed.detours.shift();}
+        else bed.nextAt=now+75;
         return true;
     }
     function trySpawnBed(now=performance.now()) {
@@ -3179,8 +3260,9 @@
         if(now<bed.nextAt || !bedCanWork(now) ||
             (bed.awaitFreshAt && bed.self.at<=bed.awaitFreshAt))return;
         const objects=bedObstacles(now);
-        if(!bedOriginFree(objects)) {
-            retrySpawnBed('Centro da cama bloqueado',now);
+        if(!bedOriginFree(objects)||bedSiteRejected(bed.origin,now)) {
+            if(relocateBed(now,objects,'Centro da cama bloqueado'))return;
+            retrySpawnBed('Centro da cama bloqueado; sem alternativa segura',now);
             return;
         }
         if(!bedReadyToPlace(objects)) {
@@ -3197,6 +3279,7 @@
                 if(route?.length){bed.clearance=clearance;break;}
             }
             if(!route || !route.length) {
+                if(relocateBed(now,objects,'Rota bloqueada'))return;
                 retrySpawnBed('Nenhuma rota livre no momento',now);
                 return;
             }
@@ -3227,8 +3310,9 @@
             }
             // Move to ANOTHER placement angle in the SAME respawn, instead of
             // retrying one impossible position on every future life.
-            rememberBedPlacementFailure(bed.self);
+            if(!bed.relocated&&!bed.outsideTravel)rememberBedPlacementFailure(bed.self);
             bed.placementFailures++;
+            if(relocateBed(now,objects,'Colocação não confirmada'))return;
             if(bed.placementFailures>=3) {
                 retrySpawnBed('Posições rejeitadas; recalculando',now);return;
             }
@@ -3255,7 +3339,10 @@
         }
         const placed=transmit([19,...aim]);
         transmit([18]);restoreWeapon();
-        if(placed){bed.tries++;bed.lastAt=now;bed.nextAt=now+Math.max(115,ap.tick*2);}
+        if(placed){bed.tries++;bed.lastAt=now;bed.nextAt=now+Math.max(115,ap.tick*2);
+            bed.attemptSites.push({x:bed.origin.x,y:bed.origin.y,at:now});
+            bed.attemptSites=bed.attemptSites.filter(p=>now-p.at<=5000).slice(-16);
+        }
         // An accepted WebSocket send isn't proof of placement; continue
         // observing the server separately. But movement must unlock NOW,
         // rather than waiting 1-2 seconds for the bed entity to appear.
