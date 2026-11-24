@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.92
+// @version      1.8.93
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -141,6 +141,11 @@
 //   interrompe limpeza e libera combate. Próprias/aliadas/inimigas, incluindo
 //   farms 19–21 (tabela histórica Dsync); exclui loot 11 e objetos naturais.
 //   Preserva coleta de kill, cama pendente, Clown e recuperação de idade.
+// - 1.8.93: marcação coletiva explícita persistida por URL do servidor.
+//   Nova aba/reload restaura na primeira posição própria válida, sem
+//   simular morte nem liberar cama/Age Recovery. Preserva raio e não usa
+//   coordenadas de outro servidor. Limpar coletivo grava cancelamento;
+//   limpar local não apaga as outras abas. Mark antigo v1 ainda é lido.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -150,7 +155,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.92';
+    const NEXUS_VERSION = '1.8.93';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1093,10 +1098,13 @@
     };
     const returnDist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
     const FIXED_MARK_KEY=PREFIX+'fixed_mark_command_v1';
+    const FIXED_MARK_SERVER_PREFIX=PREFIX+'fixed_mark_server_v2_';
+    const collectiveMark={checkedEpoch:-1,pending:false,applied:null,active:false};
     const FIXED_FOCUS_KEY=PREFIX+'fixed_focus_event_v1';
     const fixedDeath={anchor:null,epoch:-1,entered:false,targetId:null,lastPlanAt:-Infinity,circle:null,liveMarked:false,camera:null};
     function returnEnabled(){return settings.returnAfterBed || settings.fixedDeathReturn;}
     function resetFixedDeath(){
+        collectiveMark.active=false;
         resetFixedFocus();
         fixedDeath.anchor=null;fixedDeath.epoch=-1;fixedDeath.entered=false;fixedDeath.liveMarked=false;
         fixedDeath.targetId=null;fixedDeath.lastPlanAt=-Infinity;fixedDeath.camera=null;
@@ -1218,6 +1226,7 @@
             if(remote&&isTabIndependent('fixedDeathReturn'))persist('fixedDeathReturn');
         }
         stopAutoPush();stopReturnMovement();resetFixedFocus();
+        collectiveMark.active=remote;
         fixedDeath.anchor={x:point.x,y:point.y};fixedDeath.epoch=session.connectionEpoch;
         fixedDeath.entered=!!(player.alive&&self&&now-self.at<=250&&returnDist(self,point)<=settings.fixedDeathRadius);
         fixedDeath.liveMarked=player.alive;fixedDeath.targetId=null;fixedDeath.lastPlanAt=-Infinity;fixedDeath.camera=null;
@@ -1234,28 +1243,81 @@
         drawFixedDeathCircle(now);
         return true;
     }
+    function collectiveServerKey(){
+        return connected()?FIXED_MARK_SERVER_PREFIX+encodeURIComponent(String(session.ws.url)):null;
+    }
+    function parseCollectiveMark(raw){
+        try{
+            const p=JSON.parse(raw||'null');
+            if(!p||!connected()||p.server!==String(session.ws.url)||!Number.isFinite(p.at)||p.at>Date.now()+10000)return null;
+            if(p.clear===true)return p;
+            if(!Number.isFinite(p.x)||!Number.isFinite(p.y)||p.x<0||p.y<0||p.x>65535||p.y>65535)return null;
+            return p;
+        }catch(_){return null;}
+    }
+    function collectiveMarkToken(p){return JSON.stringify([p.server,p.at,p.nonce??null,p.clear===true,p.x??null,p.y??null]);}
+    function readCollectiveMark(){
+        try{
+            const key=collectiveServerKey();if(!key)return null;
+            const local=parseCollectiveMark(localStorage.getItem(key)),legacy=parseCollectiveMark(localStorage.getItem(FIXED_MARK_KEY));
+            return !local?legacy:!legacy||local.at>=legacy.at?local:legacy;
+        }catch(_){return null;}
+    }
+    function writeCollectiveMark(p){
+        const key=collectiveServerKey();if(!key)return false;
+        const raw=JSON.stringify(p);
+        try{localStorage.setItem(key,raw);localStorage.setItem(FIXED_MARK_KEY,raw);return true;}catch(_){return false;}
+    }
+    function receiveFixedMark(raw,now=performance.now()){
+        const p=parseCollectiveMark(raw);if(!p)return false;
+        const token=collectiveMarkToken(p);
+        if(collectiveMark.applied===token&&collectiveMark.checkedEpoch===session.connectionEpoch)return false;
+        if(p.clear===true){
+            if(collectiveMark.active){
+                resetFixedDeath();cancelReturn('Área coletiva limpa');deathReturn.target=null;
+            }
+            collectiveMark.applied=token;collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;
+            return true;
+        }
+        // Explicit user-issued destination, not evidence of a death.
+        if(player.alive?(!session.self||now-session.self.at>250):lifeGate.deathEpoch!==session.connectionEpoch){
+            collectiveMark.pending=true;return false;
+        }
+        if(Number.isFinite(p.radius)&&p.radius>=30&&p.radius<=1000&&settings.fixedDeathRadius!==p.radius){
+            settings.fixedDeathRadius=p.radius;persist('fixedDeathRadius');
+        }
+        if(!applyFixedMark(p,now,true))return false;
+        persist('fixedDeathReturn');
+        collectiveMark.applied=token;collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;
+        return true;
+    }
+    function restoreCollectiveMark(now=performance.now()){
+        if(!player.alive||!session.self||now-session.self.at>250||!connected())return false;
+        if(collectiveMark.checkedEpoch===session.connectionEpoch&&!collectiveMark.pending)return false;
+        const p=readCollectiveMark();
+        if(!p){collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;return false;}
+        return receiveFixedMark(JSON.stringify(p),now);
+    }
     function markFixedHere(now=performance.now(),all=false){
         const self=session.self;
         if(!player.alive||!connected()||!self||now-self.at>250){
             deathReturn.status='Marcar área: aguardando posição atual';return false;
         }
         if(!applyFixedMark(self,now))return false;
+        collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;
         if(all){
-            try{
-                localStorage.setItem(FIXED_MARK_KEY,JSON.stringify({x:self.x,y:self.y,
-                    server:String(session.ws.url),at:Date.now(),nonce:Math.random()}));
-                deathReturn.status='Área marcada e enviada às abas deste servidor';
-            }catch(_){deathReturn.status='Área local marcada; envio às abas indisponível';}
+            const p={x:self.x,y:self.y,radius:settings.fixedDeathRadius,server:String(session.ws.url),at:Date.now(),nonce:Math.random()};
+            collectiveMark.applied=collectiveMarkToken(p);collectiveMark.active=true;
+            deathReturn.status=writeCollectiveMark(p)?'Área coletiva salva para todas as abas, inclusive novas':'Área local marcada; armazenamento coletivo indisponível';
         }
         return true;
     }
-    function receiveFixedMark(raw){
-        try{
-            const p=JSON.parse(raw||'null');
-            if(!p||!connected()||p.server!==String(session.ws.url)||
-                !Number.isFinite(p.at)||Math.abs(Date.now()-p.at)>10000)return false;
-            return applyFixedMark(p,performance.now(),true);
-        }catch(_){return false;}
+    function clearCollectiveMark(){
+        if(!connected())return false;
+        const p={server:String(session.ws.url),at:Date.now(),nonce:Math.random(),clear:true};
+        const saved=writeCollectiveMark(p);
+        receiveFixedMark(JSON.stringify(p));
+        return saved;
     }
     const killLoot={names:new Map(),recent:new Map(),boxes:new Map(),claim:null,status:'Aguardando kill própria'};
     const combatOrbit={id:null,sid:null,hp:null,since:0,attempts:0,until:0,point:null,center:null,side:1,nextAt:0};
@@ -6687,6 +6749,7 @@
                     deathReturn.lastHitAt=now;
                 recordReturnPosition({x:packet[i+4]|packet[i+5]<<8,
                                       y:packet[i+6]|packet[i+7]<<8},now);
+                restoreCollectiveMark(now);
                 noteHealthSnapshot(observedHealth,now);
                 observeCounter(packet,now);
                 observeAuraTrap(packet,now);
@@ -7039,7 +7102,7 @@
         // Speed changes preserve the existing phase, avoiding an angle reset.
         if(key==='auraLockAim' && !settings.auraLockAim && !settings.returnSpin && !auraTrapTarget(performance.now()) && session.nativeAim && player.alive && connected() && !session.attacking)transmit([13,...session.nativeAim]);
         if(key==='fixedDeathReturn'){
-            if(!settings.fixedDeathReturn){resetFixedDeath();cancelReturn('Ponto fixo desativado; aguarda nova morte');deathReturn.target=null;}
+            if(!settings.fixedDeathReturn){collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;resetFixedDeath();cancelReturn('Ponto fixo desativado; aguarda nova morte');deathReturn.target=null;}
             else {cancelReturn('Aguardando primeira morte do modo fixo');deathReturn.target=null;}
         }
         if(key==='fixedDeathCircle'||key==='fixedDeathRadius')drawFixedDeathCircle();
@@ -7433,7 +7496,7 @@
             <div class="nx-info-line" id="nx-area-cleanup-status"></div>
             <label>Raio de detecção (u)<input data-heal-setting="fixedDeathRadius" type="number" min="30" max="1000" step="1"></label>
             <div class="nx-info-line" id="nx-fixed-status"></div>
-            <div class="pick-actions"><button type="button" id="nx-fixed-mark">Marcar área aqui</button><button type="button" id="nx-fixed-mark-all" title="Usa as coordenadas desta aba em todas as abas conectadas ao mesmo servidor">Marcar área para todos</button><button type="button" id="nx-fixed-reset">Limpar ponto fixo</button></div>
+            <div class="pick-actions"><button type="button" id="nx-fixed-mark">Marcar área aqui</button><button type="button" id="nx-fixed-mark-all" title="Salva centro e raio para abas atuais e futuras deste servidor">Marcar área para todos</button><button type="button" id="nx-fixed-reset">Limpar ponto fixo</button><button type="button" id="nx-fixed-clear-all">Limpar área coletiva</button></div>
             <div class="nx-info-line" id="nx-bed-status">Cama: aguardando respawn</div>
             <div class="nx-info-line" id="nx-return-status">Retorno: aguardando morte</div>
             <div class="pick-actions" style="margin-top:8px">
@@ -7549,7 +7612,8 @@
         menu.querySelector('#nx-chat-test').addEventListener('click',()=>{queueDeathChatTest();refreshInputs();});
         menu.querySelector('#nx-fixed-mark').addEventListener('click',()=>{markFixedHere();refreshInputs();});
         menu.querySelector('#nx-fixed-mark-all').addEventListener('click',()=>{markFixedHere(performance.now(),true);refreshInputs();});
-        menu.querySelector('#nx-fixed-reset').addEventListener('click',()=>{resetFixedDeath();if(settings.fixedDeathReturn){cancelReturn('Ponto limpo; aguardando nova morte');deathReturn.target=null;}refreshInputs();});
+        menu.querySelector('#nx-fixed-reset').addEventListener('click',()=>{collectiveMark.checkedEpoch=session.connectionEpoch;collectiveMark.pending=false;resetFixedDeath();if(settings.fixedDeathReturn){cancelReturn('Ponto limpo; aguardando nova morte');deathReturn.target=null;}refreshInputs();});
+        menu.querySelector('#nx-fixed-clear-all').addEventListener('click',()=>{clearCollectiveMark();refreshInputs();});
         menu.querySelector('#nx-death-reset').addEventListener('click',()=>{resetDeathCount();refreshInputs();});
         menu.querySelector('#nx-bed-cancel').addEventListener('click',()=>{
             if(bed.pending)abortSpawnBed('Parada manual pelo HUD');
@@ -7702,7 +7766,10 @@
     }
     window.addEventListener('storage',event=>{
         if (event.storageArea && event.storageArea!==localStorage) return;
-        if(event.key===FIXED_MARK_KEY){receiveFixedMark(event.newValue);refreshInputs();return;}
+        if(event.key===FIXED_MARK_KEY||(event.key&&event.key===collectiveServerKey())){
+            const p=readCollectiveMark();if(p)receiveFixedMark(JSON.stringify(p));
+            refreshInputs();return;
+        }
         if(event.key===FIXED_FOCUS_KEY){if(receiveFixedFocus(event.newValue))refreshInputs();return;}
         if (event.key===GAME_TOGGLES_KEY) {
             try {
