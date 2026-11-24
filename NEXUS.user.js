@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.77
+// @version      1.8.78
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -54,6 +54,16 @@
 // - Configurações compartilhadas usam localStorage; exceções por aba usam
 //   sessionStorage. Não sobrescreva preferências compartilhadas ao abrir uma aba.
 // - Preserve o singleton: apenas uma versão ativa por página.
+// - 1.8.78: Clown inferido do bit 128 do estado (Dsync + Socket API públicos);
+//   Jungle Gear ID 3 regenera vida; Immunity Gear ID 6 aumenta HP máximo.
+//   A fuga suspende retorno/cama/autoheal, usa snapshots e evita spikes hostis.
+//   A estratégia de recuperação só usa uma comida após confirmação do chapéu.
+// - Cama fora da área fixa: aproximação por A* antes de construir, alvo de
+//   colocação em faixa próxima à borda. A âncora da morte não muda.
+// - Death Chat: envio direto, tentativa extra única se não houver eco.
+//   O eco não é garantido; pode haver uma duplicata. Testar tudo no jogo.
+// - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
+//   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
 // Objetivo: manter a NEXUS atualizável automaticamente a partir do GitHub.
 // ============================================================================
@@ -61,7 +71,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.77';
+    const NEXUS_VERSION = '1.8.78';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -125,6 +135,7 @@
         autoPick: false,
         notifyTargets: true,
         autoHeal: true,
+        clownEscape: true,
         legitHeal: false,
         lagGuard: true,
         threeHitGuard: true,
@@ -545,7 +556,7 @@
         ageRecovery.phase='equip';
         ageRecovery.equipAt=0;
         ageRecovery.hatConfirmed=false;
-        ageRecovery.deadline=performance.now()+4500;
+        ageRecovery.deadline=performance.now()+9000;
         ageRecovery.status='Equipando Immunity Gear';
         tryAgeRecovery();
     }
@@ -569,26 +580,28 @@
             clearAgeRecovery('Recuperação cancelada');return;
         }
         if(now>ageRecovery.deadline){
-            finishAgeRecovery('Sem resposta/ângulo para consumir comida');return;
+            finishAgeRecovery(ageRecovery.hatConfirmed?'Sem mira/conexão para consumir comida':'Immunity Gear não confirmado pelo servidor');return;
         }
         if(ageRecovery.phase==='equip') {
-            if(session.ws.bufferedAmount>4096){wakeAgeRecovery(50);return;}
-            // Public clients use opcode 5 for hats and ID 6 for Immunity Gear.
-            if(hat.current!==6 && !requestHat(6,'age',now)){wakeAgeRecovery(80);return;}
-            if(hat.current===6)ageRecovery.hatConfirmed=true;
-            ageRecovery.equipAt=now;
-            ageRecovery.phase='food';
-            ageRecovery.status='Aguardando equipamento; 1 comida pendente';
-            wakeAgeRecovery(130);
-            return;
+            if(session.ws.bufferedAmount>1024 || !session.self || !currentAim()){
+                ageRecovery.status='Aguardando posição/mira para Immunity Gear';wakeAgeRecovery(80);return;
+            }
+            // A packet sent before the store/player is ready is not an ACK.
+            if(hat.current!==6 || !ageRecovery.hatConfirmed){
+                if(hat.current!==6)requestHat(6,'age',now);
+                ageRecovery.status='Aguardando confirmação do Immunity Gear';
+                wakeAgeRecovery(120);return;
+            }
+            ageRecovery.equipAt=now;ageRecovery.phase='food';
+            ageRecovery.status='Immunity confirmado; 1 comida pendente';
+            wakeAgeRecovery(65);return;
         }
         if(ageRecovery.phase!=='food')return;
-        // Await an observed hat or allow a short ordered WebSocket delay.
-        // The server, not the sent packet, decides whether the hat was equipped.
-        const elapsed=now-ageRecovery.equipAt;
-        const minimum=ageRecovery.hatConfirmed?40:230;
-        if(elapsed<minimum){wakeAgeRecovery(minimum-elapsed);return;}
-        if(!currentAim() || session.ws.bufferedAmount>4096){
+        if(hat.current!==6){
+            ageRecovery.hatConfirmed=false;ageRecovery.phase='equip';wakeAgeRecovery(80);return;
+        }
+        if(now-ageRecovery.equipAt<65){wakeAgeRecovery(65-(now-ageRecovery.equipAt));return;}
+        if(!currentAim() || session.ws.bufferedAmount>1024){
             ageRecovery.status='Aguardando mira/conexão para 1 comida';
             wakeAgeRecovery(45);return;
         }
@@ -632,7 +645,7 @@
         const previous=hat.current;
         hat.current=id;hat.observedAt=now;
         if(id>0&&id===hat.requestId&&now>hat.requestAt)hat.requestOwner=null;
-        if(ageRecovery.pending)return;
+        if(ageRecovery.pending||clownFlight.active||clownEscapeActive())return;
         if(validCombatHat(id)&&!auraHat.owned&&!(id===6&&now<auraHat.echoUntil))hat.lastGood=id;
         if(hat.pending && id===hat.wanted){hat.pending=false;hat.tries=0;}
         if(id===0&&!hat.manualNone&&(settings.autoLastHat||settings.copyNearbyHat)&&fallbackHat()){
@@ -649,7 +662,7 @@
         if(validCombatHat(id)&&id!==hat.wanted&&now-hat.lastManualAt>650)rememberHat(id);
     }
     function tryRestoreHat(now=performance.now()) {
-        if(ageRecovery.pending||auraHat.owned||hat.manualNone)return false;
+        if(ageRecovery.pending||clownEscapeActive()||clownFlight.active||auraHat.owned||hat.manualNone)return false;
         if(!player.alive||!connected()||now<hat.nextAt||now-hat.lastManualAt<350)return false;
         const empty=hat.current===0;
         const recovery=empty&&(settings.autoLastHat||settings.copyNearbyHat);
@@ -912,7 +925,7 @@
         bed.epoch++;
         bed.spawnAt=performance.now();
         bed.spawnCandidate=null;bed.spawnCandidateCount=0;
-        bed.spawnAnchorConfirmed=false;bed.earlyBeds.clear();bed.outsideTravel=false;bed.outsidePlaced=null;bed.outsideGoal=null;
+        bed.spawnAnchorConfirmed=false;bed.earlyBeds.clear();bed.approach=false;bed.outsideTravel=false;bed.outsidePlaced=null;bed.outsideGoal=null;
         bed.pending=!!(settings.autoSpawnBed && player.alive && lifeGate.respawnAuthorized);
         // An inventory update can precede spawn during fast reconnects.
         bed.unlocked=!!(bed.preSpawnUnlockAt && performance.now()-bed.preSpawnUnlockAt<1500);
@@ -1022,7 +1035,7 @@
             fixedDeath.anchor && fixedDeath.epoch===session.connectionEpoch);
     }
     function returnBedReady(){
-        return !bed.pending && (bed.confirmed || deathReturn.withoutBed);
+        return !!(bed.pending&&bed.approach) || (!bed.pending && (bed.confirmed || deathReturn.withoutBed));
     }
     function applyFixedMark(point,now=performance.now(),remote=false){
         if(!connected()||!point||!Number.isFinite(point.x)||!Number.isFinite(point.y)||
@@ -1076,7 +1089,7 @@
     function refreshFixedDeathGoal(now){
         const anchor=fixedDeath.anchor,self=deathReturn.self;
         if(!settings.fixedDeathReturn || !anchor || !self || !deathReturn.target ||
-            fixedDeath.epoch!==session.connectionEpoch || deathReturn.manualMove)return;
+            fixedDeath.epoch!==session.connectionEpoch || deathReturn.manualMove || bed.approach)return;
         if(!fixedDeath.entered && returnDist(self,anchor)<=settings.fixedDeathRadius)fixedDeath.entered=true;
         const cleaning=trapCleanupActive(now);
         const enemy=fixedDeath.entered&&!cleaning?fixedDeathEnemy(now):null;
@@ -1112,13 +1125,9 @@
             y:rect.top+rect.height/2+(anchor.y-self.y)*scale,radius:radius*scale};
     }
     function fixedVisualCamera(self,now){
-        const old=fixedDeath.camera;
-        if(!old||old.sid!==self.sid||old.epoch!==session.connectionEpoch||
-            now-old.at>300||Math.hypot(self.x-old.x,self.y-old.y)>160)
-            return fixedDeath.camera={x:self.x,y:self.y,sid:self.sid,epoch:session.connectionEpoch,at:now};
-        const f=1-Math.exp(-Math.max(0,now-old.at)/34);
-        old.x+=(self.x-old.x)*f;old.y+=(self.y-old.y)*f;old.at=now;
-        return old;
+        // Do not add an independent smoothing delay to the world projection.
+        // The server anchor is immutable; the native camera can still interpolate.
+        return {x:self.x,y:self.y,sid:self.sid,epoch:session.connectionEpoch,at:now};
     }
     function drawFixedDeathCircle(now=performance.now()){
         const a=fixedDeath.anchor,self=session.self,canvas=document.getElementById('game-canvas');
@@ -1826,7 +1835,7 @@
         deathReturn.learned=false;deathReturn.driftSamples=0;
         deathReturn.verifiedPath=deathReturn.self ?
             [{x:deathReturn.self.x,y:deathReturn.self.y}] : [];
-        deathReturn.learningClean=!deathReturn.withoutBed&&!fixedDeath.liveMarked;
+        deathReturn.learningClean=!deathReturn.withoutBed&&!fixedDeath.liveMarked&&!bed.approach;
         deathReturn.status=deathReturn.withoutBed?'Sem cama disponível: retornando mesmo assim':'Calculando retorno';
         return true;
     }
@@ -1839,7 +1848,7 @@
             // Food selection/attack does not own the movement channel.
             // Waiting for a quiet healing phase can starve the return when
             // rapid healing stays busy for most of a fight.
-            !ageRecovery.pending && !macro.selected &&
+            !ageRecovery.pending && !clownEscapeActive() && !macro.selected &&
             !Object.keys(macroDefs).some(macroActive) &&
             !ap.manualItem && session.ws.bufferedAmount<2048;
     }
@@ -2019,6 +2028,7 @@
         spin.lastSentAt=now;return true;
     }
     function driveReturn(now=performance.now()){
+        if(clownEscapeActive())return;
         if(!returnAuthorized()||!returnEnabled()||!player.alive||
             deathReturn.socketEpoch!==session.connectionEpoch)return;
         if(!deathReturn.target){
@@ -2047,7 +2057,7 @@
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
             const nav=t && auraIsSpike(t)?t:auraNavigationSpike(now);
-            if(nav && (counterUrgentStructure(nav,now)||spikeSegmentDistance(deathReturn.self,deathReturn.moveTo||deathReturn.target,nav)<=spikeSafetyRadius(nav))){pauseReturnForSpike(nav,now);return;}
+            if(nav && (counterUrgentStructure(nav,now)||(deathReturn.moveOwned&&deathReturn.moveTo&&spikeSegmentDistance(deathReturn.self,deathReturn.moveTo,nav)<=spikeSafetyRadius(nav)))){pauseReturnForSpike(nav,now);return;}
             if(deathReturn.moveOwned && spikeNavBlocker(deathReturn.self,deathReturn.moveTo,now)){
                 stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;
                 deathReturn.nextAt=now+50;deathReturn.status='Spike novo na rota';return;
@@ -2256,8 +2266,11 @@
         if (packet instanceof Uint8Array && packet[0]===2 &&
             packet.subarray(1).includes(SPAWN_BED_ID)) {
             if (player.alive) {
-                if (bed.pending && bed.socketEpoch===session.connectionEpoch)
-                    bed.unlocked=true;
+                if (bed.pending && bed.socketEpoch===session.connectionEpoch)bed.unlocked=true;
+                else if(settings.autoSpawnBed&&bedOutsideActive()&&lifeGate.respawnAuthorized&&!bed.confirmed&&bed.phase==='unavailable'&&bed.abortReason==='Item cama indisponível após respawn'){
+                    resetSpawnBed();bed.unlocked=true;deathReturn.withoutBed=false;
+                    stopReturnMovement();deathReturn.target={...fixedDeath.anchor};deathReturn.phase='waiting';
+                }
             } else bed.preSpawnUnlockAt=performance.now();
         }
     }
@@ -2880,28 +2893,58 @@
         return settings.bedOutsideFixed&&settings.fixedDeathReturn&&!!fixedDeath.anchor&&fixedDeath.epoch===session.connectionEpoch;
     }
     function planOutsideBed(self,anchor,radius,objects,now){
-        const base=returnDist(self,anchor)<1?0:Math.atan2(self.y-anchor.y,self.x-anchor.x);
-        const min=radius+100,current=returnDist(self,anchor);
+        const current=returnDist(self,anchor),preferred=radius+145;
+        const radial=current<1?0:Math.atan2(self.y-anchor.y,self.x-anchor.x);
+        const base=current>preferred?radial+Math.PI:radial;
+        const min=radius+95,max=radius+225;
         let best=null;
         for(let i=0;i<32;i++){
             const angle=base+i*Math.PI/16;
             const p={x:self.x+BED_BUILD_DISTANCE*Math.cos(angle),y:self.y+BED_BUILD_DISTANCE*Math.sin(angle)};
-            if(returnDist(p,anchor)<min||!bedPointFree(p.x,p.y,objects,0)||!bedSegmentFree(self,p,objects,0)||spikeNavBlocker(self,p,now))continue;
-            const score=returnDist(p,anchor);
+            const distance=returnDist(p,anchor);
+            if(distance<min||distance>max||!bedPointFree(p.x,p.y,objects,0)||!bedSegmentFree(self,p,objects,0)||spikeNavBlocker(self,p,now))continue;
+            const score=-Math.abs(distance-preferred);
             if(!best||score>best.score)best={point:p,place:true,score};
         }
         if(best)return best;
         for(const length of [115,75,40])for(let i=0;i<24;i++){
             const delta=(i%2?-1:1)*Math.ceil(i/2)*Math.PI/12;
             const angle=base+delta,p={x:self.x+length*Math.cos(angle),y:self.y+length*Math.sin(angle)};
-            const advance=returnDist(p,anchor)-current;
-            if(advance<8||!bedRouteSegment(self,p,objects,20)||spikeNavBlocker(self,p,now))continue;
+            const advance=Math.abs(current-preferred)-Math.abs(returnDist(p,anchor)-preferred);
+            if(advance<3||!bedRouteSegment(self,p,objects,20)||spikeNavBlocker(self,p,now))continue;
             if(localEnemyTrap(now,{...session.self,x:p.x,y:p.y,trapped:false}))continue;
             const risk=returnRiskOnSegment(self,p,returnRiskZones(now,self));
             const score=advance+(risk?-120:0)-Math.abs(delta)*4;
             if(!best||score>best.score)best={point:p,place:false,score};
         }
         return best;
+    }
+    function driveBedApproach(now){
+        if(!bedOutsideActive()||!bed.origin||!bed.self||!bed.spawnAnchorConfirmed||
+            bed.lastAt>0||bed.outsideGoal||now-bed.self.at>250)return false;
+        const a=fixedDeath.anchor,r=settings.fixedDeathRadius,self=bed.self,d=returnDist(self,a);
+        if(bed.approach){
+            if(d>r+215 || push.manual || deathReturn.manualMove)return true;
+            stopReturnMovement();deathReturn.target={...a};
+            deathReturn.phase='waiting';deathReturn.route=[];deathReturn.step=0;
+            deathReturn.withoutBed=false;deathReturn.nextAt=now;
+            bed.approach=false;bed.origin={...self};bed.spawnAt=now;
+            bed.outsideTravel=false;bed.outsideGoal=null;bed.lastAt=0;bed.tries=0;
+            bed.moveTries=0;bed.earlyBeds.clear();bed.knownBedIds.clear();
+            bed.localBlocked=[];bed.blocked=[];bed.layoutKey=null;bed.nextAt=now;
+            bed.phase='await-position';bed.retryReason='Chegou perto da área; preparando cama';
+            return false;
+        }
+        if(d<=r+250)return false;
+        const angle=Math.atan2(self.y-a.y,self.x-a.x),distance=r+150;
+        const clamp=v=>Math.max(1,Math.min(65534,v));
+        stopBedMovement();if(bed.locked)releaseBedInput(true);
+        bed.approach=true;bed.phase='approach';
+        deathReturn.target={x:clamp(a.x+Math.cos(angle)*distance),y:clamp(a.y+Math.sin(angle)*distance)};
+        stopReturnMovement();deathReturn.phase='waiting';deathReturn.nextAt=now;
+        deathReturn.route=[];deathReturn.step=0;deathReturn.learningClean=false;
+        deathReturn.status='Aproximando da área antes de construir cama';
+        return true;
     }
     function driveBedOutside(now){
         if(!bedOutsideActive()||!bed.origin||bed.lastAt>0)return false;
@@ -2915,7 +2958,7 @@
             stopBedMovement();bed.phase='await-position';bed.route=[];bed.waypoint=0;
         }
         if(now<bed.nextAt)return true;
-        if(!bed.outsideTravel&&returnDist(bed.origin,anchor)>=radius+100)return false;
+        // Never build at a distant random spawn merely because it is outside.
         const plan=planOutsideBed(bed.self,anchor,radius,bedObstacles(now),now);
         bed.outsideTravel=true;
         if(!plan){
@@ -2936,9 +2979,10 @@
         return true;
     }
     function trySpawnBed(now=performance.now()) {
-        if(ageRecovery.pending)return; // Recovery must happen before bed movement.
+        if(ageRecovery.pending||clownEscapeActive())return; // Recovery must happen before bed movement.
         if(!lifeGate.respawnAuthorized || !bed.pending || !settings.autoSpawnBed || !player.alive || !connected() ||
             bed.socketEpoch!==session.connectionEpoch)return;
+        if(driveBedApproach(now))return;
         if(selfPinned(now)){
             if(bed.moveOwned){stopBedMovement();bed.phase='await-position';bed.route=[];bed.waypoint=0;}
             if(bed.locked)releaseBedInput(true);
@@ -3110,6 +3154,77 @@
         releaseBedInput(true);
     }
 
+    // Clown is a state flag, not an ordinary equipment ID.
+    const clownFlight={active:false,owned:false,lastAt:-Infinity,angle:null,goal:null};
+    function clownEscapeActive(){
+        return settings.clownEscape && player.alive && !!session.self?.clown;
+    }
+    function stopClownMovement(sendStop=true){
+        if(clownFlight.owned&&sendStop&&connected())transmit([15]);
+        clownFlight.owned=false;clownFlight.goal=null;clownFlight.angle=null;
+    }
+    function clearClownFlight(sendStop=true){
+        stopClownMovement(sendStop);clownFlight.active=false;clownFlight.lastAt=-Infinity;
+    }
+    function clownEscapePlan(self,threats,obstacles,risks,now){
+        let dx=0,dy=0;
+        for(const t of threats){
+            const x=self.x-t.x,y=self.y-t.y,d=Math.max(1,Math.hypot(x,y));
+            const w=1/Math.max(35,d);dx+=x/d*w;dy+=y/d*w;
+        }
+        const base=Math.hypot(dx,dy)>1e-8?Math.atan2(dy,dx):(clownFlight.angle??0);
+        let best=null;
+        const closest=p=>threats.length?Math.min(...threats.map(t=>returnDist(t,p))):250;
+        const startDistance=closest(self);
+        for(const length of [110,70,40])for(let i=0;i<24;i++){
+            const delta=(i%2?-1:1)*Math.ceil(i/2)*Math.PI/12,angle=base+delta;
+            const p={x:self.x+length*Math.cos(angle),y:self.y+length*Math.sin(angle)};
+            if(p.x<30||p.y<30||p.x>65505||p.y>65505||
+                !returnSegmentClear(self,p,obstacles,22)||spikeNavBlocker(self,p,now))continue;
+            if(localEnemyTrap(now,{...self,x:p.x,y:p.y,trapped:false}))continue;
+            const gain=closest(p)-startDistance;
+            const score=gain*2.2+length*.40-returnRiskCost(p,risks)*.65-Math.abs(delta)*5;
+            if(!best||score>best.score)best={point:p,angle,score};
+        }
+        return best;
+    }
+    function driveClownEscape(now=performance.now()){
+        if(!clownEscapeActive()||!connected()){
+            if(clownFlight.active){
+                clearClownFlight();
+                if(settings.autoLastHat&&hat.wanted&&hat.wanted!==3){hat.pending=true;hat.nextAt=now;}
+            }
+            return false;
+        }
+        const self=session.self;
+        if(!clownFlight.active){
+            clownFlight.active=true;stopAutoPush();
+            if(deathReturn.moveOwned)stopReturnMovement();
+            if(deathReturn.phase==='moving'){deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;deathReturn.nextAt=now;}
+            if(bed.moveOwned){stopBedMovement();bed.phase='await-position';bed.route=[];bed.waypoint=0;}
+            if(bed.locked)releaseBedInput(true);
+            if(heal.phase!=='idle')cancelHeal();
+            resetAuraHat();
+        }
+        if(now-self.at>250||push.manual||deathReturn.manualMove||bed.handoffMove||selfPinned(now)||session.ws.bufferedAmount>=1024){
+            stopClownMovement();return true;
+        }
+        // Ask for regeneration as soon as the state is observed; retain the
+        // normal hat transaction gate so a delayed reply cannot toggle it off.
+        if(hat.current!==3)requestHat(3,'clown',now);
+        if(now-clownFlight.lastAt<95 && clownFlight.owned && clownFlight.goal &&
+            !spikeNavBlocker(self,clownFlight.goal,now))return true;
+        const threats=[...counter.players.values()].filter(e=>e.id!==player.id&&e.sid!==self.sid&&
+            !(self.team&&e.team===self.team)&&now-e.at<=350&&returnDist(e,self)<450);
+        if(!threats.length){stopClownMovement();return true;}
+        const plan=clownEscapePlan(self,threats,returnObstacles(now,self),returnRiskZones(now,self),now);
+        if(!plan){stopClownMovement();return true;}
+        if(transmit([1,...apAngleBytes(plan.angle)])){
+            clownFlight.owned=true;clownFlight.lastAt=now;clownFlight.goal=plan.point;clownFlight.angle=plan.angle;
+            deathReturn.status='Clown: fuga segura + Jungle Gear';
+        }
+        return true;
+    }
     function connected() { return session.ws && session.ws.readyState === 1; }
     function transmit(bytes) {
         if (!connected()) return false;
@@ -3122,7 +3237,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
-        resetSpin();resetCounter();resetHatCopy();
+        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -3327,7 +3442,7 @@
         return true;
     }
     function isEligible() {
-        return !ageRecovery.pending && settings.autoHeal && player.alive && player.id >= 0 &&
+        return !ageRecovery.pending && !clownEscapeActive() && settings.autoHeal && player.alive && player.id >= 0 &&
             player.health > 0 && player.health < 100 && connected();
     }
     const LEGIT_HEAL_INTERVAL_MS=1;
@@ -3960,6 +4075,7 @@
     function autoPushBlock(now){
         const self=ap.self;
         if(!settings.autoPush)return 'Desativado';
+        if(clownEscapeActive())return 'Clown: fuga prioritária';
         if(!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL)return 'Aguardando posição';
         if(push.manual||deathReturn.manualMove||session.attacking)return 'Controle manual';
         if(trapCleanupActive(now))return 'Liberando vagas de traps';
@@ -4628,7 +4744,7 @@
         return Math.hypot(t.x-a.x-u*dx,t.y-a.y-u*dy);
     }
     function hostileSpikes(now,self=session.self){
-        if(!settings.auraBreakSpikes || !self)return [];
+        if(!self)return []; // Avoid hostile spikes even when automatic breaking is off.
         return [...counter.traps.values()].filter(t=>auraIsSpike(t) &&
             (auraStructureLive(t,now)||now-t.at<=15000) && auraTrapHostile(t,self));
     }
@@ -4971,7 +5087,7 @@
         return count;
     }
     function driveAuraHat(now=performance.now()){
-        if(!player.alive || !connected() || ageRecovery.pending || session.ws.bufferedAmount>=1024)return;
+        if(!player.alive || !connected() || ageRecovery.pending || clownEscapeActive() || clownFlight.active || session.ws.bufferedAmount>=1024)return;
         const target=auraTrapTarget(now);
         if(target)counter.lastStructureAt=now;
         const escaping=auraEscapeInProgress(now);
@@ -5132,7 +5248,7 @@
     }
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
-        if(auraHat.owned || now<auraHat.echoUntil || auraEscapeInProgress(now))return false;
+        if(clownEscapeActive()||clownFlight.active||auraHat.owned || now<auraHat.echoUntil || auraEscapeInProgress(now))return false;
         if(t?.hat===AURA_DEMOLIST||t?.hat===0){hatCopy.status='Sem chapéu copiável';return false;}
         if(hat.manualNone)return false;
         if(hat.current===0&&fallbackHat()&&hat.tries<3)return false;
@@ -5165,6 +5281,7 @@
         return '';
     }
     function driveCounter(now=performance.now()){
+        if(clownEscapeActive()&&!selfPinned(now))return false;
         driveAuraHat(now);
         const hostile=auraTrapTarget(now),cleanup=trapCleanupTarget(now);
         const structure=hostile||cleanup;
@@ -5206,9 +5323,9 @@
     // FUN: real public game chat. Prefer the native chat control on visible
     // tabs and observe its actual outbound packet. Background tabs use the
     // documented binary chat command, not DOM overlays or clan chat.
-    const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=1500;
+    const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=600, DEATH_CHAT_ACK_WAIT=3500;
     const deathChat={total:0,pending:false,readyAt:Infinity,lastAt:-Infinity,epoch:-1,
-        echo:null,nativeTry:null,status:'Aguardando morte',lifeAt:null,lifeEpoch:-1,lastDeath:null};
+        echo:null,nativeTry:null,retry:0,status:'Aguardando morte',lifeAt:null,lifeEpoch:-1,lastDeath:null};
     // Count only deaths in this document. A new or duplicated tab and a
     // full reload start at zero; respawns in this document retain the count.
     try{sessionStorage.removeItem(PREFIX+'death_count_v1');}catch(_){}
@@ -5270,7 +5387,7 @@
         deathChat.total=Math.min(Number.MAX_SAFE_INTEGER,deathChat.total+1);
         deathChat.pending=!!settings.deathChat;
         deathChat.epoch=session.connectionEpoch;
-        deathChat.readyAt=Infinity;deathChat.echo=null;deathChat.nativeTry=null;
+        deathChat.readyAt=Infinity;deathChat.echo=null;deathChat.nativeTry=null;deathChat.retry=0;
         deathChat.status='Aguardando respawn';
         return true;
     }
@@ -5325,8 +5442,12 @@
         return true;
     }
     function announceDeathCount(now=performance.now()){
-        if(deathChat.echo && now-deathChat.echo.at>5000){
-            deathChat.echo=null;deathChat.status='Pacote enviado ao jogo; sem confirmação do servidor';
+        if(deathChat.echo && now-deathChat.echo.at>=DEATH_CHAT_ACK_WAIT){
+            const e=deathChat.echo;deathChat.echo=null;
+            if(settings.deathChat&&player.alive&&connected()&&e.epoch===session.connectionEpoch&&e.playerId===player.id&&deathChat.retry===0){
+                deathChat.retry=1;deathChat.pending=true;deathChat.readyAt=now;
+                deathChat.status='Sem eco: uma nova tentativa de chat';
+            }else deathChat.status='Pacote enviado; sem confirmação do servidor';
         }
         if(!settings.deathChat || !deathChat.pending || !player.alive ||
             !connected() || deathChat.epoch!==session.connectionEpoch)return false;
@@ -5334,13 +5455,8 @@
         if(now-deathChat.lastAt<DEATH_CHAT_GAP){deathChat.status='Aguardando intervalo do chat';return false;}
         if(session.ws.bufferedAmount>=1024){deathChat.status='Aguardando fila da conexão';return false;}
         const message=deathChatMessage();
-        // A stationary player need not have a fresh position to send chat.
-        // Respect a real user's open chat/draft rather than interrupting it.
-        const input=document.getElementById('chat');
-        if(input && (input.value || document.activeElement===input)){deathChat.status='Aguardando fechar chat manual';return false;}
-        const n=deathChat.nativeTry;
-        if(!n && tryNativeDeathChat(message,now))return !deathChat.pending;
-        if(n && now-n.at<300)return false;
+        // The public Socket API sends chat as UTF-8 directly. Do not
+        // synthesize Enter or touch the user's input/focus.
         if(!transmit([7,...new TextEncoder().encode(message)])){
             deathChat.status='Falha no envio ao jogo';return false;
         }
@@ -5350,13 +5466,13 @@
     function queueDeathChatTest(now=performance.now()){
         if(!settings.deathChat || !player.alive || !connected())return false;
         deathChat.pending=true;deathChat.epoch=session.connectionEpoch;deathChat.readyAt=now;
-        deathChat.nativeTry=null;deathChat.status='Teste do chat real pendente';
+        deathChat.nativeTry=null;deathChat.echo=null;deathChat.retry=0;deathChat.status='Teste do chat real pendente';
         announceDeathCount(now);return true;
     }
     function resetDeathChatConnection(){
         deathChat.readyAt=Infinity;deathChat.epoch=-1;deathChat.echo=null;deathChat.nativeTry=null;
         deathChat.lifeAt=null;deathChat.lifeEpoch=-1;
-        if(deathChat.pending)deathChat.status='Aguardando respawn';
+        deathChat.pending=false;deathChat.retry=0;deathChat.status='Aguardando morte';
     }
     function resetDeathCount(){
         deathChat.total=0;deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;deathChat.lastDeath=null;
@@ -5728,6 +5844,7 @@
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false,apSnapshotProcessed=false;
         if (id === 35) { // spawn
+            if(player.alive&&Number(packet[1])===player.id)return; // duplicate init must not cancel a live task
             const newDeathLife=!player.alive||deathChat.lifeEpoch!==session.connectionEpoch||deathChat.lifeAt===null;
             finishGoofySpawn();
             resetSmartLife();smartLife.startedAt=performance.now();
@@ -5830,7 +5947,7 @@
                 noteServerSnapshot(now);
                 heal.observedItem=packet[i+10];heal.observedItemAt=now;
                 session.self={x:packet[i+4]|packet[i+5]<<8,
-                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],trapped:!!(packet[i+8]&32),at:now};
+                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],trapped:!!(packet[i+8]&32),clown:!!(packet[i+8]&128),at:now};
                 const observedHealth=Math.max(0,Math.min(100,
                     packet[i + 13] * 100 / 255));
                 if(observedHealth<player.health-1.5 &&
@@ -5862,6 +5979,7 @@
         }
         // The one-off post-death food has priority over normal healing and
         // starts from server updates, including hidden tabs.
+        driveClownEscape();
         tryAgeRecovery();
         // Entity packets without our player may still wake an ongoing heal.
         if (!ownSnapshotProcessed) evaluate();
@@ -5932,6 +6050,8 @@
         if (this === session.ws && raw && raw.length) {
             const movementStart=raw[0]===1 || (raw[0]===6&&raw.length>1&&raw[1]!==0);
             const movementStop=raw[0]===15 || (raw[0]===6&&raw.length>1&&raw[1]===0);
+            if(movementStart&&clownFlight.owned)stopClownMovement(false);
+            if(movementStop&&!push.manual&&!deathReturn.manualMove&&!bed.locked&&(clownFlight.owned||deathReturn.moveOwned))return;
             if(!bed.locked&&movementStart){stopAutoPush(false);push.manual=true;}
             else if(!bed.locked&&movementStop){
                 // Do not let idle native STOP packets interrupt owned push;
@@ -6238,11 +6358,11 @@
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+(deathChat.lastDeath?' • Última vida: '+formatDeathDuration(deathChat.lastDeath.duration)+' • Por: '+(deathChat.lastDeath.killer||'Desconhecido'):'')+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
-        if(ageStatus)ageStatus.textContent='Age: '+(settings.ageRecovery ? ageRecovery.status : 'desativado');
+        if(ageStatus)ageStatus.textContent='Age: '+(settings.ageRecovery ? ageRecovery.status : 'desativado')+(clownEscapeActive()?' • Clown: '+(hat.current===3?'Jungle confirmado':'aguardando Jungle'):'');
         const bedStatus=menu.querySelector('#nx-bed-status');
         if(bedStatus) {
             const state=!settings.autoSpawnBed ? 'Cama: desativada' :
-                bed.phase==='unavailable' ? 'Cama: '+bed.abortReason+'; retorno liberado' : bed.confirmed ? (bed.outsidePlaced===true?'Cama: confirmada fora da área fixa':bed.outsidePlaced===false?'Cama: confirmada dentro da área (desvio do servidor)':bed.lastLearned ? 'Cama: posição confirmada' : 'Cama: colocada fora do centro (não aprendida)') :
+                bed.approach ? 'Cama: aproximando da área fixa' : bed.phase==='unavailable' ? 'Cama: '+bed.abortReason+'; retorno liberado' : bed.confirmed ? (bed.outsidePlaced===true?'Cama: confirmada fora da área fixa':bed.outsidePlaced===false?'Cama: confirmada dentro da área (desvio do servidor)':bed.lastLearned ? 'Cama: posição confirmada' : 'Cama: colocada fora do centro (não aprendida)') :
                 !bed.pending ? `Cama: ${bed.abortReason||'aguardando respawn'}` :
                 !bed.unlocked ? 'Cama: aguardando item no inventário' :
                 !bed.origin ? 'Cama: aguardando posição do spawn' :
@@ -6518,6 +6638,7 @@
             <div class="section-intro"><span><strong>RECOVERY</strong><small>Heal e consumo de comida</small></span>
               <span class="health-chip" id="gpt-heal-health">—</span></div>
             <label title="Use food automatically when your health is below 100%">Auto Heal<input data-heal-setting="autoHeal" type="checkbox"></label>
+            <label title="Durante Clown, pede Jungle Gear, pausa comida e foge dos inimigos evitando spikes.">Clown Escape<input data-heal-setting="clownEscape" type="checkbox"></label>
             <label title="Legit Heal usa agendamento fixo de 1 ms. Hold Min/Max continuam definindo o tempo aleatório segurando comida.">Legit Heal (1 ms)<input data-heal-setting="legitHeal" type="checkbox"></label>
             <label title="Priorize cura após golpes, reconheça Katanas próximas e reduza atraso de Legit Heal somente em emergência. Não garante sobrevivência">3-Hit Guard<input data-heal-setting="threeHitGuard" type="checkbox"></label>
             <label title="Intervalo somente da cura normal (1–1000 ms); Legit Heal sempre usa 1 ms, independente desta opção.">Heal ms (normal)<input data-heal-setting="intervalMs" type="number" min="1" max="1000" step="1"></label>
@@ -6894,6 +7015,7 @@
     setInterval(()=>{
         if(goofy.original!==null || settings.goofyNames)syncGoofyNickname();
         if(deathChat.pending || deathChat.echo)announceDeathCount();
+        if(clownFlight.active||clownEscapeActive())driveClownEscape();
     },500);
     function spinFrame(){
         if(!document.hidden && player.alive){driveCounter();driveSpin();}
