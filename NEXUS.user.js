@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.82
+// @version      1.8.83
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -79,6 +79,16 @@
 // - 1.8.82: mantém distância mesmo sem ângulo de spike disponível; não
 //   muda de posição durante confirmação. Limpeza pode contornar obstáculos
 //   em vez de exigir linha reta. Bloqueios recentes persistem entre alvos.
+// - 1.8.83: Astral Without AI 5.1.0:4 (Greasy Fork 551959) estudado.
+//   Changelog oficial sploop.io: v0.4.0 (2025-10-30) reduziu knockback de
+//   Spear/Naginata e aumentou dano de Gold/Diamond Hammer a construções;
+//   v0.5.1 reduziu HP de Immunity para 130. Não assumir valores atuais.
+//   IDs de armas 55,72–78 vieram da tabela pública; alcance ainda estimado.
+//   Prioridade de limpeza: traps/spikes hostis, turrets, mills; Demolist
+//   somente sem inimigos próximos, mantendo restauração do chapéu.
+//   Ban Check do Astral confunde 1005/1006 com ban. NEXUS observa apenas
+//   conexões reais e registra motivo explícito de ban; sem sondar servidores.
+//   Geometria/knockback atuais precisam de medição, não copiar números cegamente.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -88,7 +98,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.82';
+    const NEXUS_VERSION = '1.8.83';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3983,7 +3993,9 @@
     const AP_TRAP_CONTACT=65, AP_SPIKE_CONTACT=78;
     function apCapture(e,traps){
         const t=traps.filter(o=>apDistance(o,e)<=65).sort((a,b)=>apDistance(a,e)-apDistance(b,e))[0];
-        return t && ((e.state&32)||apDistance(t,e)<=42||((e.stillFrames||0)>=1&&e.motion<=.18&&apDistance(t,e)<=60))?t:null;
+        return t && ((e.state&32)||apDistance(t,e)<=42||
+            (apDistance(t,e)<=50&&(e.motion??0)<=.18)||
+            ((e.stillFrames||0)>=1&&e.motion<=.18&&apDistance(t,e)<=60))?t:null;
     }
     function apStatic(e,now){
         return e.type!==0 && !BED_NAV_DYNAMIC.has(e.type) && e.type!==12 && now-e.at<=AP_OBJECT_TTL;
@@ -4136,7 +4148,8 @@
                 const gap=apDistance(e,spike);
                 if(gap<=65||gap>150)continue; // already in spike contact: do not push continuously
                 const ux=(e.x-spike.x)/gap,uy=(e.y-spike.y)/gap;
-                const behind={x:e.x+ux*70,y:e.y+uy*70};
+                const offset=Math.max(64,Math.min(86,64+(gap-65)*.24));
+                const behind={x:e.x+ux*offset,y:e.y+uy*offset};
                 if(apDistance(behind,self)>285)continue;
                 const dot=(self.x-e.x)*ux+(self.y-e.y)*uy,side=Math.abs((self.x-e.x)*uy-(self.y-e.y)*ux);
                 const aligned=dot>=0 && (side<=32 || (push.target===e.id&&push.spike===spike.id&&push.stage==='push'&&side<=48));
@@ -4150,7 +4163,7 @@
                 }
                 for(const goal of goals){
                     if(!pushReturnAllowed(self,e,goal,now)||!apPushPathClear(self,goal,objects,self,now))continue;
-                    const score=apDistance(self,goal)*.65+gap*1.25-(push.target===e.id&&push.spike===spike.id?32:0)+(goal!==goals[0]?35:0);
+                    const score=apDistance(self,goal)*.65+gap*1.65-(push.target===e.id&&push.spike===spike.id?24:0)+(goal!==goals[0]?35:0);
                     if(!best||score<best.score)best={enemy:e,spike,goal,aligned,gap,score};
                 }
             }
@@ -4668,16 +4681,18 @@
         [36,[140,300]],[37,[140,300]],[38,[160,700]],[39,[160,700]],[40,[140,300]],
         [41,[100,400]],[42,[100,400]],[43,[100,400]],[44,[165,700]],[45,[165,700]],
         [46,[80,300]],[47,[80,300]],[48,[80,300]],
-        [52,[80,150]],[53,[80,150]],[54,[80,150]],[57,[160,450]],
+        [52,[80,150]],[53,[80,150]],[54,[80,150]],[55,[80,150]],[57,[160,450]],
         [65,[80,1250]],[66,[80,1250]],[67,[80,1250]],
-        [68,[115,700]],[69,[115,700]],[70,[115,700]],[71,[80,150]]
+        [68,[115,700]],[69,[115,700]],[70,[115,700]],[71,[80,150]],
+        [72,[165,700]],[73,[160,700]],[74,[135,300]],[75,[135,300]],
+        [76,[135,300]],[77,[90,400]],[78,[94,400]]
     ]);
     const COUNTER_REACH=new Map([...AURA_STATS].map(([id,[reach]])=>[id,reach+30]));
     // The server owns actual weapon cooldowns. A fixed nominal reload plus
     // snapshot scheduling can miss an entire ready window. Send bounded
     // attempts instead, without claiming a successful hit from a send.
     const AURA_ATTEMPT_MS=90, AURA_BREAK_ATTEMPT_MS=110;
-    const AURA_DEMOLIST=11, AURA_DANGEROUS=new Set([17,28,36,37,40,44,45]);
+    const AURA_DEMOLIST=11, AURA_DANGEROUS=new Set([17,28,36,37,40,44,45,72]);
     const AURA_THREAT_RADIUS=225;
     const auraHat={previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0,sentAt:-Infinity,confirmedSince:null};
     function resetAuraHat(){Object.assign(auraHat,{previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0,sentAt:-Infinity,confirmedSince:null});}
@@ -5138,8 +5153,10 @@
         const all=areaCleanupCandidates(now);
         const targets=all.filter(t=>(counter.breakAvoid.get(t.key)??0)<=now&&
             (!reachable||!!areaCleanupWeapon(now,t,true)));
-        targets.sort((a,b)=>returnDist(a,self)-returnDist(b,self));
-        return targets.find(t=>t.key===areaSweep.target&&(!reachable||!!areaCleanupWeapon(now,t,true)))||targets[0]||null;
+        const priority=t=>auraTrapHostile(t,self)?(t.type===6||auraIsSpike(t)?90:t.type===18?75:t.type===13||t.type===16?40:0):0;
+        targets.sort((a,b)=>(returnDist(a,self)-priority(a))-(returnDist(b,self)-priority(b)));
+        const current=targets.find(t=>t.key===areaSweep.target&&(!reachable||!!areaCleanupWeapon(now,t,true)));
+        return current&&(!targets[0]||priority(targets[0])<=priority(current)+35)?current:targets[0]||null;
     }
     function areaCleanupGoal(now,anchor,self){
         const all=areaCleanupCandidates(now),r=settings.fixedDeathRadius;
@@ -5290,15 +5307,20 @@
     }
     function driveAuraHat(now=performance.now()){
         if(!player.alive || !connected() || ageRecovery.pending || clownEscapeActive() || clownFlight.active || session.ws.bufferedAmount>=1024)return;
-        const target=auraTrapTarget(now);
-        if(target)counter.lastStructureAt=now;
+        const escapeTarget=auraTrapTarget(now),sweepTarget=areaCleanupActive(now)?areaCleanupTarget(now,true):null;
+        const target=escapeTarget||sweepTarget;
+        if(escapeTarget)counter.lastStructureAt=now;
         const escaping=auraEscapeInProgress(now);
         const threats=auraThreatCount(now);
         auraHat.threats=threats;
         // A deletion or stale position is not proof of freedom. Keep the hat
         // during the clear-confirmation window, but never equip a new one
         // without fresh threat data. Two dangerous enemies override the delay.
-        const allow=escaping && selfPinned(now) && !!target && threats!==null && threats<=1;
+        const self=session.self;
+        const nearby= self&&[...counter.players.values()].some(e=>now-e.at<=350&&
+            e.id!==player.id&&e.sid!==self.sid&&!(self.team&&self.team===e.team)&&returnDist(self,e)<=300);
+        const allow=(escaping&&selfPinned(now)&&!!escapeTarget&&threats!==null&&threats<=1)||
+            (!!sweepTarget&&threats===0&&!nearby&&!session.attacking);
         // Manual hat choices get priority. Do not acquire ownership based on a
         // stale or unknown pre-break hat.
         if(allow && !auraHat.owned){
@@ -6046,6 +6068,7 @@
         }
         if (!packet || !packet.length) return;
         const id = Number(packet[0]);
+        if(id===33||id===35)serverCheckRecord(session.ws,'Servidor respondeu');
         if(id===30)observeDeathChatEcho(packet);
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false,apSnapshotProcessed=false;
@@ -6208,6 +6231,22 @@
             refreshInputs();
         }
     }
+    // Passive connection history: transport errors are not ban evidence.
+    const serverChecks=new Map();
+    function serverCheckKey(ws){
+        try{return new URL(ws.url).hostname;}catch(_){return null;}
+    }
+    function serverCheckRecord(ws,status){
+        const key=serverCheckKey(ws);if(!key)return;
+        serverChecks.delete(key);serverChecks.set(key,status);
+        while(serverChecks.size>12)serverChecks.delete(serverChecks.keys().next().value);
+    }
+    function serverCloseStatus(event){
+        const reason=String(event?.reason||'').trim();
+        if(/^(?:banned\b|you (?:are|have been) banned\b|ban(?:ned)? from (?:this|the) server\b)/i.test(reason))
+            return 'Ban informado pelo servidor';
+        return 'Desconectado ('+String(event?.code??'—')+'); ban não confirmado';
+    }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
@@ -6235,12 +6274,14 @@
         if(session.ws)retiredGameSockets.add(session.ws);
         clearGameConnection();
         session.ws=ws;session.connectionEpoch++;
+        serverCheckRecord(ws,'Conectando; ban não verificado');
         resetReturnForServer();
         if(!observedGameSockets.has(ws)) {
             observedGameSockets.add(ws);
             ws.addEventListener('message',onGameMessage);
-            ws.addEventListener('close',()=>{
+            ws.addEventListener('close',event=>{
                 if(session.ws!==ws)return;
+                serverCheckRecord(ws,serverCloseStatus(event));
                 clearGameConnection();session.ws=null;session.connectionEpoch++;
             });
         }
@@ -6558,6 +6599,8 @@
     }
     function refreshInputs() {
         if (!menu) return;
+        const checks=menu.querySelector('#nx-server-checks');
+        if(checks)checks.textContent=serverChecks.size?[...serverChecks].reverse().map(([host,status])=>host+' — '+status).join('\n'):'Nenhum servidor observado nesta aba';
         const apStatus=menu.querySelector('#nx-ap-status');
         const paused=areaCleanupActive();
         if(apStatus)apStatus.textContent='Auto Place: '+(paused?'pausado pela limpeza':!autoPlacementEnabled()?'desativado':ap.status)+' • cálculo '+ap.lastPlanMs.toFixed(1)+' ms • '+(ap.blockedAt!==null?'bloqueado '+Math.round(performance.now()-ap.blockedAt)+' ms':'última espera '+Math.round(ap.lastBlockMs)+' ms');
@@ -6932,6 +6975,9 @@
           <div class="content" data-panel="network" hidden>
             <div class="section-intro"><span><strong>REDE</strong><small>Lag e estabilidade da conexão</small></span></div>
             <label title="Pause F/V macros e Auto Place durante travamentos e congestionamento do WebSocket, dando prioridade à cura">Lag Guard<input data-heal-setting="lagGuard" type="checkbox"></label>
+            <div class="nx-group-title">Ban Check · conexões observadas</div>
+            <div class="nx-info-line" style="white-space:pre-line" id="nx-server-checks"></div>
+            <div class="nx-info-line">Somente servidores visitados nesta aba; erro de conexão não confirma banimento.</div>
           </div>
           <div class="content" data-panel="hud" hidden>
             <div class="section-intro"><span><strong>TELEMETRIA</strong><small>FPS, CPS e status do servidor</small></span></div>
