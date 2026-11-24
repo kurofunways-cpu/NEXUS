@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.72
+// @version      1.8.73
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.72';
+    const NEXUS_VERSION = '1.8.73';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1895,7 +1895,7 @@
     }
     function spinCanAim(now){
         return settings.returnSpin && player.alive && connected() && !session.attacking &&
-            !counter.restorePending && !auraAimTarget(now) &&
+            !auraAimTarget(now) &&
             session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
             !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
             !macro.selected && !Object.keys(macroDefs).some(macroActive) &&
@@ -1918,10 +1918,11 @@
     function driveSpin(now=performance.now()){
         if(!settings.returnSpin || !player.alive)return false;
         if(!spinCanAim(now))return false;
-        if(counter.aim){
-            spin.angle=((counter.aim[0]+256*counter.aim[1])*360/65535-180+360)%360;
-            spin.lastAt=now;spin.lastSentAt=-Infinity;counter.aim=null;
-        }
+        // Let the targeted attack packet finish before resuming rotation.
+        if(now-counter.lastAt<SPIN_INTERVAL_MS)return true;
+        // Keep the rotation phase independent of each automatic strike.
+        // Only the first spin after reset uses the last observed aim.
+        counter.aim=null;
         // Allow small frame-clock jitter without skipping every other 60 Hz
         // frame. The single timestamp also deduplicates timer/socket wakes.
         if(now-spin.lastSentAt<SPIN_INTERVAL_MS-0.75)return true;
@@ -3092,10 +3093,10 @@
             session.weaponIds[session.weapon] = id;
         }
     }
-    function restoreWeapon() {
+    function restoreWeapon(restoreAim=true) {
         if (!connected() || !transmit(counter.restorePending && counter.restorePacket ? counter.restorePacket : session.weaponPacket)) return false;
         // Restore direction/attack only if a real, manual attack was in progress.
-        const aim = automationAim(performance.now());
+        const aim = restoreAim?automationAim(performance.now()):null;
         if (aim) transmit(session.attacking ? [19, ...aim] : [13, ...aim]);
         return true;
     }
@@ -3308,7 +3309,7 @@
         if(bed.pending && bed.self && session.self && bed.self.at>=session.self.at)
             trySpawnBed(now);
         if(autoPlacementEnabled()&&ap.self&&session.self&&ap.self.at>=session.self.at)runAutoPlace(now);
-        if(!driveCounter(now))driveSpin(now); // Resume aim immediately after food.
+        driveCounter(now);driveSpin(now); // Resume aim immediately after food.
         return true;
     }
     function randomHold() {
@@ -3724,7 +3725,7 @@
     function planAutoPlace(self,entities,now,count=2){
         apExpire(now);
         const lead=Math.max(25,Math.min(100,ap.tick*.65));
-        const defending=apDefending(now),cleaning=trapCleanupActive(now);
+        const defending=apDefending(now),cleaning=trapCleanupActive(now),slots=apSlotBudget(now);
         const origin=defending?{x:self.x,y:self.y}:apPredict(self,Math.max(0,now-self.at)+lead*.35);
         const nearby=entities.filter(e=>apDistance(origin,e)<=AP_MAX_RANGE+150);
         const players=nearby.filter(e=>e.type===0 && e.id!==self.id && e.health>0 && now-e.at<=AP_PLAYER_TTL);
@@ -3752,7 +3753,7 @@
             const point={x:origin.x+r.dx,y:origin.y+r.dy};
             for(const key of ['KeyF','KeyV']){
                 const trap=key==='KeyF',radius=trap?40:45;
-                if(!(trap?settings.autoPlaceTrap:settings.autoPlaceSpike)||(trap&&cleaning))continue;
+                if(!(trap?settings.autoPlaceTrap:settings.autoPlaceSpike)||(trap&&cleaning)||!slots[key])continue;
                 const margin=apPlacementSpace(point,radius,ringObjects,allies,now);
                 if(margin===null)continue;
                 const failures=ap.misses.filter(p=>p.key===key&&apDistance(point,p)<27).length;
@@ -3785,11 +3786,12 @@
         candidates.sort((a,b)=>b.priority-a.priority||b.score-a.score);
         const chosen=[];
         for(const c of candidates){
+            if(!slots[c.key])continue;
             if(chosen.some(p=>p.target===c.target||apDistance(p.point,c.point)<75))continue;
             if(chosen.length&&c.priority===chosen[0].priority&&c.score<chosen[0].score-32)continue;
-            chosen.push(c);if(chosen.length>=count)break;
+            chosen.push(c);slots[c.key]--;if(chosen.length>=count)break;
         }
-        if(!chosen.length)ap.status=enemies.some(e=>e.pendingTrap)?'Waiting trap confirmation':'No valid spot';
+        if(!chosen.length)ap.status=ownTrapCount(now)>=OWN_TRAP_LIMIT&&ownSpikeCount(now)>=OWN_SPIKE_LIMIT?'Limite de estruturas':enemies.some(e=>e.pendingTrap)?'Waiting trap confirmation':'No valid spot';
         return chosen;
     }
     function stopAutoPush(send=true){
@@ -3930,8 +3932,9 @@
         const origin=apPredict(self,Math.max(0,now-self.at)+lead*.4);
         const allies=entities.filter(e=>e.type===0 && e.id!==self.id && apFriendly(e,self) && now-e.at<=AP_PLAYER_TTL)
             .map(e=>apPredict(e,Math.max(0,now-e.at)+lead));
-        const candidates=[];
+        const candidates=[],slots=apSlotBudget(now);
         for (const r of ap.replaceQueue.values()) {
+            if(!slots[r.key])continue;
             if (!(r.key==='KeyF'?settings.autoPlaceTrap:settings.autoPlaceSpike)) continue;
             if(r.key==='KeyF'&&(trapCleanupActive(now)||(counter.cleanupMarks.get(String(r.id))??0)>now))continue;
             if (r.tries>=AR_MAX_TRIES || now-r.last<Math.max(100,ap.tick*2.1)) continue;
@@ -4061,7 +4064,7 @@
         const combat=settings.autoPlace?planAutoPlace(ap.self,entities,now,defending?1:AP_BATCH_MAX):[];
         const combatStatus=ap.status;
         const replacements=planAutoReplace(ap.self,entities,now);
-        const candidates=mergePlacementPlans(combat,replacements,!settings.autoPlace||combatStatus==='No enemy');
+        const candidates=apLimitPlans(mergePlacementPlans(combat,replacements,!settings.autoPlace||combatStatus==='No enemy'),now);
         ap.lastPlanMs=performance.now()-planStart;
         if (!candidates.length) {
             if (!settings.autoPlace || combatStatus==='No enemy') {
@@ -4389,7 +4392,7 @@
         traps:new Map(),contacts:new Map(),escapeActive:false,clearSince:null,clearSamples:0,navSpikeKey:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
         restorePending:false,restoreTries:0,restoreNextAt:0,restoreAt:-Infinity,restoreExpected:null,restorePacket:null,
         breakKey:null,breakSince:0,breakAttempts:0,breakAvoid:new Map(),breakProgress:new Map(),
-        ownTraps:new Map(),cleanupMarks:new Map(),cleanupActive:false,
+        ownTraps:new Map(),ownSpikes:new Map(),cleanupMarks:new Map(),cleanupActive:false,
         clanId:null,clanMembers:new Set(),lastStructureAt:-Infinity,lastEnemyStrike:-Infinity,lastStructureStrike:-Infinity,aim:null,aimAt:-Infinity};
     const hatCopy={target:null,nextAt:0,tries:0,candidateId:null,candidateSince:0,status:'Aguardando jogador'};
     function resetCounter(){
@@ -4397,7 +4400,7 @@
         resetAuraEscape();counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
         clearAuraWeaponRestore();counter.hammerEchoUntil=0;
         counter.breakKey=null;counter.breakSince=0;counter.breakAttempts=0;counter.breakAvoid.clear();counter.breakProgress.clear();
-        counter.ownTraps.clear();counter.cleanupMarks.clear();counter.cleanupActive=false;
+        counter.ownTraps.clear();counter.ownSpikes.clear();counter.cleanupMarks.clear();counter.cleanupActive=false;
         counter.lastStructureAt=-Infinity;counter.lastEnemyStrike=-Infinity;counter.lastStructureStrike=-Infinity;
         counter.aim=null;counter.aimAt=-Infinity;
         resetAuraHat();
@@ -4623,8 +4626,9 @@
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8;
             // The public protocol uses the world index as the entity identity.
-            const key=String(id),old=counter.traps.get(key);
+            const key=String(id),old=counter.traps.get(key)||counter.ownTraps.get(key)||counter.ownSpikes.get(key);
             if(packet[i+8]&2 || type!==AURA_TRAP_TYPE || sid!==self.sid)counter.ownTraps.delete(key);
+            if(packet[i+8]&2 || !AURA_SPIKE_TYPES.has(type) || sid!==self.sid)counter.ownSpikes.delete(key);
             if(packet[i+8]&2 || (type!==AURA_TRAP_TYPE && !AURA_SPIKE_TYPES.has(type))){
                 if(old)dropAuraTrap(key);
                 continue;
@@ -4636,7 +4640,7 @@
             if(replaced)dropAuraTrap(key);
             // Only a positive-to-zero HP transition corroborates destruction;
             // a zero on a new structure may not represent health.
-            if(old && !replaced && old.hp>0 && t.hp===0){counter.ownTraps.delete(key);dropAuraTrap(key);continue;}
+            if(old && !replaced && old.hp>0 && t.hp===0){counter.ownTraps.delete(key);counter.ownSpikes.delete(key);dropAuraTrap(key);continue;}
             if(old && !replaced && t.hp<old.hp){
                 counter.breakProgress.delete(key);counter.breakAvoid.delete(key);
             }
@@ -4645,8 +4649,10 @@
             }
             counter.traps.set(key,t);
             if(type===AURA_TRAP_TYPE&&sid===self.sid)counter.ownTraps.set(key,t);
+            if(AURA_SPIKE_TYPES.has(type)&&sid===self.sid)counter.ownSpikes.set(key,t);
         }
         for(const [key,t] of counter.ownTraps)if(now-t.at>AURA_TRAP_TTL)counter.ownTraps.delete(key);
+        for(const [key,t] of counter.ownSpikes)if(now-t.at>AURA_TRAP_TTL)counter.ownSpikes.delete(key);
         for(const [key,until] of counter.cleanupMarks)if(now>until)counter.cleanupMarks.delete(key);
         for(const [key,t] of counter.traps){
             if(now-t.at>AURA_TRAP_TTL)dropAuraTrap(key);
@@ -4711,14 +4717,26 @@
             for(const {t} of nearby)counter.contacts.get(t.key).confirmed=true;
         }
     }
-    const OWN_TRAP_LIMIT=6, OWN_TRAP_RESERVE=2;
-    function ownTrapCount(now){
+    const OWN_TRAP_LIMIT=12, OWN_TRAP_RESERVE=2, OWN_SPIKE_LIMIT=30;
+    function ownStructureCount(records,now){
         const self=session.self;
         if(!self)return 0;
         let count=0;
-        for(const t of counter.ownTraps.values())
+        for(const t of records.values())
             if(t.sid===self.sid&&now-t.at<=AURA_TRAP_TTL)count++;
         return count;
+    }
+    function ownTrapCount(now){return ownStructureCount(counter.ownTraps,now);}
+    function ownSpikeCount(now){return ownStructureCount(counter.ownSpikes,now);}
+    function apSlotBudget(now){
+        return {
+            KeyF:Math.max(0,OWN_TRAP_LIMIT-ownTrapCount(now)-ap.pending.filter(p=>p.key==='KeyF'&&apPendingActive(p,now)).length),
+            KeyV:Math.max(0,OWN_SPIKE_LIMIT-ownSpikeCount(now)-ap.pending.filter(p=>p.key==='KeyV'&&apPendingActive(p,now)).length)
+        };
+    }
+    function apLimitPlans(plans,now){
+        const slots=apSlotBudget(now);
+        return plans.filter(p=>slots[p.key]>0&&--slots[p.key]>=0);
     }
     function trapCleanupActive(now){
         if(!settings.trapSlotRecovery||!settings.autoPlace||!player.alive||!session.self){
@@ -4966,7 +4984,7 @@
         }else if(w?.select && !transmit(w.packet||session.weaponPacket))return false;
         const hit=transmit([19,...aim]);
         transmit([18]);
-        if(temporary)restoreWeapon(); // retain watchdog even after successful send
+        if(temporary)restoreWeapon(!settings.returnSpin); // retain watchdog even after successful send
         if(hit){progress.attempts++;counter.breakAttempts=progress.attempts;}
         counter.lastAt=now;counter.lastStructureStrike=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
         counter.aim=aim;counter.aimAt=now;
@@ -4996,12 +5014,13 @@
             (bed.pending && bed.phase==='placing' && bed.locked) ||
             macro.selected || Object.keys(macroDefs).some(macroActive) ||
             ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024)return null;
-        const trap=auraTrapTarget(now);
+        const trap=auraTrapTarget(now),cleanup=trapCleanupTarget(now);
+        if(settings.returnSpin&&(trap||cleanup))return null;
         if(counterUrgentStructure(trap,now))return trap;
         const w=counterWeapon(now),saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
         const reach=COUNTER_REACH.get(w?.id??saved);
         const enemy=settings.killAura&&settings.auraLockAim&&reach?selectAuraTarget(now,reach):null;
-        return enemy||trap||trapCleanupTarget(now);
+        return enemy||trap||cleanup;
     }
     function targetAim(t){
         return apAngleBytes(Math.atan2(t.y-session.self.y,t.x-session.self.x));
@@ -5099,21 +5118,15 @@
     // FUN: real public game chat. Prefer the native chat control on visible
     // tabs and observe its actual outbound packet. Background tabs use the
     // documented binary chat command, not DOM overlays or clan chat.
-    const DEATH_COUNT_KEY=PREFIX+'death_count_v1';
     const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=1500;
     const deathChat={total:0,pending:false,readyAt:Infinity,lastAt:-Infinity,epoch:-1,
         echo:null,nativeTry:null,status:'Aguardando morte'};
-    try{
-        const count=Number(sessionStorage.getItem(DEATH_COUNT_KEY));
-        if(Number.isSafeInteger(count)&&count>=0)deathChat.total=count;
-    }catch(_){}
-    function saveDeathCount(){
-        try{sessionStorage.setItem(DEATH_COUNT_KEY,String(deathChat.total));}catch(_){}
-    }
+    // Count only deaths in this document. A new or duplicated tab and a
+    // full reload start at zero; respawns in this document retain the count.
+    try{sessionStorage.removeItem(PREFIX+'death_count_v1');}catch(_){}
     function countDeath(){
         if(!player.alive)return false;
         deathChat.total=Math.min(Number.MAX_SAFE_INTEGER,deathChat.total+1);
-        saveDeathCount();
         deathChat.pending=!!settings.deathChat;
         deathChat.epoch=session.connectionEpoch;
         deathChat.readyAt=Infinity;deathChat.echo=null;deathChat.nativeTry=null;
@@ -5204,7 +5217,7 @@
     }
     function resetDeathCount(){
         deathChat.total=0;deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;
-        deathChat.status='Aguardando morte';saveDeathCount();
+        deathChat.readyAt=Infinity;deathChat.status='Aguardando morte';
     }
     // FUN: change the nickname once per observed death, before native Play.
     const GOOFY_NAMES=Object.freeze([
@@ -5720,7 +5733,7 @@
             const now=performance.now();
             if(apSnapshotProcessed||observeAutoPlace(packet,now)){runAutoPlace(now);driveAutoPush(now);}
         }
-        if(player.alive){if(!driveCounter())driveSpin();driveHatCopy();announceDeathCount();}
+        if(player.alive){driveCounter();driveSpin();driveHatCopy();announceDeathCount();}
         if(menu && !menu.hidden && id===20 &&
             performance.now()-lastMenuSnapshotPaint>=180){
             lastMenuSnapshotPaint=performance.now();
@@ -6096,7 +6109,7 @@
             bedStatus.textContent=state+memoryInfo+(bed.pending ? ` • Paredes ${bedObstacles().filter(o=>o.type===8||o.type===22).length} • Bloqueios locais ${bed.localBlocked.length}` : '');
         }
         const slots=menu.querySelector('#nx-trap-slots');
-        if(slots)slots.textContent='Traps próprias observadas: '+ownTrapCount(performance.now())+'/6'+(trapCleanupActive(performance.now())?' • liberando vagas':'');
+        if(slots){const now=performance.now();slots.textContent='Traps próprias: '+ownTrapCount(now)+'/'+OWN_TRAP_LIMIT+' • Spikes próprios: '+ownSpikeCount(now)+'/'+OWN_SPIKE_LIMIT+(trapCleanupActive(now)?' • liberando vagas':'');}
         const fixedStatus=menu.querySelector('#nx-fixed-status');
         if(fixedStatus)fixedStatus.textContent=!settings.fixedDeathReturn?'Ponto fixo: desativado':fixedDeath.anchor?'Ponto fixo: '+Math.round(fixedDeath.anchor.x)+', '+Math.round(fixedDeath.anchor.y)+(fixedDeath.targetId!==null?' • alvo #'+fixedDeath.targetId:''):'Ponto fixo: aguardando primeira morte';
         const returnStatus=menu.querySelector('#nx-return-status');
@@ -6419,7 +6432,7 @@
             <div class="nx-info-line" id="nx-ap-status">Auto Place: aguardando</div>
             <label title="Rebuild removed own traps; spikes only at approved finisher positions">Auto Replace<input data-heal-setting="autoReplace" type="checkbox"></label>
             <label title="Prioritize trapping free opponents before placing spikes">Auto Trap<input data-heal-setting="autoPlaceTrap" type="checkbox"></label>
-            <label title="Ao observar seis traps próprias, suspende perseguição e tenta liberar duas vagas. Mantém defesa e cura.">Liberar vagas de traps<input data-heal-setting="trapSlotRecovery" type="checkbox"></label>
+            <label title="Ao observar 12 traps próprias, suspende perseguição e tenta liberar duas vagas. Mantém defesa e cura.">Liberar vagas de traps<input data-heal-setting="trapSlotRecovery" type="checkbox"></label>
             <div class="nx-info-line" id="nx-trap-slots"></div>
             <label title="Spikes para inimigos capturados ou em contato previsto, sem limite artificial de HP">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
             <label title="Alinha o personagem atrás de inimigos presos em traps próprias para empurrá-los exclusivamente contra spikes próprios confirmados. Respeita movimento manual, cama e retorno inicial. No ponto fixo, pode empurrar o alvo prioritário dentro do círculo.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
@@ -6730,13 +6743,13 @@
         if(deathChat.pending || deathChat.echo)announceDeathCount();
     },500);
     function spinFrame(){
-        if(!document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}
+        if(!document.hidden && player.alive){driveCounter();driveSpin();}
         drawFixedDeathCircle();requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
     setInterval(()=>{if(push.owned)driveAutoPush();},100);
     // Hidden tabs use snapshots plus a timer; no packet bursts on resume.
-    setInterval(()=>{if(document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}},SPIN_INTERVAL_MS);
+    setInterval(()=>{if(document.hidden && player.alive){driveCounter();driveSpin();}},SPIN_INTERVAL_MS);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
     else mount();
 })();
