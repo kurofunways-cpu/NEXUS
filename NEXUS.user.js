@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.94
+// @version      1.8.95
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -152,6 +152,11 @@
 //   da caixa não significa deleção. Janela maior, tolerância na borda,
 //   movimento/ataque prioritários, diagnósticos no HUD. Associação ainda
 //   inferida; sem kill local ou com caixas ambíguas não coleta.
+// - 1.8.95: Spin com fase monotônica independente de cura, construção,
+//   quebra, combate, macros e dano. Visual em cada frame; envio de mira
+//   ~60 Hz sem rajadas após suspensão/fila. Ações 19 mantêm ângulo explícito;
+//   13 da Aura não disputa giro. Clique manual mantém ângulo inicial real.
+//   Navegador/servidor podem limitar FPS e pacotes; não garante render remoto.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -161,7 +166,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.94';
+    const NEXUS_VERSION = '1.8.95';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1058,7 +1063,7 @@
     // A death inside this radius keeps the ORIGINAL destination, not the latest death.
     const RETURN_DEATH_RADIUS=120;
     const SPIN_INTERVAL_MS=1000/60;
-    const spin={lastSentAt:-Infinity,lastAt:null,angle:0,aim:null};
+    const spin={lastSentAt:-Infinity,nextSendAt:-Infinity,lastAt:null,angle:0,aim:null};
     // Return is sticky within a small tolerance. A real knockback should
     // restart navigation on its FIRST server-confirmed displacement, not after
     // multiple snapshots while opponents push the character farther away.
@@ -2411,13 +2416,13 @@
         spinVisual.active=false;spinVisual.lastAt=-Infinity;spinVisual.savedAim=null;
     }
     function drawLocalSpin(now=performance.now()){
-        if(document.hidden||!spinCanAim(now)||!spin.aim){
+        if(document.hidden||!spinEnabled()){
             releaseSpinVisual();return false;
         }
-        if(now-spin.lastSentAt>250){releaseSpinVisual();return false;}
+        advanceSpin(now);
         const canvas=spinCanvas(),rect=canvas?.getBoundingClientRect();
         if(!rect||!rect.width||!rect.height){releaseSpinVisual();return false;}
-        if(now-spinVisual.lastAt<SPIN_INTERVAL_MS-.75)return true;
+        if(now<=spinVisual.lastAt)return true; // one visual update per frame
         if(!spinVisual.active){
             spinVisual.savedAim=session.nativeAim?[...session.nativeAim]:null;
             spinVisual.active=true;
@@ -2440,48 +2445,44 @@
     window.addEventListener('mousedown',event=>{
         if(event.isTrusted&&event.target===spinCanvas()&&spinVisual.active){
             spinVisual.real={x:event.clientX,y:event.clientY};
-            releaseSpinVisual();
+            const rect=spinCanvas()?.getBoundingClientRect(),aim=rect&&spinPointerAim(spinVisual.real,rect);
+            if(aim){spinVisual.savedAim=aim;session.nativeAim=aim;}
         }
     },true);
     function resetSpin(){
-        releaseSpinVisual();spin.lastSentAt=-Infinity;spin.lastAt=null;spin.angle=0;spin.aim=null;
+        releaseSpinVisual();spin.lastSentAt=-Infinity;spin.nextSendAt=-Infinity;spin.lastAt=null;spin.angle=0;spin.aim=null;
+    }
+    function spinEnabled(){
+        return !!(settings.returnSpin&&player.alive&&connected());
     }
     function spinCanAim(now){
-        return settings.returnSpin && player.alive && connected() && !session.attacking && !areaCleanupActive(now) &&
-            !auraAimTarget(now) &&
-            session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
-            !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
-            !macro.selected && !Object.keys(macroDefs).some(macroActive) &&
-            session.ws.bufferedAmount<2048;
+        return spinEnabled()&&session.ws.bufferedAmount<2048;
     }
     function advanceSpin(now){
-        // Keep phase continuous through short interruptions, without replaying
-        // missed packets. Very long browser suspension restarts from last angle.
         if(spin.lastAt===null){
-            const initial=session.nativeAim || session.serverAim;
+            const initial=session.nativeAim||session.serverAim;
             if(initial)spin.angle=((initial[0]+256*initial[1])*360/65535-180+360)%360;
-        }else{
-            const elapsed=Math.max(0,Math.min(250,now-spin.lastAt));
-            spin.angle=(spin.angle+((settings.spinDegreesPerSecond/1000)*elapsed)%360)%360;
+        }else if(now<=spin.lastAt&&spin.aim)return spin.aim;
+        else{
+            const elapsed=now-spin.lastAt;
+            spin.angle=(spin.angle+(settings.spinDegreesPerSecond*elapsed/1000)%360+360)%360;
         }
         spin.lastAt=now;
         spin.aim=apAngleBytes(spin.angle*Math.PI/180);
         return spin.aim;
     }
     function driveSpin(now=performance.now()){
-        if(!settings.returnSpin || !player.alive)return false;
-        if(!spinCanAim(now))return false;
-        // Let the targeted attack packet finish before resuming rotation.
-        if(now-counter.lastAt<SPIN_INTERVAL_MS)return true;
-        // Keep the rotation phase independent of each automatic strike.
-        // Only the first spin after reset uses the last observed aim.
-        counter.aim=null;
-        // Allow small frame-clock jitter without skipping every other 60 Hz
-        // frame. The single timestamp also deduplicates timer/socket wakes.
-        if(now-spin.lastSentAt<SPIN_INTERVAL_MS-0.75)return true;
-        const aim=advanceSpin(now);
-        if(!transmit([13,...aim]))return false;
-        spin.lastSentAt=now;return true;
+        if(!spinEnabled())return false;
+        // Keep phase advancing during network backpressure. Item/attack
+        // transactions supply their own explicit angles synchronously.
+        const aim=advanceSpin(now),tick=spin.lastAt;
+        if(!spinCanAim(tick))return true;
+        if(tick+0.75<spin.nextSendAt||tick-spin.lastSentAt<8)return true;
+        if(!transmit([13,...aim]))return true;
+        counter.aim=null;spin.lastSentAt=tick;
+        const next=spin.nextSendAt+SPIN_INTERVAL_MS;
+        spin.nextSendAt=Number.isFinite(next)&&next>tick+8?next:tick+SPIN_INTERVAL_MS;
+        return true;
     }
     function driveReturn(now=performance.now()){
         if(clownEscapeActive())return;
@@ -3853,7 +3854,11 @@
         if (!connected() || !transmit(counter.restorePending && counter.restorePacket ? counter.restorePacket : session.weaponPacket)) return false;
         // Restore direction/attack only if a real, manual attack was in progress.
         const aim = restoreAim?automationAim(performance.now()):null;
-        if (aim) transmit(session.attacking ? [19, ...aim] : [13, ...aim]);
+        if(aim){
+            if(session.attacking)transmit([19,...aim]);
+            else if(spinEnabled())driveSpin();
+            else transmit([13,...aim]);
+        }
         return true;
     }
     // Background tabs throttle window timers, and may throttle workers as well.
@@ -4286,13 +4291,14 @@
                 const attacking=session.attacking;
                 const placement=[19,...aim];
                 const packets=[...(attacking?[[18]]:[]),[0,def.id],placement,[18],
-                    session.weaponPacket, attacking?[19,...aim]:[13,...aim]];
+                    session.weaponPacket,...(attacking?[[19,...aim]]:spinEnabled()?[]:[[13,...aim]])];
                 let complete=true;
                 for (const packet of packets) {
                     if (!transmit(packet)) { complete=false; break; }
                     if (packet===placement) countMacroClick(key);
                 }
                 if (!complete) { transmit([18]); restoreWeapon(); }
+                if(spinEnabled())driveSpin();
                 macro.next[key]=now+settings[def.speed];
                 macro.turn=key==='KeyV'?1:0;
             }
@@ -4931,7 +4937,6 @@
     },true);
     window.addEventListener('blur',()=>{
         if(session.attacking && connected())transmit([18]);
-        if(session.attacking)resetSpin();
         session.attacking=false;
         clearMacros();
         // Keyup may not be delivered after switching tabs. Stop a movement
@@ -5974,6 +5979,8 @@
         return apAngleBytes(Math.atan2(t.y-session.self.y,t.x-session.self.x));
     }
     function driveAuraAim(now=performance.now()){
+        // Attack opcode 19 has its own angle; idle aim belongs to Spin.
+        if(spinEnabled())return false;
         const t=auraAimTarget(now);
         if(!t)return false;
         const aim=targetAim(t);
@@ -5984,10 +5991,10 @@
         return true;
     }
     function automationAim(now=performance.now()){
+        if(spinEnabled())return advanceSpin(now);
         if(session.attacking)return currentAim();
         const t=auraAimTarget(now);
         if(t)return targetAim(t);
-        if(settings.returnSpin && spin.aim)return spin.aim;
         return currentAim();
     }
     function driveHatCopy(now=performance.now()){
@@ -6982,7 +6989,6 @@
                 case 13:
                 case 19:
                     if(raw[0]===19&&spinVisual.active){
-                        releaseSpinVisual();
                         if(raw.length===3&&session.nativeAim){
                             data=new Uint8Array([19,...session.nativeAim]);
                             arguments[0]=data;
@@ -6990,17 +6996,14 @@
                     }else if(raw.length>=3&&!(raw[0]===13&&spinVisual.active)){
                         session.nativeAim=[raw[1],raw[2]];
                     }
-                    // Manual attack direction always belongs to the native
-                    // client. Aim-only spin must not redirect a held attack.
+                    // Preserve phase across manual attacks and releases.
                     if (raw[0] === 19) {
-                        if(!session.attacking)resetSpin();
                         session.attacking=true;
-                    } else if(raw.length===3 && (driveAuraAim() || driveSpin())){
+                    } else if(raw.length===3 && (driveSpin() || driveAuraAim())){
                         return;
                     }
                     break;
                 case 18:
-                    if(session.attacking)resetSpin();
                     session.attacking=false;
                     break;
             }
@@ -7558,7 +7561,7 @@
           </div>
           <div class="content" data-panel="fun" hidden>
             <div class="section-intro"><span><strong>FUN</strong><small>Rotação e nomes engraçados</small></span></div>
-            <label title="Giro contínuo com qualquer item, inclusive durante a espera da cura. Ataque manual e alvo do Kill Aura têm prioridade; retoma o giro quando livres.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
+            <label title="Giro contínuo com qualquer item, inclusive durante cura, ataques, construção e quebra. Ações mantêm ângulo explícito; rotação visual independente.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
             <label title="Velocidade angular em graus por segundo, sem máximo configurado. 360 = uma volta por segundo.">Velocidade 360°/s<input data-heal-setting="spinDegreesPerSecond" type="number" min="0" step="any"></label>
             <div class="nx-info-line">360 = 1 volta/s • 720 = 2 voltas/s</div>
             <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
@@ -7912,8 +7915,9 @@
         if(clownFlight.active||clownEscapeActive())driveClownEscape();
     },500);
     function spinFrame(){
-        if(!document.hidden && player.alive){driveCounter();driveSpin();}
-        drawLocalSpin();drawFixedDeathCircle();requestAnimationFrame(spinFrame);
+        if(!document.hidden && player.alive){driveSpin();drawLocalSpin();driveCounter();}
+        else if(!player.alive)releaseSpinVisual();
+        drawFixedDeathCircle();requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
     // Stop owned movement during stalls; do not issue new movement on stale data.
@@ -7929,7 +7933,7 @@
             retrySpawnBed('Aguardando posição atualizada',now);
     },100);
     // Hidden tabs use snapshots plus a timer; no packet bursts on resume.
-    setInterval(()=>{if(document.hidden && player.alive){driveCounter();driveSpin();}},SPIN_INTERVAL_MS);
+    setInterval(()=>{if(document.hidden && player.alive){driveSpin();driveCounter();}},SPIN_INTERVAL_MS);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
     else mount();
 })();
