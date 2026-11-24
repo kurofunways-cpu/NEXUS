@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.64
+// @version      1.8.65
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.64';
+    const NEXUS_VERSION = '1.8.65';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1811,6 +1811,7 @@
         // Arrival is NOT terminal. Continue observing server-confirmed position
         // every snapshot, including when the page is hidden.
         if(!deathReturn.self || now-deathReturn.self.at>RETURN_SNAPSHOT_TTL)return;
+        if(push.owned && driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
         refreshFixedDeathGoal(now);
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
@@ -3337,7 +3338,7 @@
     const apTrackingEnabled=()=>autoPlacementEnabled()||settings.autoPush;
     const ap={entities:new Map(), self:null, nextAt:0, manualUntil:0, manualItem:false,
         pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off',plannedAt:-Infinity,revision:0,plannedRevision:-1,lastPlanMs:0,blockedAt:null,blockedReason:'',lastBlockMs:0};
-    const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,progressAt:0,cooldown:0,status:'Desativado'};
+    const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,bestGap:Infinity,stage:null,progressAt:0,cooldown:0,status:'Desativado'};
     function resetAutoPlace() {
         stopAutoPush();push.manual=false;push.cooldown=0;ap.plannedAt=-Infinity;
         ap.revision=0;ap.plannedRevision=-1;ap.lastPlanMs=0;ap.blockedAt=null;ap.blockedReason='';ap.lastBlockMs=0;
@@ -3475,7 +3476,7 @@
     const AP_TRAP_CONTACT=65, AP_SPIKE_CONTACT=78;
     function apCapture(e,traps){
         const t=traps.filter(o=>apDistance(o,e)<=65).sort((a,b)=>apDistance(a,e)-apDistance(b,e))[0];
-        return t && ((e.state&32)||((e.stillFrames||0)>=2 && e.motion<=.12 && apDistance(t,e)<=42))?t:null;
+        return t && ((e.state&32)||apDistance(t,e)<=42||((e.stillFrames||0)>=1&&e.motion<=.18&&apDistance(t,e)<=60))?t:null;
     }
     function apStatic(e,now){
         return e.type!==0 && !BED_NAV_DYNAMIC.has(e.type) && e.type!==12 && now-e.at<=AP_OBJECT_TTL;
@@ -3557,7 +3558,7 @@
     function stopAutoPush(send=true){
         if(push.owned&&send&&player.alive&&connected()&&push.epoch===session.connectionEpoch)transmit([15]);
         push.owned=false;push.target=null;push.spike=null;push.lastAt=-Infinity;
-        push.best=Infinity;push.progressAt=0;push.startedAt=0;
+        push.best=Infinity;push.bestGap=Infinity;push.stage=null;push.progressAt=0;push.startedAt=0;
     }
     function apPushPathClear(a,b,objects,self){
         if(b.x<1||b.y<1||b.x>65534||b.y>65534)return false;
@@ -3568,57 +3569,96 @@
         }
         return true;
     }
+    // Only one movement owner at a time. Fixed-point defense may lend
+    // movement to push after reaching B, within the selected circle.
+    // Normal return, bed placement, and the initial journey retain priority.
+    function pushReturnAllowed(self,enemy,goal,now){
+        if(!returnEnabled()||!deathReturn.target)return true;
+        if(!settings.fixedDeathReturn || !settings.fixedDeathFollow || !fixedDeath.entered ||
+            !fixedDeath.anchor || fixedDeath.epoch!==session.connectionEpoch ||
+            !['ready','moving','arrived'].includes(deathReturn.phase) ||
+            deathReturn.moveOwned || deathReturn.manualMove)return false;
+        const a=fixedDeath.anchor,r=settings.fixedDeathRadius,preferred=fixedDeathEnemy(now);
+        if(!preferred||preferred.id!==enemy.id)return false;
+        return apDistance(self,a)<=r+20&&apDistance(enemy,a)<=r&&apDistance(goal,a)<=r;
+    }
     function planAutoPush(self,entities,now){
         const objects=entities.filter(e=>apStatic(e,now)&&apDistance(e,self)<=410);
         const traps=objects.filter(o=>o.type===6&&apFriendly(o,self));
         const spikes=objects.filter(o=>placementTypes.KeyV.has(o.type)&&apFriendly(o,self));
-        const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=220);
+        const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=280);
         let best=null;
         for(const e of enemies){
             if(!apCapture(e,traps))continue;
             for(const spike of spikes){
                 const gap=apDistance(e,spike);
-                if(gap<30||gap>150)continue;
+                if(gap<25||gap>150)continue;
                 const ux=(e.x-spike.x)/gap,uy=(e.y-spike.y)/gap;
-                const behind={x:e.x+ux*68,y:e.y+uy*68};
-                if(apDistance(behind,self)>245)continue;
+                const behind={x:e.x+ux*70,y:e.y+uy*70};
+                if(apDistance(behind,self)>285)continue;
                 const dot=(self.x-e.x)*ux+(self.y-e.y)*uy,side=Math.abs((self.x-e.x)*uy-(self.y-e.y)*ux);
-                const aligned=dot>=35&&side<=24;
-                const goal=aligned?{x:e.x+ux*32,y:e.y+uy*32}:behind;
-                if(!apPushPathClear(self,goal,objects,self))continue;
-                const score=apDistance(self,goal)+gap*.6-(push.target===e.id?15:0);
-                if(!best||score<best.score)best={enemy:e,spike,goal,aligned,score};
+                const aligned=dot>=0&&side<=32;
+                // Keep moving towards the enemy after reaching the alignment
+                // point. Do not stop 32 units away or turn back at contact.
+                let goals=aligned?[{x:e.x,y:e.y}]:[behind];
+                if(!aligned){
+                    const sign=(self.x-e.x)*(-uy)+(self.y-e.y)*ux>=0?1:-1;
+                    goals.push({x:behind.x-uy*58*sign,y:behind.y+ux*58*sign});
+                    goals.push({x:behind.x+uy*58*sign,y:behind.y-ux*58*sign});
+                }
+                for(const goal of goals){
+                    if(!pushReturnAllowed(self,e,goal,now)||!apPushPathClear(self,goal,objects,self))continue;
+                    const score=apDistance(self,goal)+gap*.6-(push.target===e.id?15:0)+(goal!==goals[0]?35:0);
+                    if(!best||score<best.score)best={enemy:e,spike,goal,aligned,gap,score};
+                }
             }
         }
         return best;
     }
-    function driveAutoPush(now=performance.now()){
+    function autoPushBlock(now){
         const self=ap.self;
-        const blocked=!settings.autoPush||!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL||
-            push.manual||session.attacking||bed.pending||bed.locked||bed.handoffMove||deathReturn.moveOwned||
-            (returnEnabled()&&deathReturn.target)||ageRecovery.pending||session.self?.trapped||auraTrapTarget(now)||
-            ap.manualItem||now<ap.manualUntil||macro.selected||Object.keys(macroDefs).some(macroActive)||
-            heal.phase!=='idle'||heal.foodSelected||(isEligible()&&now>=heal.nextAt&&heal.snapshotSerial>heal.sentSnapshotSerial)||
-            pauseAutoPlaceForLag(now)||session.ws.bufferedAmount>=1024||
-            (!document.hidden&&(editing({target:document.activeElement})||(menu&&!menu.hidden)));
-        if(blocked||now<push.cooldown){stopAutoPush();push.status=settings.autoPush?'Pausado':'Desativado';return false;}
-        const plan=planAutoPush(self,[...ap.entities.values()],now);
-        if(!plan){stopAutoPush();push.status='Sem combinação trap + spike';return false;}
-        const distance=apDistance(self,plan.goal);
+        if(!settings.autoPush)return 'Desativado';
+        if(!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL)return 'Aguardando posição';
+        if(push.manual||deathReturn.manualMove||session.attacking)return 'Controle manual';
+        if(bed.pending||bed.locked||bed.handoffMove)return 'Cama no respawn';
+        if(returnEnabled()&&deathReturn.target&&(!settings.fixedDeathReturn||!settings.fixedDeathFollow||
+            !fixedDeath.entered||!fixedDeath.anchor||deathReturn.moveOwned||
+            !['ready','moving','arrived'].includes(deathReturn.phase)))return 'Retorno ao ponto';
+        if(ageRecovery.pending)return 'Recuperação de idade';
+        if(session.self?.trapped)return 'Preso em trap';
+        const structure=auraTrapTarget(now);
+        if(structure && now-heal.lastDamageAt<=250 && auraTrapDistance(structure,session.self)<=82)return 'Fuga de estruturas';
+        if(ap.manualItem||now<ap.manualUntil||macro.selected||Object.keys(macroDefs).some(macroActive))return 'Item/macro manual';
+        // Food holds use the item channel, not the movement channel. Only
+        // dangerous health interrupts push, rather than every Legit Heal.
+        if(player.health<=35)return 'Vida crítica';
+        if(apLagBlocked(now)||session.ws.bufferedAmount>=1024)return 'Lag Guard/fila';
+        if(apTyping())return 'Digitando no jogo';
+        if(now<push.cooldown)return 'Reavaliando movimento';
+        return '';
+    }
+    function driveAutoPush(now=performance.now()){
+        const blocked=autoPushBlock(now);
+        if(blocked){stopAutoPush();push.status=blocked;return false;}
+        const self=ap.self,plan=planAutoPush(self,[...ap.entities.values()],now);
+        if(!plan){stopAutoPush();push.status='Sem combinação trap + spike alcançável';return false;}
+        const distance=apDistance(self,plan.goal),stage=plan.aligned?'push':'align';
         if(push.target!==plan.enemy.id||push.spike!==plan.spike.id){
             stopAutoPush();push.target=plan.enemy.id;push.spike=plan.spike.id;
-            push.startedAt=now;push.progressAt=now;push.best=distance;
+            push.startedAt=now;push.progressAt=now;push.best=distance;push.bestGap=plan.gap;push.stage=stage;
         }
-        if(distance<push.best-3){push.best=distance;push.progressAt=now;}
-        if(now-push.startedAt>3200||(distance>14&&now-push.progressAt>650)){
-            stopAutoPush();push.cooldown=now+800;push.status='Sem progresso; pausado';return false;
+        if(stage!==push.stage){push.stage=stage;push.best=distance;push.progressAt=now;}
+        if(distance<push.best-3||plan.gap<push.bestGap-3){
+            push.best=Math.min(distance,push.best);push.bestGap=Math.min(plan.gap,push.bestGap);push.progressAt=now;
         }
-        if(distance<=12){
-            if(push.owned){transmit([15]);push.owned=false;}
-            push.status='Alinhado com spike';return true;
+        if(now-push.startedAt>3200||now-push.progressAt>850){
+            stopAutoPush();push.cooldown=now+500;push.status='Sem progresso; reavaliando';return false;
         }
+        if(distance<2){stopAutoPush();push.status='Contato com alvo';return false;}
         if(now-push.lastAt<80)return true;
-        if(!transmit([1,...apAngleBytes(Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x))])){stopAutoPush();return false;}
+        if(!transmit([1,...apAngleBytes(Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x))])){
+            stopAutoPush();push.status='Falha no envio';return false;
+        }
         push.owned=true;push.epoch=session.connectionEpoch;push.lastAt=now;
         push.status=plan.aligned?'Empurrando para spike':'Alinhando atrás do alvo';
         return true;
@@ -3702,9 +3742,15 @@
         return state==='RECOVERY' ?
             !(lag.stableTicks>=1 && session.ws.bufferedAmount<1024) : state!=='OK';
     }
+    // The NEXUS panel is a live diagnostic display, not a combat pause.
+    // Only actual typing in the game's chat/input outside our panel pauses AP.
+    function apTyping(){
+        const active=document.activeElement;
+        return !document.hidden && editing({target:active}) && !(menu&&menu.contains(active));
+    }
     function apCombatBlocked(now){
         if(now-ap.self.at>AP_PLAYER_TTL)return 'Waiting update';
-        if(!document.hidden && (editing({target:document.activeElement})||(menu&&!menu.hidden)))return 'Paused';
+        if(apTyping())return 'Digitando no jogo';
         if(ap.manualItem||now<ap.manualUntil)return 'Manual item';
         if(macro.selected||Object.keys(macroDefs).some(macroActive))return 'Manual macro';
         if(ageRecovery.pending)return 'Age recovery';
@@ -3722,7 +3768,7 @@
     function runAutoPlace(now=performance.now()) {
         if(!autoPlacementEnabled()||!player.alive||!connected()||!ap.self)return false;
         const blocked=apCombatBlocked(now);
-        if(blocked)return apBlocked(blocked,now,blocked==='Paused'||blocked==='Waiting update'?null:blocked==='Heal'?8:20);
+        if(blocked)return apBlocked(blocked,now,blocked==='Digitando no jogo'||blocked==='Waiting update'?null:blocked==='Heal'?8:20);
         if(now<ap.nextAt){scheduleAutoPlace(ap.nextAt-now);return false;}
         const rate=document.hidden?Math.min(240,settings.autoPlaceRate):settings.autoPlaceRate;
         macro.tokens=Math.min(AP_BURST,macro.tokens+Math.max(0,now-macro.last)*rate/1000);
@@ -3823,7 +3869,8 @@
         // that was handed off manually, but keep bed navigation pending.
         if (bed.handoffMove) {transmit([15]);bed.handoffMove=false;}
         bed.moveKeys.clear();
-        // A missed keyup after changing tabs must not keep return paused.
+        // A missed keyup after changing tabs must not keep either movement owner paused.
+        if(push.manual){transmit([15]);push.manual=false;}
         if(deathReturn.manualMove){
             transmit([15]);deathReturn.manualMove=false;
             deathReturn.nextAt=0;
@@ -5280,16 +5327,16 @@
         // React to respawn and newly unlocked beds using fresh server events,
         // without arbitrary timers that get throttled in hidden tabs.
         if (player.alive) { tryRestoreHat(); trySpawnBed(); driveReturn(); }
-        if(menu && !menu.hidden && id===20 &&
-            performance.now()-lastMenuSnapshotPaint>=180){
-            lastMenuSnapshotPaint=performance.now();
-            refreshInputs();
-        }
         if (id===20 && packet instanceof Uint8Array && player.alive && apTrackingEnabled()) {
             const now=performance.now();
             if(apSnapshotProcessed||observeAutoPlace(packet,now)){runAutoPlace(now);driveAutoPush(now);}
         }
         if(player.alive){if(!driveCounter())driveSpin();driveHatCopy();announceDeathCount();}
+        if(menu && !menu.hidden && id===20 &&
+            performance.now()-lastMenuSnapshotPaint>=180){
+            lastMenuSnapshotPaint=performance.now();
+            refreshInputs();
+        }
     }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
@@ -5337,19 +5384,27 @@
             bindGameSocket(this);
         }
         if (this === session.ws && raw && raw.length) {
-            if(!bed.locked && (raw[0]===1||raw[0]===6||raw[0]===15)){stopAutoPush(false);push.manual=raw[0]!==15;}
+            const movementStart=raw[0]===1 || (raw[0]===6&&raw.length>1&&raw[1]!==0);
+            const movementStop=raw[0]===15 || (raw[0]===6&&raw.length>1&&raw[1]===0);
+            if(!bed.locked&&movementStart){stopAutoPush(false);push.manual=true;}
+            else if(!bed.locked&&movementStop){
+                // Do not let idle native STOP packets interrupt owned push;
+                // a real preceding manual movement still releases normally.
+                if(push.owned&&!push.manual&&settings.autoPush&&push.epoch===session.connectionEpoch)return;
+                push.manual=false;
+            }
             // Native movement temporarily owns the controls. Unlike before,
             // it never disables the death-position anchor for the current life.
             if(returnEnabled() && deathReturn.target &&
                 ['moving','ready','arrived'].includes(deathReturn.phase)){
-                if(raw[0]===1 || raw[0]===6){
+                if(movementStart){
                     deathReturn.manualMove=true;
                     if(deathReturn.moveOwned){
                         stopReturnMovement();deathReturn.phase='ready';
                         deathReturn.route=[];deathReturn.step=0;
                     }
                     deathReturn.status='Movimento manual; retomará ao soltar';
-                } else if(raw[0]===15){
+                } else if(movementStop){
                     deathReturn.manualMove=false;
                     deathReturn.nextAt=performance.now()+25;
                 }
@@ -5959,7 +6014,7 @@
             <label title="Rebuild removed own traps; spikes only at approved finisher positions">Auto Replace<input data-heal-setting="autoReplace" type="checkbox"></label>
             <label title="Prioritize trapping free opponents before placing spikes">Auto Trap<input data-heal-setting="autoPlaceTrap" type="checkbox"></label>
             <label title="Spikes para inimigos capturados ou em contato previsto, sem limite artificial de HP">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
-            <label title="Alinha o personagem atrás de inimigos presos para empurrá-los contra spikes próprios/aliados. Não interfere com retorno, cura ou movimento manual.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
+            <label title="Alinha o personagem atrás de inimigos presos para empurrá-los contra spikes próprios/aliados. Respeita movimento manual, cama e retorno inicial. No ponto fixo, pode empurrar o alvo prioritário dentro do círculo.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
             <div class="nx-info-line" id="nx-push-status">Auto Push: desativado</div>
             <label title="Minimum interval between automatic attempts; server updates may be slower">Place ms<input data-heal-setting="autoPlaceMs" type="number" min="1" max="1000" step="1"></label>
             <label title="Local Auto Place packet budget only; higher values may cause lag or rejection">AP packets/s<input data-heal-setting="autoPlaceRate" type="number" min="240" max="480" step="20"></label>
