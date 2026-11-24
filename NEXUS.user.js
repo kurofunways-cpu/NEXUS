@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.87
+// @version      1.8.88
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -111,6 +111,12 @@
 // - 1.8.87: confirmação tardia não é marcada como cama preexistente ao
 //   mudar de centro. Busca de desvios filtra obstáculos locais e reutiliza
 //   a análise de risco. Falhas de posição expiram; não alteram âncora da morte.
+// - 1.8.88: alvo fixo mais próximo do jogador (dentro do círculo), não
+//   do centro. Push/Place priorizam inimigo mais próximo elegível.
+//   Alcance da arma orienta posicionamento; bloqueios recentes persistem.
+//   Restauração de Hammer limitada; após falhas retoma combate com arma
+//   conhecida. Death Chat usa até duas mensagens legíveis de 35 bytes
+//   (ou limite nativo menor), respeitando intervalo e mesma vida.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -120,7 +126,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.87';
+    const NEXUS_VERSION = '1.8.88';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1079,12 +1085,12 @@
         const a=fixedDeath.anchor,self=session.self;
         if(!settings.fixedDeathReturn || (!settings.fixedDeathFollow && reach===Infinity) || !a || !self ||
             fixedDeath.epoch!==session.connectionEpoch || now-self.at>250)return null;
-        let best=null,distance=settings.fixedDeathRadius;
+        let best=null,distance=reach;
         for(const e of counter.players.values()){
             if(now-e.at>(reach===Infinity?350:250) || e.id===player.id || e.sid===self.sid ||
                 (self.team!==0 && self.team===e.team))continue;
-            const d=returnDist(e,a);
-            if(returnDist(e,self)>reach)continue;
+            if(returnDist(e,a)>settings.fixedDeathRadius)continue;
+            const d=returnDist(e,self);
             if(d<=distance && (!best || d<distance || (d===distance&&e.id<best.id))){best=e;distance=d;}
         }
         return best;
@@ -1148,8 +1154,8 @@
     function fixedCombatGoal(enemy,self,anchor,now){
         const d=returnDist(self,enemy),radius=settings.fixedDeathRadius;
         const placing=settings.autoPlace&&settings.autoPlaceSpike;
+        const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110;
         if(!placing){
-            const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110;
             const desired=Math.max(55,Math.min(100,reach-20));
             if(d<=desired+12&&d>=desired-15)return {x:self.x,y:self.y};
             const a=d>1?Math.atan2(self.y-enemy.y,self.x-enemy.x):0;
@@ -1159,7 +1165,7 @@
         const observed=cached&&now-cached.at<=AP_PLAYER_TTL?cached:enemy;
         const owner=ap.self||session.self||self;
         const trapped=!!(observed.state&32)||!!apCapture(observed,entities.filter(t=>t.type===6&&apFriendly(t,owner)));
-        const desired=trapped?102:95;
+        const desired=Math.min(trapped?102:95,settings.killAura?Math.max(48,reach-22):Infinity);
         // If a spike can be placed from this position, don't move out of the
         // valid angle while the next placement transaction is being planned.
         const objects=entities.filter(o=>apStatic(o,now)&&returnDist(o,enemy)<=300);
@@ -1175,19 +1181,30 @@
             }
             return false;
         };
-        if(d>=65&&d<=120&&(waiting||canSpike(self)||(!trapped&&d<=95)))return {x:self.x,y:self.y};
+        const attackReady=!settings.killAura||d<=reach-8;
+        if(d>=Math.min(65,desired-5)&&d<=120&&attackReady&&(waiting||canSpike(self)||(!trapped&&d<=95)))return {x:self.x,y:self.y};
         const base=d>1?Math.atan2(self.y-enemy.y,self.x-enemy.x):0;
         let best=null,score=Infinity;
-        for(let i=0;i<16;i++)for(const distance of [desired,desired+20,desired-18]){
+        for(let i=0;i<16;i++)for(const distance of [desired,desired+20,Math.max(40,desired-18),Math.max(40,desired-35)]){
             const a=base+(i%2?-1:1)*Math.ceil(i/2)*Math.PI/8;
             const p={x:enemy.x+Math.cos(a)*distance,y:enemy.y+Math.sin(a)*distance};
             if(returnDist(p,anchor)>radius||p.x<30||p.y<30||p.x>65505||p.y>65505||
-                obs.some(o=>returnDist(o,p)<o.radius+15)||spikeNavBlocker(self,p,now))continue;
-            const value=returnDist(p,self)+(returnSegmentClear(self,p,obs,15)?0:50)+(!waiting&&!canSpike(p)?90:0);
+                obs.some(o=>returnDist(o,p)<o.radius+15)||spikeNavBlocker(self,p,now)||returnBadEdge(self,p,now))continue;
+            const value=returnDist(p,self)+(returnSegmentClear(self,p,obs,15)?0:50)+(!waiting&&!canSpike(p)?90:0)+(settings.killAura&&distance>reach-8?140:0);
             if(value<score){score=value;best=p;}
         }
-        // Avoid pushing a pinned enemy while searching for a viable angle.
-        return best||{x:self.x,y:self.y};
+        if(best)return best;
+        let fallback=null,quality=-Infinity;
+        for(const length of [55,35,20])for(let i=0;i<24;i++){
+            const a=base+Math.PI+i*Math.PI/12,p={x:self.x+length*Math.cos(a),y:self.y+length*Math.sin(a)};
+            if(returnDist(p,anchor)>radius||p.x<30||p.y<30||p.x>65505||p.y>65505||
+                !returnSegmentClear(self,p,obs,15)||spikeNavBlocker(self,p,now)||returnBadEdge(self,p,now))continue;
+            const advance=d-returnDist(p,enemy);
+            if(advance<3&&d<=reach-8)continue;
+            const score=advance*2+length*.1+(canSpike(p)?20:0)-returnLoopPenalty(p,self);
+            if(score>quality){quality=score;fallback=p;}
+        }
+        return fallback||{x:self.x,y:self.y};
     }
     function refreshFixedDeathGoal(now){
         const anchor=fixedDeath.anchor,self=deathReturn.self;
@@ -1212,7 +1229,7 @@
             (sweeping||!returnRiskOnSegment(self,goal,returnRiskZones(now,self)))&&!returnBadEdge(self,goal)&&!spikeNavBlocker(self,goal,now);
         if(!continuous)stopReturnMovement();fixedDeath.targetId=id;fixedDeath.lastPlanAt=now;
         deathReturn.target={x:goal.x,y:goal.y};deathReturn.route=[];deathReturn.step=0;
-        if(!sweeping)deathReturn.bad=[];
+        if(!sweeping&&!enemy)deathReturn.bad=[];
         deathReturn.fails=0;deathReturn.attempted=0;
         deathReturn.phase='ready';deathReturn.startedAt=now;deathReturn.nextAt=now;
         deathReturn.learningClean=false;deathReturn.recorded=[];
@@ -1741,7 +1758,7 @@
         if(!start||!goal)return null;
         const obs=returnObstacles(now,start),risk=returnRiskZones(now,start),
             distance=returnDist(start,goal);
-        if(distance<=RETURN_ARRIVED)return [];
+        if(distance<=(areaCleanupActive(now)||fixedDeath.targetId!==null?6:RETURN_ARRIVED))return [];
         const heading=Math.atan2(goal.y-start.y,goal.x-start.x);
         // Local planner may see a longer corridor, but each *actual* move is
         // short enough to validate with fresh server snapshots.
@@ -1966,8 +1983,8 @@
             else{stopReturnMovement();deathReturn.route=[];deathReturn.step=0;deathReturn.phase='ready';deathReturn.nextAt=now+100;deathReturn.status='Recalculando rota segura: spikes';}
             return false;
         }
-        const finalSweep=areaCleanupActive(now)&&returnDist(point,deathReturn.target)<=3;
-        if(returnDist(self,point)<=(finalSweep?5:RETURN_WAYPOINT)){deathReturn.step++;return true;}
+        const precise=(areaCleanupActive(now)||fixedDeath.targetId!==null)&&returnDist(point,deathReturn.target)<=3;
+        if(returnDist(self,point)<=(precise?5:RETURN_WAYPOINT)){deathReturn.step++;return true;}
         const angle=Math.atan2(point.y-self.y,point.x-self.x);
         if(!transmit([1,...apAngleBytes(angle)]))return false;
         if(deathReturn.moveTimer!==null)clearTimeout(deathReturn.moveTimer);
@@ -2171,7 +2188,7 @@
                 deathReturn.nextAt=now+50;deathReturn.status='Spike novo na rota';return;
             }
         }
-        const sweep=areaCleanupActive(now),arrival=sweep?6:RETURN_ARRIVED;
+        const sweep=areaCleanupActive(now),precise=sweep||fixedDeath.targetId!==null,arrival=precise?6:RETURN_ARRIVED;
         const distance=returnDist(deathReturn.self,deathReturn.target);
         const lookingAt=deathReturn.phase==='moving' && deathReturn.moveTo ?
             deathReturn.moveTo:deathReturn.target;
@@ -2179,7 +2196,7 @@
             returnObstacles(now,deathReturn.self),19);
         if(deathReturn.phase==='arrived'){
             const recentHit=now-deathReturn.lastHitAt<=750;
-            const displaced=distance>(sweep?8:RETURN_REENGAGE) ||
+            const displaced=distance>(precise?10:RETURN_REENGAGE) ||
                 (recentHit && distance>arrival+4);
             if(!displaced){
                 deathReturn.driftSamples=0;
@@ -2246,10 +2263,10 @@
                     // waypoint is added to the learned path here.
                 }
             }
-            const legTolerance=sweep&&returnDist(to,deathReturn.target)<=3?5:RETURN_WAYPOINT;
+            const legTolerance=precise&&returnDist(to,deathReturn.target)<=3?5:RETURN_WAYPOINT;
             if(returnDist(at,to)<=legTolerance || forward>=leg-legTolerance){
                 deathReturn.step++;
-                while(deathReturn.step<deathReturn.route.length&&returnDist(at,deathReturn.route[deathReturn.step])<=(sweep&&deathReturn.step===deathReturn.route.length-1?5:RETURN_WAYPOINT))deathReturn.step++;
+                while(deathReturn.step<deathReturn.route.length&&returnDist(at,deathReturn.route[deathReturn.step])<=(precise&&deathReturn.step===deathReturn.route.length-1?5:RETURN_WAYPOINT))deathReturn.step++;
                 const next=deathReturn.route[deathReturn.step];
                 if(next&&returnCanMove(now)&&returnSegmentClear(at,next,returnObstacles(now,at),15)&&
                     (sweep||!returnRiskOnSegment(at,next,returnRiskZones(now,at)))&&!returnBadEdge(at,next)&&returnMoveTo(next,now))return;
@@ -4156,7 +4173,7 @@
             const inReach=dist<=165;
             const threat=Math.max(0,AP_MAX_RANGE-dist)+Math.max(0,apDistance(origin,path[0])-apDistance(origin,path[2]))*.5+(ap.target===e.id&&now<ap.targetUntil?12:0);
             return {e,capture,path,dist,pendingTrap,pendingSpike,nearbySpikes,nearSpike,threat,inReach};
-        }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>b.threat-a.threat).slice(0,4);
+        }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>apDistance(a.e,self)-apDistance(b.e,self)||a.e.id-b.e.id).slice(0,4);
         if(!enemies.length){ap.target=null;ap.status='No enemy';return [];}
         const candidates=[];
         for(const r of AP_RING){
@@ -4200,7 +4217,8 @@
                 }
             }
         }
-        candidates.sort((a,b)=>b.priority-a.priority||b.score-a.score);
+        const nearestOrder=new Map(enemies.map((x,i)=>[x.e.id,i]));
+        candidates.sort((a,b)=>(nearestOrder.get(a.target)-nearestOrder.get(b.target))||b.priority-a.priority||b.score-a.score);
         const chosen=[];
         for(const c of candidates){
             if(!slots[c.key])continue;
@@ -4261,6 +4279,7 @@
         const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=300);
         let best=null;
         for(const [key,until] of push.avoid)if(now>=until)push.avoid.delete(key);
+        enemies.sort((a,b)=>apDistance(a,self)-apDistance(b,self)||a.id-b.id);
         for(const e of enemies){
             if(!apCapture(e,traps))continue;
             for(const spike of spikes){
@@ -4290,6 +4309,7 @@
                     if(!best||score<best.score)best={enemy:e,spike,goal,aligned,gap,score,pressureAngle:Math.atan2(-uy,-ux)};
                 }
             }
+            if(best)break;
         }
         return best;
     }
@@ -5409,6 +5429,11 @@
         // restoration echo. Outside escape no new automated hit is permitted
         // until the saved weapon is observed again.
         if(breaking)return false;
+        // Missing echo must not permanently monopolize combat.
+        if(counter.restoreTries>=4&&now-counter.restoreAt>=1200&&now-heal.observedItemAt<=250){
+            clearAuraWeaponRestore();counter.hammerEchoUntil=now+1500;
+            counter.status='Restaurando arma: retomando combate';return false;
+        }
         if(session.ws.bufferedAmount>=1024 || now<counter.restoreNextAt)return true;
         // Alternate the saved slot and exact observed item, when known. The
         // server may have accepted one selection but rejected the other.
@@ -5560,7 +5585,7 @@
             if(now-e.at>250 || e.id===player.id || e.sid===self.sid ||
                 (self.team!==0&&self.team===e.team))continue;
             const d=Math.hypot(e.x-self.x,e.y-self.y);
-            if(d<=bestDistance){bestDistance=d;best=e;}
+            if(d<=bestDistance&&(!best||d<bestDistance||e.id<best.id)){bestDistance=d;best=e;}
         }
         return best;
     }
@@ -5658,7 +5683,8 @@
                 counter.cleanupMarks.set(cleanup.key,now+15000);
                 ap.replaceQueue.delete(cleanup.key);
             }
-            return strikeAuraTrap(structure,now,w);
+            if(strikeAuraTrap(structure,now,w))return true;
+            if(urgent||!enemy)return aiming;
         }
         if(!enemy){
             counter.status=trapCleanupActive(now)?'Liberando traps: aguardando alvo alcançável':!settings.killAura?'Sem spikes perigosos próximos':!w?'Aguardando arma observada':'Nenhum inimigo no alcance';
@@ -5682,7 +5708,7 @@
     // documented binary chat command, not DOM overlays or clan chat.
     const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=600, DEATH_CHAT_ACK_WAIT=3500;
     const deathChat={total:0,pending:false,readyAt:Infinity,lastAt:-Infinity,epoch:-1,
-        echo:null,nativeTry:null,retry:0,status:'Aguardando morte',lifeAt:null,lifeEpoch:-1,lastDeath:null};
+        echo:null,nativeTry:null,retry:0,parts:[],part:0,unconfirmed:0,status:'Aguardando morte',lifeAt:null,lifeEpoch:-1,lastDeath:null};
     // Count only deaths in this document. A new or duplicated tab and a
     // full reload start at zero; respawns in this document retain the count.
     try{sessionStorage.removeItem(PREFIX+'death_count_v1');}catch(_){}
@@ -5716,25 +5742,30 @@
         }
         return null;
     }
-    function deathChatMessage(){
-        const d=deathChat.lastDeath;
-        const input=document.getElementById('chat');
-        // Conservative fallback from public clients; honor a smaller native limit.
-        const limit=input && input.maxLength>0?Math.min(35,input.maxLength):35;
-        const encoder=new TextEncoder(),fits=text=>encoder.encode(text).length<=limit;
+    function deathChatMessages(){
+        const d=deathChat.lastDeath,input=document.getElementById('chat');
+        const limit=input&&input.maxLength>0?Math.min(35,input.maxLength):35;
+        const encoder=new TextEncoder(),fits=t=>encoder.encode(t).length<=limit;
+        const fit=t=>{let out='';for(const c of t){if(!fits(out+c))break;out+=c;}return out;};
         const duration=formatDeathDuration(d?.duration??null),killer=d?.killer||'Unknown';
-        const full='Deaths: '+deathChat.total+' | Alive: '+duration+' | By: '+killer;
-        if(fits(full))return full;
-        let prefix='D:'+deathChat.total+' A:'+duration+' By:';
-        if(!fits(prefix+'?'))prefix='D:'+deathChat.total+' A:? By:';
-        let message=prefix;
-        for(const char of killer){if(!fits(message+char))break;message+=char;}
-        if(message===prefix && fits(prefix+'?'))message+='?';
-        if(fits(message))return message;
-        // Extremely small native limits: keep the death counter, if possible.
-        message='';
-        for(const char of 'D:'+deathChat.total){if(!fits(message+char))break;message+=char;}
-        return message;
+        const life='Deaths: '+deathChat.total+' | Alive: '+duration;
+        const full=life+' | By: '+killer;
+        if(fits(full))return [full];
+        const first=fits(life)?life:fit('Deaths: '+deathChat.total+' Alive: '+duration);
+        const second=fit('Killed by: '+killer);
+        return [first,second].filter(Boolean);
+    }
+    function resetDeathChatParts(){
+        deathChat.parts=[];deathChat.part=0;deathChat.unconfirmed=0;deathChat.retry=0;
+    }
+    function finishDeathChatPart(now,confirmed){
+        if(!confirmed)deathChat.unconfirmed++;
+        deathChat.part++;deathChat.retry=0;
+        deathChat.pending=deathChat.part<deathChat.parts.length;
+        deathChat.readyAt=now;
+        deathChat.status=deathChat.pending?'Chat: próxima parte aguardando intervalo':
+            deathChat.unconfirmed?'Chat enviado; '+deathChat.unconfirmed+' parte(s) sem confirmação':
+            'Chat confirmado ('+deathChat.parts.length+' parte(s))';
     }
     function countDeath(packet,now=performance.now()){
         if(!player.alive)return false;
@@ -5744,7 +5775,7 @@
         deathChat.total=Math.min(Number.MAX_SAFE_INTEGER,deathChat.total+1);
         deathChat.pending=!!settings.deathChat;
         deathChat.epoch=session.connectionEpoch;
-        deathChat.readyAt=Infinity;deathChat.echo=null;deathChat.nativeTry=null;deathChat.retry=0;
+        deathChat.readyAt=Infinity;deathChat.echo=null;deathChat.nativeTry=null;resetDeathChatParts();
         deathChat.status='Aguardando respawn';
         return true;
     }
@@ -5775,7 +5806,7 @@
         const id=packet[1]|packet[2]<<8;
         if(id!==e.playerId)return false;
         if(new TextDecoder().decode(packet.subarray(3))!==e.message)return false;
-        deathChat.echo=null;deathChat.status='Confirmado pelo servidor: '+e.message;
+        deathChat.echo=null;finishDeathChatPart(now,true);
         return true;
     }
     function tryNativeDeathChat(message,now){
@@ -5804,14 +5835,17 @@
             if(settings.deathChat&&player.alive&&connected()&&e.epoch===session.connectionEpoch&&e.playerId===player.id&&deathChat.retry===0){
                 deathChat.retry=1;deathChat.pending=true;deathChat.readyAt=now;
                 deathChat.status='Sem eco: uma nova tentativa de chat';
-            }else deathChat.status='Pacote enviado; sem confirmação do servidor';
+            }else if(settings.deathChat&&player.alive&&connected()&&e.epoch===session.connectionEpoch&&e.playerId===player.id)finishDeathChatPart(now,false);
+            else{deathChat.pending=false;deathChat.status='Pacote enviado; sem confirmação do servidor';}
         }
         if(!settings.deathChat || !deathChat.pending || !player.alive ||
             !connected() || deathChat.epoch!==session.connectionEpoch)return false;
         if(now<deathChat.readyAt || !session.self){deathChat.status='Aguardando entrada no jogo';return false;}
         if(now-deathChat.lastAt<DEATH_CHAT_GAP){deathChat.status='Aguardando intervalo do chat';return false;}
         if(session.ws.bufferedAmount>=1024){deathChat.status='Aguardando fila da conexão';return false;}
-        const message=deathChatMessage();
+        if(!deathChat.parts.length)deathChat.parts=deathChatMessages();
+        const message=deathChat.parts[deathChat.part];
+        if(!message){deathChat.pending=false;return false;}
         // The public Socket API sends chat as UTF-8 directly. Do not
         // synthesize Enter or touch the user's input/focus.
         if(!transmit([7,...new TextEncoder().encode(message)])){
@@ -5823,17 +5857,17 @@
     function queueDeathChatTest(now=performance.now()){
         if(!settings.deathChat || !player.alive || !connected())return false;
         deathChat.pending=true;deathChat.epoch=session.connectionEpoch;deathChat.readyAt=now;
-        deathChat.nativeTry=null;deathChat.echo=null;deathChat.retry=0;deathChat.status='Teste do chat real pendente';
+        deathChat.nativeTry=null;deathChat.echo=null;resetDeathChatParts();deathChat.status='Teste do chat real pendente';
         announceDeathCount(now);return true;
     }
     function resetDeathChatConnection(){
         deathChat.readyAt=Infinity;deathChat.epoch=-1;deathChat.echo=null;deathChat.nativeTry=null;
         deathChat.lifeAt=null;deathChat.lifeEpoch=-1;
-        deathChat.pending=false;deathChat.retry=0;deathChat.status='Aguardando morte';
+        deathChat.pending=false;resetDeathChatParts();deathChat.status='Aguardando morte';
     }
     function resetDeathCount(){
         deathChat.total=0;deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;deathChat.lastDeath=null;
-        deathChat.readyAt=Infinity;deathChat.status='Aguardando morte';
+        deathChat.readyAt=Infinity;resetDeathChatParts();deathChat.status='Aguardando morte';
     }
     // FUN: change the nickname once per observed death, before native Play.
     const GOOFY_NAMES=Object.freeze([
@@ -6659,7 +6693,7 @@
                 hat.pending=true;hat.tries=0;hat.nextAt=0;tryRestoreHat();
             }
         }
-        if(key==='deathChat' && !settings.deathChat){deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;deathChat.status='Desativado';}
+        if(key==='deathChat' && !settings.deathChat){deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;resetDeathChatParts();deathChat.status='Desativado';}
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
             resetSpin();
