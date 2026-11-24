@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.59
+// @version      1.8.60
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.59';
+    const NEXUS_VERSION = '1.8.60';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -429,7 +429,7 @@
 
     // Per-tab preference for last worn hat: separate tabs may use different hats.
     const HAT_SESSION_KEY = PREFIX + 'last_hat_session';
-    const hat = { current:null, wanted:null, pending:false, tries:0, nextAt:0, epoch:0, lastManualAt:-Infinity };
+    const hat = { current:null, wanted:null, pending:false, tries:0, nextAt:0, epoch:0, lastManualAt:-Infinity, observedAt:-Infinity };
     try {
         const saved=Number(sessionStorage.getItem(HAT_SESSION_KEY));
         if (Number.isInteger(saved) && saved>=1 && saved<=12) hat.wanted=saved;
@@ -580,7 +580,7 @@
     }
     function observeSelfHat(id, now=performance.now()) {
         if (!Number.isInteger(id) || id<0 || id>12) return;
-        hat.current=id;
+        hat.current=id;hat.observedAt=now;
         if(auraHat.owned || now<auraHat.echoUntil)return;
         if(settings.copyNearbyHat){
             if(hatCopy.target && id===hatCopy.target.hat){hatCopy.status='Chapéu confirmado #'+id;hatCopy.tries=0;}
@@ -1612,7 +1612,7 @@
         if(!point||!self||!returnCanMove(now))return false;
         const blocker=spikeNavBlocker(self,point,now);
         if(blocker){
-            if(auraTrapDistance(blocker,self)<=spikeBreakReach(now))pauseReturnForSpike(blocker,now);
+            if(auraTrapDistance(blocker,self)<=spikeBreakReach(now) && (counter.breakAvoid.get(blocker.key)??0)<=now)pauseReturnForSpike(blocker,now);
             else{stopReturnMovement();deathReturn.route=[];deathReturn.step=0;deathReturn.phase='ready';deathReturn.nextAt=now+100;deathReturn.status='Recalculando rota segura: spikes';}
             return false;
         }
@@ -2524,7 +2524,7 @@
         if(!point || !bedCanWork(now) || bed.moveTries>=BED_NAV_MAX_LEGS)return false;
         const blocker=spikeNavBlocker(bed.self,point,now);
         if(blocker){
-            if(auraTrapDistance(blocker,bed.self)<=spikeBreakReach(now))pauseBedForSpike(blocker,now);
+            if(auraTrapDistance(blocker,bed.self)<=spikeBreakReach(now) && (counter.breakAvoid.get(blocker.key)??0)<=now)pauseBedForSpike(blocker,now);
             else{stopBedMovement();bed.phase='await-position';bed.route=[];bed.waypoint=0;bed.nextAt=now+100;}
             return false;
         }
@@ -2738,6 +2738,7 @@
         session.attacking = false;
     }
     function rememberSlot(slot) {
+        clearAuraWeaponRestore();counter.hammerEchoUntil=0;
         session.weapon = slot;
         session.weaponPacket = [0,slot];
         session.lastNativeWeaponAt = performance.now();
@@ -2748,6 +2749,7 @@
         // observed in a weapon slot, rather than assuming all item IDs are weapons.
         const slot = AURA_HAMMERS.has(id) ? 1 : session.weaponIds.indexOf(id);
         if (slot < 0) return false;
+        clearAuraWeaponRestore();counter.hammerEchoUntil=0;
         session.weapon = slot;
         session.weaponPacket = [2,id];
         session.lastNativeWeaponAt = performance.now();
@@ -2759,7 +2761,9 @@
             counter.hammerSeen=id;
             // Delayed snapshots of our temporary Hammer must not overwrite
             // the user's saved weapon or contaminate weapon-slot learning.
-            if(now<counter.hammerEchoUntil || counter.restorePending)return;
+            // Hammer is a secondary weapon. A delayed Hammer snapshot must
+            // never promote itself to the saved primary weapon.
+            if(now<counter.hammerEchoUntil || counter.restorePending || session.weapon===0)return;
         }
         // Never learn the temporarily selected food/building or a delayed
         // pre-selection snapshot as a new manual weapon choice.
@@ -2775,7 +2779,7 @@
         }
     }
     function restoreWeapon() {
-        if (!connected() || !transmit(session.weaponPacket)) return false;
+        if (!connected() || !transmit(counter.restorePending && counter.restorePacket ? counter.restorePacket : session.weaponPacket)) return false;
         // Restore direction/attack only if a real, manual attack was in progress.
         const aim = automationAim(performance.now());
         if (aim) transmit(session.attacking ? [19, ...aim] : [13, ...aim]);
@@ -3890,16 +3894,18 @@
     const AURA_ATTEMPT_MS=90, AURA_BREAK_ATTEMPT_MS=110;
     const AURA_DEMOLIST=11, AURA_DANGEROUS=new Set([17,28,36,37,40,44,45]);
     const AURA_THREAT_RADIUS=225;
-    const auraHat={previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0};
-    function resetAuraHat(){Object.assign(auraHat,{previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0});}
+    const auraHat={previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0,sentAt:-Infinity,confirmedSince:null};
+    function resetAuraHat(){Object.assign(auraHat,{previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0,sentAt:-Infinity,confirmedSince:null});}
     const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map(),
         traps:new Map(),contacts:new Map(),escapeActive:false,clearSince:null,clearSamples:0,navSpikeKey:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
-        restorePending:false,restoreTries:0,restoreNextAt:0,aim:null,aimAt:-Infinity};
+        restorePending:false,restoreTries:0,restoreNextAt:0,restoreAt:-Infinity,restoreExpected:null,restorePacket:null,
+        breakKey:null,breakSince:0,breakAttempts:0,breakAvoid:new Map(),aim:null,aimAt:-Infinity};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
         resetAuraEscape();counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
-        counter.hammerEchoUntil=0;counter.restorePending=false;counter.restoreTries=0;counter.restoreNextAt=0;
+        clearAuraWeaponRestore();counter.hammerEchoUntil=0;
+        counter.breakKey=null;counter.breakSince=0;counter.breakAttempts=0;counter.breakAvoid.clear();
         counter.aim=null;counter.aimAt=-Infinity;
         resetAuraHat();
     }
@@ -3908,7 +3914,7 @@
     }
     function counterWeapon(now){
         const r=heal.restore;
-        if(AURA_HAMMERS.has(heal.observedItem) && now<counter.hammerEchoUntil){
+        if(counter.restorePending || (AURA_HAMMERS.has(heal.observedItem) && (now<counter.hammerEchoUntil || session.weapon===0))){
             const id=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
             return COUNTER_REACH.has(id)?{id,select:true}:null;
         }
@@ -3959,7 +3965,7 @@
     const AURA_TRAP_TYPE=6, AURA_TRAP_CONTACT=60, AURA_TRAP_RETAIN=70;
     // Entity IDs corroborated by Astral Lite and the existing placement map.
     const AURA_SPIKE_TYPES=new Set([2,7,17]);
-    const AURA_SPIKE_BODY=28, AURA_SPIKE_MARGIN=5;
+    const AURA_SPIKE_BODY=28, AURA_SPIKE_MARGIN=5, AURA_SPIKE_THREAT=115;
     function auraIsSpike(t){return AURA_SPIKE_TYPES.has(t.type);}
     function auraStructureEnabled(t){return auraIsSpike(t)?settings.auraBreakSpikes:settings.killAura;}
     function auraStructureName(t){return auraIsSpike(t)?'spike':'trap';}
@@ -3973,6 +3979,8 @@
     function dropAuraTrap(key){
         counter.traps.delete(key);counter.contacts.delete(key);
         if(counter.navSpikeKey===key)counter.navSpikeKey=null;
+        counter.breakAvoid.delete(key);
+        if(counter.breakKey===key){counter.breakKey=null;counter.breakAttempts=0;}
     }
     function auraTrapHostile(t,self){
         return t.sid!==self.sid && !(self.team!==0 && self.team===t.team);
@@ -4019,15 +4027,16 @@
     function spikeBreakReach(now){
         const hammer=auraHammerAvailable();
         const w=counterWeapon(now);
-        // Use the known equipped weapon only, or the confirmed Hammer.
-        return COUNTER_REACH.get(hammer??w?.id)??0;
+        // A longer-range primary can clear a spike the Hammer cannot reach.
+        return Math.max(COUNTER_REACH.get(hammer)??0,COUNTER_REACH.get(w?.id)??0);
     }
     function auraNavigationSpike(now,explicitGoal=null){
         const self=session.self;
         if(!settings.auraBreakSpikes || !player.alive || !self || now-self.at>250)return null;
         const reach=spikeBreakReach(now);
         if(!reach)return null;
-        const spikes=hostileSpikes(now).filter(t=>auraTrapDistance(t,self)<=reach);
+        const spikes=hostileSpikes(now).filter(t=>auraTrapDistance(t,self)<=reach &&
+            (counter.breakAvoid.get(t.key)??0)<=now);
         const bedTask=settings.autoSpawnBed && lifeGate.respawnAuthorized && bed.pending &&
             !bed.handoffMove && !bed.manualAfterPlacement;
         const returnTask=settings.returnAfterBed && lifeGate.respawnAuthorized && !!deathReturn.target &&
@@ -4045,11 +4054,16 @@
         if(bedTask && bed.origin)candidates.push(...spikes.filter(t=>auraTrapDistance(t,bed.origin)<=135));
         // On spawn, a ring can exist before bed or return navigation starts.
         // Three nearby spikes or an opposing pair are evidence of a siege.
-        if(now-bed.spawnAt>=0 && now-bed.spawnAt<=5000){
-            const ring=spikes.filter(t=>auraTrapDistance(t,self)<=110);
+        {
+            const ring=spikes.filter(t=>auraTrapDistance(t,self)<=AURA_SPIKE_THREAT);
             const opposed=ring.some(a=>ring.some(b=>a!==b &&
                 (a.x-self.x)*(b.x-self.x)+(a.y-self.y)*(b.y-self.y)<-.25*auraTrapDistance(a,self)*auraTrapDistance(b,self)));
             if(ring.length>=3 || opposed)candidates.push(...ring);
+            // A nearby hostile trap can pin the player while a spike just
+            // outside the contact circle continues threatening damage.
+            const trapped=[...counter.traps.values()].some(t=>!auraIsSpike(t) &&
+                now-t.at<=AURA_TRAP_TTL && auraTrapHostile(t,self) && auraTrapDistance(t,self)<=AURA_TRAP_RETAIN);
+            if(trapped || (now-heal.lastDamageAt<=500 && ring.length>=2))candidates.push(...ring);
         }
         return candidates.sort((a,b)=>auraTrapDistance(a,self)-auraTrapDistance(b,self))[0]??null;
     }
@@ -4085,8 +4099,14 @@
             // or another spike tier sharing an owner/entity ID.
             const key=type===AURA_TRAP_TYPE?sid+':'+id:sid+':'+type+':'+id;
             // Delete ONLY this trap. All other traps and contacts survive.
-            if(packet[i+8]&2){dropAuraTrap(key);continue;}
-            const t={key,type,sid,team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
+            if(packet[i+8]&2){
+                dropAuraTrap(key);
+                // Removal records can carry changed owner information. Match
+                // the same structure type and world index, never another type.
+                for(const [other,t] of counter.traps)if(t.type===type && t.id===id)dropAuraTrap(other);
+                continue;
+            }
+            const t={key,type,id,sid,team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
                 y:packet[i+6]|packet[i+7]<<8,at:now};
             if(!auraTrapHostile(t,self)){dropAuraTrap(key);continue;}
             counter.traps.set(key,t);
@@ -4152,11 +4172,13 @@
         if((!settings.killAura && !settings.auraBreakSpikes) || !self || now-self.at>250)return null;
         const navSpike=auraNavigationSpike(now);
         if(!counter.escapeActive)return navSpike;
+        const reach=spikeBreakReach(now);
         // Re-evaluate ALL remaining traps on every strike/aim decision, even
         // immediately after an object-only deletion of the previous target.
         const nearby=auraTrapNearby(now,self);
         let best=null,distance=Infinity;
         for(const {t,distance:d} of nearby){
+            if(auraIsSpike(t) && reach && d>reach)continue;
             // A touching spike can inflict damage while the trap only pins us.
             // Prefer that spike, then the nearest eligible structure of its kind.
             if(!best || (auraIsSpike(t) && !auraIsSpike(best)) ||
@@ -4177,17 +4199,52 @@
         // Prefer the highest observed tier; never attempt an unknown item.
         return candidates.filter(id=>AURA_HAMMERS.has(id)).sort((a,b)=>b-a)[0]??null;
     }
-    function recoverAuraWeapon(now){
+    function clearAuraWeaponRestore(){
+        counter.restorePending=false;counter.restorePacket=null;counter.restoreExpected=null;
+        counter.restoreAt=-Infinity;counter.restoreNextAt=0;counter.restoreTries=0;
+    }
+    function armAuraWeaponRestore(now){
+        if(!counter.restorePending){
+            const id=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
+            counter.restoreExpected=Number.isInteger(id)?id:null;
+            counter.restorePacket=[...session.weaponPacket];
+            counter.restoreTries=0;
+        }
+        counter.restorePending=true;counter.restoreAt=now;
+        counter.restoreNextAt=now+140;counter.hammerEchoUntil=now+2000;
+    }
+    function auraRestoreConfirmed(){
+        if(!counter.restorePending || heal.observedItemAt<=counter.restoreAt)return false;
+        const id=heal.observedItem;
+        return counter.restoreExpected!==null?id===counter.restoreExpected:
+            !AURA_HAMMERS.has(id) && COUNTER_REACH.has(id);
+    }
+    function recoverAuraWeapon(now,breaking=false){
         if(!counter.restorePending)return false;
-        if(!player.alive || !connected()){counter.restorePending=false;return false;}
+        if(!player.alive || !connected()){clearAuraWeaponRestore();return false;}
+        if(auraRestoreConfirmed()){
+            clearAuraWeaponRestore();counter.hammerEchoUntil=now+1500;return false;
+        }
         if(heal.phase!=='idle' || heal.foodSelected || ageRecovery.pending ||
             macro.selected || Object.keys(macroDefs).some(macroActive) ||
-            (bed.pending && bed.phase==='placing' && bed.locked))return true;
+            (bed.pending && bed.phase==='placing' && bed.locked) ||
+            ap.manualItem || session.attacking)return !breaking;
+        // A structure transaction may retry without waiting for its previous
+        // restoration echo. Outside escape no new automated hit is permitted
+        // until the saved weapon is observed again.
+        if(breaking)return false;
         if(session.ws.bufferedAmount>=1024 || now<counter.restoreNextAt)return true;
+        // Alternate the saved slot and exact observed item, when known. The
+        // server may have accepted one selection but rejected the other.
+        const original=counter.restorePacket;
+        const exact=counter.restoreExpected;
+        const packet=counter.restoreTries%2===1 && exact!==null?[2,exact]:original;
+        transmit([18]);
+        if(packet)transmit(packet);
         counter.restoreTries++;
-        if(restoreWeapon()){counter.restorePending=false;return true;}
-        counter.restoreNextAt=now+150;
-        if(counter.restoreTries>=3)counter.restorePending=false;
+        counter.restoreNextAt=now+(counter.restoreTries<4?180:1000);
+        counter.hammerEchoUntil=now+2000;
+        counter.status='Restaurando arma anterior (aguardando confirmação)';
         return true;
     }
     function auraThreatCount(now){
@@ -4217,33 +4274,55 @@
             if(now-hat.lastManualAt<1500 || hat.current===null)return;
             if(hat.current===AURA_DEMOLIST)return;
             auraHat.previous=hat.current;auraHat.owned=true;
-            auraHat.requested=null;auraHat.tries=0;
+            auraHat.requested=null;auraHat.tries=0;auraHat.confirmedSince=null;auraHat.sentAt=-Infinity;
         }
         if(!auraHat.owned)return;
         const desired=allow?AURA_DEMOLIST:auraHat.previous;
         if(desired!==auraHat.requested){
             auraHat.requested=desired;auraHat.tries=0;
-            // Safety transitions may be attempted immediately. Any server
-            // hat cooldown still applies, so wait for observed confirmation.
-            if(!allow)auraHat.nextAt=now;
+            auraHat.confirmedSince=null;auraHat.sentAt=-Infinity;
+            auraHat.nextAt=now;
         }
-        if(hat.current===desired){
+        // A pre-request snapshot showing the old hat is not an ACK. Explicitly
+        // request restoration even if that snapshot appears to match.
+        const confirmed=hat.current===desired && hat.observedAt>auraHat.sentAt &&
+            Number.isFinite(auraHat.sentAt);
+        if(confirmed){
             if(!allow){
-                auraHat.owned=false;auraHat.previous=null;auraHat.requested=null;
-                auraHat.echoUntil=now+1500;
+                if(auraHat.confirmedSince===null)auraHat.confirmedSince=hat.observedAt;
+                if(hat.observedAt-auraHat.confirmedSince>=150){
+                    auraHat.owned=false;auraHat.previous=null;auraHat.requested=null;
+                    auraHat.echoUntil=now+1500;
+                }
             }
             return;
         }
-        if(now<auraHat.nextAt || auraHat.tries>=3)return;
+        auraHat.confirmedSince=null;
+        if(now<auraHat.nextAt)return;
         if(transmit([5,desired])){
-            auraHat.tries++;auraHat.nextAt=now+1500;auraHat.echoUntil=now+2000;
+            auraHat.tries++;auraHat.sentAt=now;
+            // Bounded cadence, not bounded lifetime: cooldown or a rejected
+            // request must not permanently strand the player in Demolist.
+            auraHat.nextAt=now+(allow?1500:auraHat.tries<=3?450:1500);
+            auraHat.echoUntil=now+2000;
         }
     }
     function strikeAuraTrap(t,now,w){
-        const hammer=auraHammerAvailable();
+        const distance=auraTrapDistance(t,session.self);
+        const available=auraHammerAvailable();
+        const hammer=available!==null && distance<=(COUNTER_REACH.get(available)??0)?available:null;
         const id=hammer??w?.id, name=auraStructureName(t);
-        if(id==null){counter.status=name+': aguardando arma';return false;}
+        if(id==null || distance>(COUNTER_REACH.get(id)??0)){counter.status=name+': aguardando arma/alcance';return false;}
         const self=session.self;
+        if(counter.breakKey!==t.key){counter.breakKey=t.key;counter.breakSince=now;counter.breakAttempts=0;}
+        const touching=auraTrapNearby(now,self).some(e=>e.t.key===t.key);
+        if(auraIsSpike(t) && !touching && counter.breakAttempts>=12 && now-counter.breakSince>=3000){
+            // No destruction evidence: try another route/structure. Do not
+            // permanently mark the real destination or a static obstacle bad.
+            counter.breakAvoid.set(t.key,now+1800);counter.navSpikeKey=null;
+            counter.breakKey=null;counter.breakAttempts=0;
+            counter.status='Spike não confirmado destruído; recalculando passagem';return false;
+        }
         const aim=apAngleBytes(Math.atan2(t.y-self.y,t.x-self.x));
         const saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
         // A confirmed Hammer uses the secondary slot / exact item ID.
@@ -4251,14 +4330,16 @@
         const temporary=hammer!==null && saved!==hammer;
         session.lastAutomationAt=now;
         if(temporary){
-            counter.hammerEchoUntil=now+1500;
-            if(!transmit([2,id])){counter.status=name+': falha ao selecionar Hammer';return false;}
+            armAuraWeaponRestore(now);
+            // Prefer native secondary slot when it is known to be this Hammer.
+            // An exact item selection is the fallback for inventory-only evidence.
+            const select=session.weaponIds[1]===id?[0,1]:[2,id];
+            if(!transmit(select)){counter.status=name+': falha ao selecionar Hammer';return false;}
         }else if(w?.select && !transmit(session.weaponPacket))return false;
         const hit=transmit([19,...aim]);
         transmit([18]);
-        if(temporary && !restoreWeapon()){
-            counter.restorePending=true;counter.restoreTries=0;counter.restoreNextAt=now+50;
-        }
+        if(temporary)restoreWeapon(); // retain watchdog even after successful send
+        if(hit)counter.breakAttempts++;
         counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
         counter.aim=aim;counter.aimAt=now;
         counter.status=hit?('Quebrando '+name+(hammer!==null?' com Hammer #'+id:' com arma atual')):name+': golpe não enviado';
@@ -4314,7 +4395,7 @@
     }
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
-        if(auraHat.owned || auraEscapeInProgress(now))return false;
+        if(auraHat.owned || now<auraHat.echoUntil || auraEscapeInProgress(now))return false;
         if(!settings.copyNearbyHat || !player.alive || !connected() || ageRecovery.pending ||
             !t || now-t.at>350 || now<hatCopy.nextAt || now-hat.lastManualAt<1500 ||
             session.ws.bufferedAmount>=1024 || (settings.lagGuard&&networkState(now)!=='OK'))return false;
@@ -4326,7 +4407,7 @@
     }
     function driveCounter(now=performance.now()){
         driveAuraHat(now);
-        if(recoverAuraWeapon(now))return true;
+        if(recoverAuraWeapon(now,!!auraTrapTarget(now)))return true;
         if((!settings.killAura && !settings.auraBreakSpikes) || !player.alive || !connected())return false;
         const aiming=driveAuraAim(now);
         if(!session.self || now-session.self.at>250 || session.attacking ||
@@ -4343,7 +4424,7 @@
         if(auraEscapeInProgress(now)){
             counter.status='Confirmando saída de traps/spikes';return aiming;
         }
-        if(!settings.killAura)return false;
+        if(!settings.killAura){counter.status='Sem spikes perigosos próximos';return false;}
         if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return aiming;}
         const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
         if(!t){counter.status=trap?'Preso em trap; Hammer indisponível':'Nenhum inimigo no alcance';return false;}
@@ -5064,7 +5145,7 @@
                 case 2: {
                     if (raw.length < 2) break;
                     heal.restore=null; // respect an intentional manual item selection
-                    counter.restorePending=false;counter.hammerEchoUntil=0;
+                    clearAuraWeaponRestore();counter.hammerEchoUntil=0;
                     ap.manualItem=raw[0]===0?raw[1]>1:!(AURA_HAMMERS.has(raw[1])||session.weaponIds.includes(raw[1])||AURA_STATS.has(raw[1]));
                     ap.manualUntil=performance.now()+(ap.manualItem?160:0);
                     if (macro.selected) {
