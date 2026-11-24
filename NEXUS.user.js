@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.75
+// @version      1.8.76
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.75';
+    const NEXUS_VERSION = '1.8.76';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -5227,7 +5227,23 @@
     }
     function deathChatMessage(){
         const d=deathChat.lastDeath;
-        return 'Deaths: '+deathChat.total+' | Alive: '+formatDeathDuration(d?.duration??null)+' | By: '+(d?.killer||'Unknown');
+        const input=document.getElementById('chat');
+        // Conservative fallback from public clients; honor a smaller native limit.
+        const limit=input && input.maxLength>0?Math.min(35,input.maxLength):35;
+        const encoder=new TextEncoder(),fits=text=>encoder.encode(text).length<=limit;
+        const duration=formatDeathDuration(d?.duration??null),killer=d?.killer||'Unknown';
+        const full='Deaths: '+deathChat.total+' | Alive: '+duration+' | By: '+killer;
+        if(fits(full))return full;
+        let prefix='D:'+deathChat.total+' A:'+duration+' By:';
+        if(!fits(prefix+'?'))prefix='D:'+deathChat.total+' A:? By:';
+        let message=prefix;
+        for(const char of killer){if(!fits(message+char))break;message+=char;}
+        if(message===prefix && fits(prefix+'?'))message+='?';
+        if(fits(message))return message;
+        // Extremely small native limits: keep the death counter, if possible.
+        message='';
+        for(const char of 'D:'+deathChat.total){if(!fits(message+char))break;message+=char;}
+        return message;
     }
     function countDeath(packet,now=performance.now()){
         if(!player.alive)return false;
@@ -5296,14 +5312,15 @@
             deathChat.echo=null;deathChat.status='Pacote enviado ao jogo; sem confirmação do servidor';
         }
         if(!settings.deathChat || !deathChat.pending || !player.alive ||
-            !connected() || deathChat.epoch!==session.connectionEpoch ||
-            now<deathChat.readyAt || now-deathChat.lastAt<DEATH_CHAT_GAP ||
-            !session.self || session.ws.bufferedAmount>=1024)return false;
+            !connected() || deathChat.epoch!==session.connectionEpoch)return false;
+        if(now<deathChat.readyAt || !session.self){deathChat.status='Aguardando entrada no jogo';return false;}
+        if(now-deathChat.lastAt<DEATH_CHAT_GAP){deathChat.status='Aguardando intervalo do chat';return false;}
+        if(session.ws.bufferedAmount>=1024){deathChat.status='Aguardando fila da conexão';return false;}
         const message=deathChatMessage();
         // A stationary player need not have a fresh position to send chat.
         // Respect a real user's open chat/draft rather than interrupting it.
         const input=document.getElementById('chat');
-        if(input && (input.value || document.activeElement===input))return false;
+        if(input && (input.value || document.activeElement===input)){deathChat.status='Aguardando fechar chat manual';return false;}
         const n=deathChat.nativeTry;
         if(!n && tryNativeDeathChat(message,now))return !deathChat.pending;
         if(n && now-n.at<300)return false;
