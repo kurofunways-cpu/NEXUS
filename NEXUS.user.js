@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.76
+// @version      1.8.77
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -20,23 +20,40 @@
 // Metadados para atualização automática: NEXUS.meta.js
 //
 // Instruções para continuar o projeto em um novo chat:
-// 1. Acesse o GitHub conectado e verifique a versão mais recente no repositório
-//    ANTES de alterar o código. Não confie no número de versão deste comentário.
-// 2. Preserve todas as funcionalidades e configurações anteriores; não remova
-//    funções sem pedido explícito do usuário.
-// 3. Para cada modificação solicitada, valide o código e publique a nova versão
-//    de NEXUS.user.js no repositório GitHub acima.
-// 4. Aumente o número de @version em NEXUS.user.js e NEXUS.meta.js e mantenha
-//    os campos @updateURL e @downloadURL apontando para os arquivos oficiais.
-// 5. Atualize a constante interna NEXUS_VERSION para a mesma versão.
-// 6. Entregue também uma cópia completa com extensão .lua, como o usuário pede.
-//    ATENÇÃO: esse arquivo continua sendo JavaScript para Tampermonkey, não Lua.
-// 7. Não altere a navegação, a cama, a cura ou outras partes sem necessidade.
-// 8. Informe quais testes foram feitos e o que não foi testado no jogo.
-// 9. Publicar no GitHub é uma ação separada: criar um arquivo no chat NÃO
-//    publica alterações automaticamente; requer acesso autorizado ao GitHub.
-// 10. O Tampermonkey verifica periodicamente atualizações publicadas; não há
-//     garantia de atualização instantânea e o jogo pode precisar ser recarregado.
+// 1. Acesse o GitHub conectado e leia a versão mais recente na branch main
+//    antes de editar. O GitHub é a fonte oficial, não anexos antigos.
+// 2. Preserve funcionalidades e configurações existentes; altere apenas o necessário.
+// 3. Quando precisar entender o protocolo, corrigir um bug ou criar uma função,
+//    pesquise scripts públicos de Sploop.io (GitHub, Greasy Fork) e documentação.
+//    Compare o código real e a data das fontes; não suponha que protocolos antigos
+//    ainda funcionem. Use as referências para aprender, respeitando suas licenças.
+//    Não execute código público desconhecido nem copie scripts inteiros sem revisão.
+//    Não repita pesquisas sem necessidade em mudanças simples.
+// 4. Valide a alteração e publique NEXUS.user.js no GitHub autorizado.
+//    Sincronize @version nos dois arquivos e NEXUS_VERSION no código; preserve
+//    @updateURL e @downloadURL. Verifique os arquivos publicados na branch main.
+// 5. Não é necessário entregar cópia .lua ou outro anexo a cada atualização.
+//    O Tampermonkey recebe o JavaScript oficial pelo GitHub; só gere anexos se pedidos.
+// 6. Não altere navegação, cama, cura ou outras funções sem necessidade.
+// 7. Informe o que mudou, a versão, os testes realmente realizados e as limitações.
+//    Diferencie teste simulado de confirmação no jogo e envio de confirmação do servidor.
+// 8. Ao descobrir informações realmente importantes para futuros chats, atualize
+//    as notas abaixo no mesmo commit. Registre decisões, fatos verificados,
+//    limitações e bugs pendentes; elimine notas obsoletas. Não registre segredos,
+//    palpites como fatos ou detalhes triviais. Mantenha este bloco conciso.
+// 9. Criar um arquivo no chat não publica no GitHub. Só declare publicação quando
+//    confirmada. O Tampermonkey verifica atualizações periodicamente e pode exigir reload.
+//
+// Notas essenciais de continuidade (revisar quando houver novas evidências):
+// - Death Chat (1.8.76): limite conservador de 35 bytes UTF-8 (ou menor limite
+//   nativo), abreviação e estados de espera no HUD. Limite e entrega ainda não
+//   confirmados no jogo. Enviar via WebSocket não prova que o servidor aceitou.
+// - Cama, retorno após morte e Age Recovery exigem morte na conexão atual;
+//   reload, nova aba e troca de servidor não autorizam essas rotinas. A marcação
+//   manual de área em vida é uma autorização distinta para retorno fixo.
+// - Configurações compartilhadas usam localStorage; exceções por aba usam
+//   sessionStorage. Não sobrescreva preferências compartilhadas ao abrir uma aba.
+// - Preserve o singleton: apenas uma versão ativa por página.
 //
 // Objetivo: manter a NEXUS atualizável automaticamente a partir do GitHub.
 // ============================================================================
@@ -44,7 +61,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.76';
+    const NEXUS_VERSION = '1.8.77';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
