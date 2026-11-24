@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.91
+// @version      1.8.92
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -135,6 +135,12 @@
 //   posição, alcance, ataques e spikes recentes; "Likely by" é estimativa.
 //   Sem evidência suficiente, mantém Unknown; não atribui kill por palpite
 //   quando há vários candidatos. Limpa evidências por vida/conexão.
+// - 1.8.92: limpeza contínua quando círculo sem inimigos; nova opção
+//   idleAreaCleanup (padrão ligada) substitui varredura manual antiga.
+//   Requer posição recente e breve intervalo sem hostis. Entrada de inimigo
+//   interrompe limpeza e libera combate. Próprias/aliadas/inimigas, incluindo
+//   farms 19–21 (tabela histórica Dsync); exclui loot 11 e objetos naturais.
+//   Preserva coleta de kill, cama pendente, Clown e recuperação de idade.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -144,7 +150,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.91';
+    const NEXUS_VERSION = '1.8.92';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -195,7 +201,7 @@
         fixedDeathFollow: true,
         collectKillLoot: true,
         orbitCombat: true,
-        clearDeathStructures: false,
+        idleAreaCleanup: true,
         fixedDeathRadius: 120,
         returnSpin: true, // legacy key retained for existing tab preferences
         spinDegreesPerSecond: 180,
@@ -1430,9 +1436,9 @@
             fixedDeath.epoch!==session.connectionEpoch || deathReturn.manualMove || bed.approach)return;
         if(!fixedDeath.entered && returnDist(self,anchor)<=settings.fixedDeathRadius)fixedDeath.entered=true;
         const sweeping=areaCleanupActive(now),cleaning=!sweeping&&trapCleanupActive(now);
-        const loot=!sweeping&&!cleaning?ownLootTarget(now):null;
+        const loot=!sweeping?ownLootTarget(now):null;
         const enemy=fixedDeath.entered&&!cleaning&&!sweeping&&!loot?fixedDeathEnemy(now):null;
-        let goal=sweeping?areaCleanupGoal(now,anchor,self):cleaning?trapCleanupGoal(now,anchor,self)||anchor:loot?lootCombatGoal(loot,self,anchor,now):anchor;
+        let goal=sweeping?areaCleanupGoal(now,anchor,self):loot?lootCombatGoal(loot,self,anchor,now):cleaning?trapCleanupGoal(now,anchor,self)||anchor:anchor;
         if(enemy){
             goal=fixedCombatGoal(enemy,self,anchor,now);
             const offset=returnDist(goal,anchor),radius=settings.fixedDeathRadius;
@@ -5459,32 +5465,50 @@
         return returnDist(goal,anchor)<=settings.fixedDeathRadius?goal:{x:self.x,y:self.y};
     }
     // A sweep is explicit, scoped to the fixed anchor, and does not mutate user settings.
-    const AREA_STRUCTURE_TYPES=new Set([2,6,7,8,9,10,13,15,16,17,18,22,26,37]);
-    const areaSweep={objects:new Map(),signature:null,done:false,emptySince:null,lastPacket:-Infinity,
+    const AREA_STRUCTURE_TYPES=new Set([2,6,7,8,9,10,13,15,16,17,18,19,20,21,22,26,37]);
+    const areaSweep={objects:new Map(),signature:null,done:false,emptySince:null,lastPacket:-Infinity,quietSince:null,active:false,
         target:null,goal:null,status:'Aguardando área'};
     function resetAreaCleanup(clearObjects=false){
         if(clearObjects)areaSweep.objects.clear();
-        areaSweep.signature=null;areaSweep.done=false;areaSweep.emptySince=null;
+        areaSweep.signature=null;areaSweep.done=false;areaSweep.emptySince=null;areaSweep.quietSince=null;areaSweep.active=false;
         areaSweep.lastPacket=-Infinity;areaSweep.target=null;areaSweep.goal=null;
         areaSweep.status='Aguardando área';
     }
     function areaCleanupSignature(){
         const a=fixedDeath.anchor;
-        return settings.clearDeathStructures&&settings.fixedDeathReturn&&a&&
+        return settings.idleAreaCleanup&&settings.fixedDeathReturn&&a&&
             fixedDeath.epoch===session.connectionEpoch?
             [session.connectionEpoch,a.x,a.y,settings.fixedDeathRadius].join(':'):null;
     }
     function areaCleanupActive(now=performance.now()){
-        const signature=areaCleanupSignature();
+        const signature=areaCleanupSignature(),self=session.self;
         if(signature!==areaSweep.signature){
             areaSweep.signature=signature;areaSweep.done=false;areaSweep.emptySince=null;
-            areaSweep.target=null;areaSweep.goal=null;
-            if(signature){ap.replaceQueue.clear();stopAutoPush();}
+            areaSweep.quietSince=null;areaSweep.target=null;areaSweep.goal=null;
         }
-        return !!(signature&&!areaSweep.done&&player.alive&&returnAuthorized());
+        const ready=!!(signature&&player.alive&&returnAuthorized()&&fixedDeath.entered&&self&&
+            now-self.at<=250&&now-areaSweep.lastPacket<=350&&!bed.pending&&!ageRecovery.pending&&!clownEscapeActive());
+        // Do not call ownLootTarget here (it calls areaCleanupActive).
+        const c=killLoot.claim,collecting=!!(settings.collectKillLoot&&c&&c.epoch===session.connectionEpoch&&now-c.at<=6500&&c.attempts<12);
+        const hostile=ready&&[...counter.players.values()].some(e=>now-e.at<=900&&e.id!==player.id&&e.sid!==self.sid&&
+            !(self.team&&self.team===e.team)&&returnDist(e,fixedDeath.anchor)<=settings.fixedDeathRadius);
+        if(!ready||hostile||collecting){
+            areaSweep.quietSince=null;areaSweep.emptySince=null;areaSweep.done=false;
+            areaSweep.status=hostile?'Inimigo na área; combate retomado':collecting?'Aguardando coleta da kill própria':'Aguardando área/posição';
+        }else if(areaSweep.quietSince===null)areaSweep.quietSince=now;
+        const active=ready&&!hostile&&!collecting&&now-areaSweep.quietSince>=450;
+        if(active!==areaSweep.active){
+            areaSweep.active=active;areaSweep.target=null;areaSweep.goal=null;areaSweep.emptySince=null;
+            // Release a former cleaning waypoint immediately on enemy entry.
+            if(deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';}
+            deathReturn.route=[];deathReturn.step=0;deathReturn.nextAt=now;fixedDeath.lastPlanAt=-Infinity;
+            if(active){ap.replaceQueue.clear();stopAutoPush();areaSweep.status='Limpando área sem inimigos';}
+            else ap.nextAt=now;
+        }
+        return active;
     }
     function observeAreaStructures(packet,now){
-        if(now-areaSweep.lastPacket>Math.max(350,(lag.baselineMs||70)*4))areaSweep.emptySince=null;
+        if(now-areaSweep.lastPacket>Math.max(350,(lag.baselineMs||70)*4)){areaSweep.emptySince=null;areaSweep.quietSince=null;}
         areaSweep.lastPacket=now;
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8,key=String(id);
@@ -5497,6 +5521,7 @@
                 if(t.hp<old.hp){counter.breakProgress.delete(key);counter.breakAvoid.delete(key);}
             }else if(old){counter.breakProgress.delete(key);counter.breakAvoid.delete(key);}
             areaSweep.objects.set(key,t);
+            if(areaSweep.done&&fixedDeath.anchor&&returnDist(t,fixedDeath.anchor)<=settings.fixedDeathRadius){areaSweep.done=false;areaSweep.emptySince=null;}
         }
         for(const [key,t] of areaSweep.objects)
             if(now-t.at>RETURN_MAP_TTL)areaSweep.objects.delete(key);
@@ -5542,7 +5567,7 @@
             if(returnDist(anchor,self)<=Math.min(r,65)&&now-areaSweep.lastPacket<=250&&now-self.at<=250){
                 if(areaSweep.emptySince===null)areaSweep.emptySince=now;
                 if(now-areaSweep.emptySince>=2000){
-                    areaSweep.done=true;areaSweep.status='Área limpa; automações retomadas';ap.nextAt=now;return anchor;
+                    areaSweep.done=true;areaSweep.status='Área limpa; monitorando novas estruturas';return anchor;
                 }
                 areaSweep.status='Confirmando área vazia';return {x:self.x,y:self.y};
             }
@@ -6968,9 +6993,9 @@
             if(!settings.autoRespawn)stopAutoRespawn();
             else if(!player.alive && connected())startAutoRespawn();
         }
-        if(key==='clearDeathStructures'){
+        if(key==='idleAreaCleanup'){
             resetAreaCleanup(false);ap.replaceQueue.clear();ap.nextAt=performance.now();
-            if(settings.clearDeathStructures){stopAutoPush();areaCleanupActive();}
+            if(settings.idleAreaCleanup){stopAutoPush();areaCleanupActive();}
             if(deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;deathReturn.nextAt=performance.now();}
         }
         if(key==='killAura'){
@@ -7096,7 +7121,7 @@
         const counterStatus=menu.querySelector('#nx-counter-status');
         if(counterStatus)counterStatus.textContent=areaCleanupActive()?'Limpeza: '+counter.status:(settings.killAura?'Kill Aura: ':settings.auraBreakSpikes?'Proteção spikes: ':'Kill Aura: ')+((settings.killAura||settings.auraBreakSpikes)?counter.status+(auraEscapeInProgress()?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
         const sweepStatus=menu.querySelector('#nx-area-cleanup-status');
-        if(sweepStatus)sweepStatus.textContent=!settings.clearDeathStructures?'Limpeza desativada':areaSweep.done?'Área limpa; automações retomadas':areaCleanupActive()?areaSweep.status+' • AP/Aura/Replace/Push pausados':'Aguardando ponto fixo';
+        if(sweepStatus){const cleaning=areaCleanupActive();sweepStatus.textContent=!settings.idleAreaCleanup?'Limpeza automática desativada':cleaning?areaSweep.status+' • AP/Aura/Replace/Push pausados':areaSweep.status;}
         const lootStatus=menu.querySelector('#nx-loot-status');
         if(lootStatus)lootStatus.textContent='Loot: '+(settings.collectKillLoot?killLoot.status:'desativado');
         const countStatus=menu.querySelector('#nx-death-count');
@@ -7404,7 +7429,7 @@
             <label>Auto Loot (kill própria)<input data-heal-setting="collectKillLoot" type="checkbox"></label>
             <label>Contornar inimigo sem progresso<input data-heal-setting="orbitCombat" type="checkbox"></label>
             <div class="nx-info-line" id="nx-loot-status">Loot: aguardando kill própria</div>
-            <label title="Uma varredura por ativação ou novo ponto fixo. Inclui construções próprias e inimigas e camas dentro do círculo. Pausa Auto Place, Auto Replace, Kill Aura e Auto Push até concluir. Desligue e ligue para repetir.">Limpar estruturas da área<input data-heal-setting="clearDeathStructures" type="checkbox"></label>
+            <label title="Limpa continuamente construções próprias, aliadas e inimigas dentro do círculo quando não há inimigos. Pausa Auto Place/Replace/Push e ataques a jogadores durante a limpeza. Retoma combate na entrada de um inimigo. Inclui camas; exclui caixas de ouro.">Limpar área sem inimigos<input data-heal-setting="idleAreaCleanup" type="checkbox"></label>
             <div class="nx-info-line" id="nx-area-cleanup-status"></div>
             <label>Raio de detecção (u)<input data-heal-setting="fixedDeathRadius" type="number" min="30" max="1000" step="1"></label>
             <div class="nx-info-line" id="nx-fixed-status"></div>
