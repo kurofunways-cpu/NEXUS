@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.84
+// @version      1.8.85
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -96,6 +96,13 @@
 //   estagnação. Push pode assumir seguimento na área, não retorno inicial.
 //   Força real é do servidor; testar no jogo. Não reduzir agressividade
 //   com bloqueios globais quando a geometria local já evita sobreposição.
+// - 1.8.85: auditoria de ciclo de vida e concorrência. Ignora mortes
+//   duplicadas; Auto Spawn só após morte real. Age Recovery tem prazo e
+//   respeita controle manual. Snapshot próprio precede leitura de chapéu.
+//   Fuga Clown recebe dados mesmo sem aura. Movimento para com dados velhos;
+//   desligar cama não cancela ponto fixo autorizado. Limpeza exige amostras
+//   recentes consecutivas, não tempo decorrido sem dados. AP mantém a
+//   agressividade da 1.8.84. Limites físicos permanecem estimativas.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -105,7 +112,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.84';
+    const NEXUS_VERSION = '1.8.85';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -610,18 +617,21 @@
     }
     function tryAgeRecovery(now=performance.now()) {
         if(!ageRecovery.pending)return;
-        if(clownEscapeActive()){wakeAgeRecovery(150);return;}
         if(!settings.ageRecovery || !player.alive || !connected() ||
             ageRecovery.connectionEpoch!==session.connectionEpoch){
             clearAgeRecovery('Recuperação cancelada');return;
         }
         if(now>ageRecovery.deadline){
-            finishAgeRecovery(ageRecovery.hatConfirmed?'Sem mira/conexão para consumir comida':'Immunity Gear não confirmado pelo servidor');return;
+            finishAgeRecovery(clownEscapeActive()?'Prazo de recuperação expirou durante Clown':ageRecovery.hatConfirmed?'Recuperação: prazo sem condição para consumir comida':'Immunity Gear não confirmado pelo servidor');return;
+        }
+        if(clownEscapeActive()){ageRecovery.status='Aguardando fim do Clown';wakeAgeRecovery(150);return;}
+        if(session.attacking||macro.selected||Object.keys(macroDefs).some(macroActive)||ap.manualItem){
+            ageRecovery.status='Aguardando controle manual';wakeAgeRecovery(80);return;
+        }
+        if(!session.self||now-session.self.at>250||!currentAim()||session.ws.bufferedAmount>1024){
+            ageRecovery.status='Aguardando posição/mira/conexão';wakeAgeRecovery(80);return;
         }
         if(ageRecovery.phase==='equip') {
-            if(session.ws.bufferedAmount>1024 || !session.self || !currentAim()){
-                ageRecovery.status='Aguardando posição/mira para Immunity Gear';wakeAgeRecovery(80);return;
-            }
             // A packet sent before the store/player is ready is not an ACK.
             if(hat.current!==6 || !ageRecovery.hatConfirmed){
                 if(hat.current!==6)requestHat(6,'age',now);
@@ -1892,7 +1902,7 @@
             deathReturn.socketEpoch!==session.connectionEpoch||
             !deathReturn.self||now-deathReturn.self.at>250||ageRecovery.pending)return false;
         if(!settings.autoSpawnBed && !settings.fixedDeathReturn)return false;
-        if(bed.phase==='cancelled' && !fixedDeath.liveMarked)return false;
+        if(bed.phase==='cancelled' && !fixedDeath.liveMarked && !(settings.fixedDeathReturn&&!settings.autoSpawnBed))return false;
         const elapsed=now-bed.spawnAt;
         const noItem=!bed.unlocked&&elapsed>=RETURN_BED_UNLOCK_WAIT;
         const buildTimeout=elapsed>=RETURN_BED_BUILD_WAIT;
@@ -1930,7 +1940,7 @@
             deathReturn.target && returnBedReady() &&
             deathReturn.socketEpoch===session.connectionEpoch &&
             deathReturn.self && now-deathReturn.self.at<=RETURN_SNAPSHOT_TTL &&
-            !deathReturn.manualMove && !bed.locked && !bed.handoffMove && !selfPinned(now) &&
+            !deathReturn.manualMove && !push.manual && !bed.locked && !bed.handoffMove && !selfPinned(now) &&
             // Food selection/attack does not own the movement channel.
             // Waiting for a quiet healing phase can starve the return when
             // rapid healing stays busy for most of a fight.
@@ -2132,7 +2142,10 @@
         if(!['moving','ready','arrived'].includes(deathReturn.phase))return;
         // Arrival is NOT terminal. Continue observing server-confirmed position
         // every snapshot, including when the page is hidden.
-        if(!deathReturn.self || now-deathReturn.self.at>RETURN_SNAPSHOT_TTL)return;
+        if(!deathReturn.self || now-deathReturn.self.at>RETURN_SNAPSHOT_TTL){
+            if(deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.status='Aguardando posição atualizada';deathReturn.nextAt=now;}
+            return;
+        }
         if(selfPinned(now)){
             stopAutoPush();if(deathReturn.moveOwned)stopReturnMovement();
             deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;
@@ -4338,7 +4351,7 @@
     function apCombatBlocked(now){
         if(areaCleanupActive(now))return 'Limpeza da área';
         if(clownEscapeActive())return 'Clown: fuga prioritária';
-        if(now-ap.self.at>AP_PLAYER_TTL)return 'Waiting update';
+        if(!session.self||now-session.self.at>AP_PLAYER_TTL||now-ap.self.at>AP_PLAYER_TTL)return 'Waiting update';
         if(apTyping())return 'Digitando no jogo';
         if(ap.manualItem||now<ap.manualUntil)return 'Manual item';
         if(macro.selected||Object.keys(macroDefs).some(macroActive))return 'Manual macro';
@@ -4570,7 +4583,8 @@
             scheduleUpgradeRetry();
             return;
         }
-        if (transmit([14,p.id])) p.tries++;
+        // Count attempts even when the transport rejects a send.
+        p.tries++;transmit([14,p.id]);
         p.nextAt=now+(PICK_RETRY_GAPS_MS[p.tries-1]||340);
         scheduleUpgradeRetry();
     }
@@ -4621,6 +4635,7 @@
         const profile=profiles.find(p=>p.name===selectedProfile);
         const id=profile?.items[upgrades.stage];
         if (!validId(id) || !upgrades.offer.includes(id)) return;
+        if(session.ws.bufferedAmount>=4096)return;
         if (transmit([14,id])) recordChoice(id,true);
     }
     function receiveOffer(ids) {
@@ -4750,7 +4765,7 @@
         return null;
     }
     function observeCounter(packet,now){
-        if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn) || !player.alive || !session.self ||
+        if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn && !settings.clownEscape && !settings.autoPush) || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
         const self=session.self;
         for(let i=1;i+18<packet.length;i+=19){
@@ -5128,6 +5143,7 @@
         return !!(signature&&!areaSweep.done&&player.alive&&returnAuthorized());
     }
     function observeAreaStructures(packet,now){
+        if(now-areaSweep.lastPacket>Math.max(350,(lag.baselineMs||70)*4))areaSweep.emptySince=null;
         areaSweep.lastPacket=now;
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8,key=String(id);
@@ -5182,7 +5198,7 @@
         const all=areaCleanupCandidates(now),r=settings.fixedDeathRadius;
         if(!all.length){
             areaSweep.target=null;areaSweep.goal=null;
-            if(returnDist(anchor,self)<=Math.min(r,65)&&now-areaSweep.lastPacket<=250){
+            if(returnDist(anchor,self)<=Math.min(r,65)&&now-areaSweep.lastPacket<=250&&now-self.at<=250){
                 if(areaSweep.emptySince===null)areaSweep.emptySince=now;
                 if(now-areaSweep.emptySince>=2000){
                     areaSweep.done=true;areaSweep.status='Área limpa; automações retomadas';ap.nextAt=now;return anchor;
@@ -5940,7 +5956,7 @@
     }
     function tryAutoRespawn(fromDomMutation=false){
         if(!autoRespawn.armed)return;
-        if(!settings.autoRespawn||player.alive||!connected()||
+        if(!settings.autoRespawn||player.alive||!connected()||lifeGate.deathEpoch!==session.connectionEpoch||
             autoRespawn.connectionEpoch!==session.connectionEpoch){
             stopAutoRespawn();return;
         }
@@ -5966,7 +5982,7 @@
     }
     function startAutoRespawn(){
         stopAutoRespawn();
-        if(!settings.autoRespawn||player.alive||!connected())return;
+        if(!settings.autoRespawn||player.alive||!connected()||lifeGate.deathEpoch!==session.connectionEpoch)return;
         autoRespawn.armed=true;autoRespawn.connectionEpoch=session.connectionEpoch;
         autoRespawn.startedAt=performance.now();autoRespawn.attempts=0;
         autoRespawn.lastClickAt=-Infinity;
@@ -6088,11 +6104,14 @@
         }
         if (!packet || !packet.length) return;
         const id = Number(packet[0]);
+        if(!Number.isInteger(id)||id<0||id>255)return;
+        if(id===20&&(!(packet instanceof Uint8Array)||(packet.length-1)%19!==0))return;
         if(id===33||id===35)serverCheckRecord(session.ws,'Servidor respondeu');
         if(id===30)observeDeathChatEcho(packet);
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false,apSnapshotProcessed=false;
         if (id === 35) { // spawn
+            if(packet.length<2||packet[1]===null||!Number.isInteger(Number(packet[1]))||Number(packet[1])<0)return;
             if(player.alive&&Number(packet[1])===player.id)return; // duplicate init must not cancel a live task
             const newDeathLife=!player.alive||deathChat.lifeEpoch!==session.connectionEpoch||deathChat.lifeAt===null;
             finishGoofySpawn();
@@ -6130,7 +6149,9 @@
             if (pending && performance.now()-pending.at<=PRESPAWN_OFFER_MS) receiveOffer(pending.ids);
             updateHealth();
         } else if (id === 19) { // death
+            if(!player.alive)return; // duplicate death must not erase the armed recovery
             markLifeDeath();
+            areaSweep.emptySince=null;
             countDeath(packet);
             if(player.alive){
                 captureSmartDeath();
@@ -6181,8 +6202,12 @@
                 // Incoming angle uses one byte; 65535 / 255 = 257, so both
                 // outgoing bytes are equal. Do not overwrite more precise native aim.
                 session.serverAim = [packet[i + 9], packet[i + 9]];
+                // Publish the current status flags before any hat observer.
+                const now=performance.now();
+                session.self={x:packet[i+4]|packet[i+5]<<8,
+                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],trapped:!!(packet[i+8]&32),clown:!!(packet[i+8]&128),at:now};
                 observeWeapon(packet[i + 10]);
-                observeSelfHat(packet[i + 11]);
+                observeSelfHat(packet[i + 11],now);
                 observeAgeRecoveryHat(packet[i + 11]);
                 if (ap.manualItem && performance.now()>=ap.manualUntil &&
                     (AURA_STATS.has(packet[i+10])||[4,11,26,27,50,59,60,61,62,...session.weaponIds].includes(packet[i+10])) &&
@@ -6192,11 +6217,8 @@
                 // Prioritize healing over costly placement/entity bookkeeping.
                 // This matters when the client receives a large snapshot just
                 // after a server tick stalled for hundreds of milliseconds.
-                const now=performance.now();
                 noteServerSnapshot(now);
                 heal.observedItem=packet[i+10];heal.observedItemAt=now;
-                session.self={x:packet[i+4]|packet[i+5]<<8,
-                    y:packet[i+6]|packet[i+7]<<8,sid:packet[i+1],team:packet[i+12],trapped:!!(packet[i+8]&32),clown:!!(packet[i+8]&128),at:now};
                 const observedHealth=Math.max(0,Math.min(100,
                     packet[i + 13] * 100 / 255));
                 if(observedHealth<player.health-1.5 &&
@@ -6267,6 +6289,9 @@
             return 'Ban informado pelo servidor';
         return 'Desconectado ('+String(event?.code??'—')+'); ban não confirmado';
     }
+    function isGameSocket(ws){
+        try{const u=new URL(ws.url);return (u.protocol==='wss:'||u.protocol==='ws:')&&(u.hostname==='sploop.io'||u.hostname.endsWith('.sploop.io'));}catch(_){return false;}
+    }
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
@@ -6310,7 +6335,7 @@
         const raw = readPacket(data);
         if (raw && raw.length && this!==session.ws &&
             !retiredGameSockets.has(this) && this.readyState===1 &&
-            typeof this.url==='string' && /sploop\.io/i.test(this.url)) {
+            typeof this.url==='string' && isGameSocket(this)) {
             // On server hops the new socket can send before the old one closes.
             bindGameSocket(this);
         }
@@ -6494,7 +6519,10 @@
         if (key==='autoSpawnBed') {
             if (!settings.autoSpawnBed) {
                 abortSpawnBed('Feature disabled');
-                if(['moving','ready','arrived'].includes(deathReturn.phase))
+                if(settings.fixedDeathReturn&&returnAuthorized()&&deathReturn.target){
+                    stopReturnMovement();deathReturn.withoutBed=true;deathReturn.phase='waiting';deathReturn.nextAt=performance.now();
+                    driveReturn();
+                }else if(['moving','ready','arrived'].includes(deathReturn.phase))
                     cancelReturn('Ative Cama no Respawn');
             }
             // Enabling mid-life doesn't construct unexpectedly: next spawn arms it.
@@ -7281,6 +7309,7 @@
     // Chromium can freeze hidden pages altogether. Release owned movement
     // before suspension; resume ONLY after new server snapshots arrive.
     document.addEventListener('freeze',()=>{
+        stopAutoPush();stopClownMovement();clearMacros();
         if(bed.pending && (bed.moveOwned || bed.locked))
             retrySpawnBed('Aba suspensa; retomada automática');
         if(deathReturn.moveOwned){
@@ -7304,7 +7333,18 @@
         drawLocalSpin();drawFixedDeathCircle();requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
-    setInterval(()=>{if(push.owned)driveAutoPush();},100);
+    // Stop owned movement during stalls; do not issue new movement on stale data.
+    setInterval(()=>{
+        if(push.owned)driveAutoPush();
+        const now=performance.now();
+        if(clownFlight.owned&&(!session.self||now-session.self.at>250))stopClownMovement();
+        if(deathReturn.moveOwned&&(!deathReturn.self||now-deathReturn.self.at>RETURN_SNAPSHOT_TTL)){
+            stopReturnMovement();deathReturn.phase='ready';deathReturn.nextAt=now;
+            deathReturn.status='Aguardando posição atualizada';
+        }
+        if(bed.pending&&(bed.locked||bed.moveOwned)&&(!bed.self||now-bed.self.at>BED_SNAPSHOT_TTL))
+            retrySpawnBed('Aguardando posição atualizada',now);
+    },100);
     // Hidden tabs use snapshots plus a timer; no packet bursts on resume.
     setInterval(()=>{if(document.hidden && player.alive){driveCounter();driveSpin();}},SPIN_INTERVAL_MS);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
