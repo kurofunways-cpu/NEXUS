@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.97
+// @version      1.8.98
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -170,6 +170,16 @@
 //   ataca construções próprias/aliadas/inimigas ao alcance, sem desviar;
 //   não ataca loot nem natureza. Cura, cama e comando manual prevalecem.
 //   Dados/ranges públicos são aproximações; não houve teste no jogo.
+// - 1.8.98: Loot próprio identificado tem prioridade sobre jogador,
+//   limpeza/estrutura não urgente e Push, inclusive fora de alcance:
+//   caminho aproxima ao alcance real estimado e golpes não são desviados
+//   para outros alvos. Arma observada no slot é fallback de snapshot;
+//   caixa recém-criada única perto da kill pode ser vinculada mesmo sem
+//   vítima visível (atribuição provável, não confirmação do servidor).
+//   Push (NEXUS/Astral) possui movimento durante seu plano válido;
+//   orbit/recuo não sequestram seu controle. O retorno não envia STOP
+//   sobre Push próprio. Cura/trap perigosa/controle manual têm prioridade.
+//   Testes de lógica simulados, sem confirmação de dano/ouro em jogo.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -179,7 +189,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.97';
+    const NEXUS_VERSION = '1.8.98';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1490,7 +1500,8 @@
             return true;
         }
         killLoot.claim={name,source,at:now,epoch:session.connectionEpoch,key:null,attempts:0,lastAt:-Infinity,
-            victim:null,attackTarget:counter.target?.id??null};
+            victim:null,position:{x:session.self.x,y:session.self.y},
+            attackTarget:now-counter.lastEnemyStrike<=1200?counter.target?.id??null:null};
         killLoot.lastKillAt=now;killLoot.lastKillName=name;
         killLoot.status='Kill própria ('+source+'): aguardando caixa';
         return true;
@@ -1535,6 +1546,17 @@
             if(eligible.length===1)pairs.push({b,e:eligible[0]});
         }
         if(pairs.length!==1){
+            // When the death packet arrives without a final victim snapshot,
+            // one genuinely NEW box close to our position at the local kill
+            // is a bounded fallback. Never use this with competing boxes.
+            const lone=boxes.length===1?boxes[0]:null;
+            if(pairs.length===0&&lone&&victims.length===0&&c.position&&
+                lone.first>=c.at-350&&lone.first<=c.at+3500&&
+                returnDist(lone,c.position)<=185){
+                c.key=lone.key;c.victim=null;
+                killLoot.status='Caixa provável #'+lone.id+' (kill própria, vítima não observada)';
+                return lone;
+            }
             killLoot.status=boxes.length>1||pairs.length>1?'Caixas ambíguas; aguardando evidência':'Kill própria: '+boxes.length+' caixa(s), '+victims.length+' vítima(s) candidata(s)';
             return null;
         }
@@ -1542,14 +1564,33 @@
         killLoot.status='Caixa #'+pairs[0].b.id+' localizada ('+c.source+')';
         return pairs[0].b;
     }
+    function lootWeapon(now){
+        const current=counterWeapon(now);
+        if(current&&COUNTER_REACH.has(current.id))return current;
+        // Saved slots are observed from server snapshots, not guessed from
+        // item inventory. A temporarily absent weapon echo need not stall loot.
+        const selected=session.weaponIds[session.weapon];
+        if(COUNTER_REACH.has(selected))return {id:selected,select:true,packet:[0,session.weapon]};
+        for(let slot=0;slot<2;slot++){
+            const id=session.weaponIds[slot];
+            if(COUNTER_REACH.has(id))return {id,select:true,packet:[0,slot]};
+        }
+        return null;
+    }
+    function lootStrikeRange(w){
+        return w?Math.max(55,Math.min(118,(COUNTER_REACH.get(w.id)??90)-25)):75;
+    }
     function lootCombatGoal(t,self,anchor,now){
-        const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110,d=returnDist(self,t);
-        if(d<=Math.max(48,reach-22))return {x:self.x,y:self.y};
-        const obs=returnObstacles(now,self),r=settings.fixedDeathRadius;
+        const range=lootStrikeRange(lootWeapon(now)),d=returnDist(self,t);
+        if(d<=range-5)return {x:self.x,y:self.y};
+        // The box itself may be present in the navigation map. Do not treat
+        // the target box as a wall blocking every approach to its hit radius.
+        const obs=returnObstacles(now,self).filter(o=>!(o.type===11&&returnDist(o,t)<8));
+        const r=settings.fixedDeathRadius;
         let best=null,score=Infinity;
-        for(const distance of [Math.max(58,reach-30),Math.max(55,reach-45)])for(let i=0;i<32;i++){
+        for(const distance of [Math.max(48,range-15),Math.max(45,range-26)])for(let i=0;i<32;i++){
             const a=i*Math.PI/16,p={x:t.x+distance*Math.cos(a),y:t.y+distance*Math.sin(a)};
-            if(returnDist(p,anchor)>r+25||p.x<30||p.y<30||p.x>65505||p.y>65505||
+            if(returnDist(p,anchor)>r+35||p.x<30||p.y<30||p.x>65505||p.y>65505||
                 obs.some(o=>returnDist(o,p)<o.radius+15)||spikeNavBlocker(self,p,now)||returnBadEdge(self,p,now))continue;
             const value=returnDist(self,p)+(returnSegmentClear(self,p,obs,15)?0:80);
             if(value<score){score=value;best=p;}
@@ -2403,7 +2444,7 @@
             deathReturn.target && returnBedReady() &&
             deathReturn.socketEpoch===session.connectionEpoch &&
             deathReturn.self && now-deathReturn.self.at<=RETURN_SNAPSHOT_TTL &&
-            !deathReturn.manualMove && !push.manual && !bed.locked && !bed.handoffMove && !selfPinned(now) &&
+            !deathReturn.manualMove && !push.manual && !push.owned && !bed.locked && !bed.handoffMove && !selfPinned(now) &&
             // Food selection/attack does not own the movement channel.
             // Waiting for a quiet healing phase can starve the return when
             // rapid healing stays busy for most of a fight.
@@ -2611,10 +2652,22 @@
             deathReturn.nextAt=now;deathReturn.status='Preso: quebrando trap/spike sem andar';
             deathReturn.learningClean=false;return;
         }
-        if(settings.edgeRetreat&&settings.fixedDeathReturn&&fixedDeath.entered&&!deathReturn.manualMove)
-            refreshEdgeRetreat(fixedDeathEnemy(now),deathReturn.self,now);
-        else if(edgeRetreat.active)finishEdgeRetreat(now,'Recuo interrompido');
-        if(!edgeRetreat.active&&(push.owned||(autoPushEnabled()&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
+        // One movement owner per cycle. Confirmed loot has first priority;
+        // otherwise an in-progress or newly available Push owns movement.
+        const loot=ownLootTarget(now);
+        if(loot){
+            if(edgeRetreat.active)finishEdgeRetreat(now,'Coletando caixa da kill própria');
+            if(push.owned)stopAutoPush();
+        }else{
+            if(edgeRetreat.active&&pushCanPreemptRetreat(now))
+                finishEdgeRetreat(now,'Auto Push retomado');
+            if(!edgeRetreat.active&&(push.owned||(autoPushEnabled()&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){
+                deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;
+            }
+            if(settings.edgeRetreat&&settings.fixedDeathReturn&&fixedDeath.entered&&!deathReturn.manualMove)
+                refreshEdgeRetreat(fixedDeathEnemy(now),deathReturn.self,now);
+            else if(edgeRetreat.active)finishEdgeRetreat(now,'Recuo interrompido');
+        }
         refreshFixedDeathGoal(now);
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
@@ -4794,7 +4847,8 @@
         if(!autoPushEnabled())return 'Desativado';
         if(ownLootTarget(now))return 'Coleta de caixa própria';
         if(edgeRetreat.active)return 'Recuo estratégico para o centro';
-        if(settings.orbitCombat&&combatOrbit.point&&now<combatOrbit.until)return 'Contornando inimigo';
+        // Orbit is a fallback for a stalled fight, not a movement owner.
+        // A valid Auto Push plan must always take precedence over orbiting.
         if(clownEscapeActive())return 'Clown: fuga prioritária';
         if(areaCleanupActive(now))return 'Limpeza da área';
         if(!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL)return 'Aguardando posição';
@@ -4816,6 +4870,17 @@
         if(apTyping())return 'Digitando no jogo';
         if(now<push.cooldown)return 'Reavaliando movimento';
         return '';
+    }
+    function pushCanPreemptRetreat(now){
+        const self=ap.self;
+        if(!edgeRetreat.active||!autoPushEnabled()||!self||!player.alive||!connected()||
+            now-self.at>AP_PLAYER_TTL||push.manual||deathReturn.manualMove||session.attacking||
+            bed.pending||bed.locked||ageRecovery.pending||selfPinned(now)||
+            ap.manualItem||now<ap.manualUntil||macro.selected||Object.keys(macroDefs).some(macroActive)||
+            apLagBlocked(now)||session.ws.bufferedAmount>=1024||player.health<=35||
+            now<push.cooldown||ownLootTarget(now))return false;
+        const entities=[...ap.entities.values()];
+        return !!(settings.astralPush?planAstralPush(self,entities,now):planAutoPush(self,entities,now));
     }
     function driveAutoPush(now=performance.now()){
         const blocked=autoPushBlock(now);
@@ -6176,21 +6241,32 @@
         const aiming=driveAuraAim(now),blocked=counterBlockReason(now);
         if(blocked){counter.status='Pausado: '+blocked;return aiming;}
         if(now<counter.nextStrikeAt)return aiming;
-        const w=counterWeapon(now);
-        const enemy=!sweeping&&(settings.killAura||trapCleanupActive(now))&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
-        if(sweeping&&!structure){counter.status='Limpeza: '+areaSweep.status;return false;}
         const urgent=counterUrgentStructure(structure,now);
+        if(loot&&!urgent){
+            const weapon=lootWeapon(now),distance=returnDist(loot,session.self);
+            if(!weapon){counter.status='Loot #'+loot.id+': aguardando arma observada';return aiming;}
+            const range=lootStrikeRange(weapon);
+            if(distance>range){
+                counter.status='Loot #'+loot.id+': aproximando ('+Math.round(distance)+'/'+range+'u)';
+                return aiming;
+            }
+            if(weapon.select&&!transmit(weapon.packet||session.weaponPacket)){
+                counter.status='Loot: falha ao equipar arma';return false;
+            }
+            if(!transmit([19,...targetAim(loot)])){counter.status='Loot: ataque não enviado';return false;}
+            transmit([18]);
+            killLoot.claim.attempts++;killLoot.claim.lastAt=now;
+            counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;
+            counter.aim=targetAim(loot);counter.aimAt=now;
+            killLoot.status='Quebrando caixa própria #'+loot.id+' ('+killLoot.claim.attempts+' tentativas)';
+            counter.status=killLoot.status;return true;
+        }
+        const w=counterWeapon(now);
+        const enemy=!sweeping&&!loot&&(settings.killAura||trapCleanupActive(now))&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
+        if(sweeping&&!structure){counter.status='Limpeza: '+areaSweep.status;return false;}
         if(edgeRetreat.active&&!selfPinned(now)&&!urgent){
             if(strikeRetreatStructure(now))return true;
             counter.status='Recuo: '+(retreatKatana(now)?'sem estrutura próxima':'Katana indisponível');return aiming;
-        }
-        if(loot&&!urgent&&w&&returnDist(loot,session.self)<=COUNTER_REACH.get(w.id)){
-            if(w.select&&!transmit(w.packet||session.weaponPacket))return false;
-            if(transmit([19,...targetAim(loot)])){
-                transmit([18]);killLoot.claim.attempts++;killLoot.claim.lastAt=now;
-                counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;
-                killLoot.status='Quebrando caixa da kill própria';counter.status=killLoot.status;return true;
-            }
         }
         // True capture/contact damage retains priority. Otherwise alternate
         // reachable structure work and enemy defense instead of monopolizing
