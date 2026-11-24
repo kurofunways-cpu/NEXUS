@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.99
+// @version      1.8.100
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -188,6 +188,12 @@
 //   preso, não somente o mais próximo; não inventa captura quando
 //   o movimento ainda é desconhecido. Vídeo não prova comandos
 //   internos dos clientes; tests de simulação não são gameplay.
+// - 1.8.100: segundo alvo capturado não era elegível se o primeiro
+//   jogador no círculo estivesse solto: validação de Push tinha filtro
+//   nearest-only. Agora valida SID/ID e posição recente do próprio alvo
+//   e permite varrer candidatos mantendo foco coletivo como prioridade.
+//   Alvo de Push permanece estável enquanto elegível. Pressão também
+//   verifica obstáculos e usa detour em vez de empurrar cegamente.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -197,7 +203,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.99';
+    const NEXUS_VERSION = '1.8.100';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -4806,8 +4812,11 @@
             !fixedDeath.anchor || fixedDeath.epoch!==session.connectionEpoch ||
             !['ready','moving','arrived'].includes(deathReturn.phase) ||
             deathReturn.manualMove)return false;
-        const a=fixedDeath.anchor,r=settings.fixedDeathRadius,preferred=fixedDeathEnemy(now);
-        if(!preferred||preferred.id!==enemy.id)return false;
+        const a=fixedDeath.anchor,r=settings.fixedDeathRadius;
+        // The nearest player may be free while another is captured. Validate
+        // this enemy's own live entity instead of rejecting every other ID.
+        const observed=counter.players.get(enemy.id);
+        if(!observed||observed.sid!==enemy.sid||now-observed.at>350)return false;
         return apDistance(self,a)<=r+40&&apDistance(enemy,a)<=r+25&&apDistance(goal,a)<=r+30;
     }
     function planAutoPush(self,entities,now){
@@ -4818,7 +4827,8 @@
         let best=null;
         for(const [key,until] of push.avoid)if(now>=until)push.avoid.delete(key);
         const focus=fixedPriorityEnemy(now)?.id;
-        enemies.sort((a,b)=>Number(b.id===focus)-Number(a.id===focus)||apDistance(a,self)-apDistance(b,self)||a.id-b.id);
+        enemies.sort((a,b)=>Number(b.id===focus)-Number(a.id===focus)||
+            Number(b.id===push.target)-Number(a.id===push.target)||apDistance(a,self)-apDistance(b,self)||a.id-b.id);
         for(const e of enemies){
             if(!apCapture(e,traps))continue;
             for(const spike of spikes){
@@ -4886,7 +4896,6 @@
         return null;
     }
     function pushWaypoint(self,plan,entities,now){
-        if(plan.aligned)return plan.goal;
         const obs=entities.filter(e=>apStatic(e,now)&&apDistance(e,self)<=410);
         const valid=p=>pushReturnAllowed(self,plan.enemy,p,now)&&
             apPushPathClear(self,p,obs,self,now)&&!spikeNavBlocker(self,p,now);
@@ -4975,14 +4984,15 @@
         }
         if(distance<2&&!plan.aligned){stopAutoPush();push.status='Alinhamento atingido';return false;}
         if(now-push.lastAt<Math.max(35,Math.min(80,ap.tick*.6)))return true;
-        const angle=plan.aligned&&distance<(plan.astral?1:45)?plan.pressureAngle:
+        const detouring=apDistance(waypoint,plan.goal)>8;
+        const angle=plan.aligned&&!detouring&&distance<(plan.astral?1:45)?plan.pressureAngle:
             Math.atan2(waypoint.y-self.y,waypoint.x-self.x);
         if(!transmit([1,...apAngleBytes(angle)])){
             stopAutoPush();push.status='Falha no envio';return false;
         }
         push.owned=true;push.epoch=session.connectionEpoch;push.lastAt=now;
         push.status=(plan.astral?'Astral • ':'NEXUS • ')+
-            (plan.aligned?'Empurrando para spike próprio':apDistance(waypoint,plan.goal)>12?'Contornando obstáculo':'Alinhando para spike próprio')+' #'+plan.spike.id;
+            (detouring?'Contornando obstáculo':plan.aligned?'Empurrando para spike próprio':'Alinhando para spike próprio')+' #'+plan.spike.id;
         return true;
     }
     function planAutoReplace(self,entities,now) {
