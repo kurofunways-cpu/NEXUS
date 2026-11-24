@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.61
+// @version      1.8.62
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.61';
+    const NEXUS_VERSION = '1.8.62';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -86,12 +86,17 @@
         autoRespawn: false,
         ageRecovery: true, // ONLY after a death observed in this live connection
         returnAfterBed: false,
+        fixedDeathReturn: false,
+        fixedDeathCircle: true,
+        fixedDeathFollow: true,
+        fixedDeathRadius: 120,
         returnSpin: true, // legacy key retained for existing tab preferences
         spinDegreesPerSecond: 180,
         goofyNames: false,
         smartNames: false,
         deathChat: true,
         killAura: false,
+        auraLockAim: true,
         auraBreakSpikes: true,
         copyNearbyHat: false,
         spikeMs: 1,
@@ -108,6 +113,7 @@
     });
     const limits = value => Math.max(1, Math.min(1000, Math.round(Number(value) || 1)));
     function numericSetting(key,value){
+        if(key==='fixedDeathRadius')return Math.max(30,Math.min(1000,Number(value)||120));
         if(key!=='spinDegreesPerSecond')return limits(value);
         const n=Number(value);
         return Number.isFinite(n)&&n>0 ? n : DEFAULTS.spinDegreesPerSecond;
@@ -837,7 +843,7 @@
         bed.awaitFreshAt=now;
         bed.nextAt=now+Math.min(BED_RETRY_MAX_MS,
             BED_RETRY_MIN_MS*2**Math.min(5,bed.retryCount-1));
-        if(settings.returnAfterBed && deathReturn.target && deathReturn.phase==='waiting')
+        if(returnEnabled() && deathReturn.target && deathReturn.phase==='waiting')
             deathReturn.status='Cama: nova tentativa pendente';
         return true;
     }
@@ -848,7 +854,7 @@
         bed.pending=false;
         bed.phase='cancelled';
         bed.abortReason=reason;
-        if(settings.returnAfterBed && deathReturn.target && deathReturn.phase==='waiting')
+        if(returnEnabled() && deathReturn.target && deathReturn.phase==='waiting')
             deathReturn.status='Retorno pausado: cama interrompida';
     }
     function resetSpawnBed() {
@@ -933,6 +939,84 @@
         lastPlanSignature:'',repeatedPlans:0,lastPlanOrigin:null,lastPlanAt:0,
     };
     const returnDist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+    const fixedDeath={anchor:null,epoch:-1,entered:false,targetId:null,lastPlanAt:-Infinity,circle:null};
+    function returnEnabled(){return settings.returnAfterBed || settings.fixedDeathReturn;}
+    function resetFixedDeath(){
+        fixedDeath.anchor=null;fixedDeath.epoch=-1;fixedDeath.entered=false;
+        fixedDeath.targetId=null;fixedDeath.lastPlanAt=-Infinity;
+        if(fixedDeath.circle)fixedDeath.circle.style.display='none';
+    }
+    function fixedDeathAnchor(last){
+        if(!settings.fixedDeathReturn)return null;
+        if(fixedDeath.anchor && fixedDeath.epoch===session.connectionEpoch)return fixedDeath.anchor;
+        if(!last)return null;
+        fixedDeath.anchor={x:last.x,y:last.y};fixedDeath.epoch=session.connectionEpoch;
+        return fixedDeath.anchor;
+    }
+    function fixedDeathEnemy(now){
+        const a=fixedDeath.anchor,self=session.self;
+        if(!settings.fixedDeathReturn || !settings.fixedDeathFollow || !a || !self ||
+            fixedDeath.epoch!==session.connectionEpoch || now-self.at>250)return null;
+        let best=null,distance=settings.fixedDeathRadius;
+        for(const e of counter.players.values()){
+            if(now-e.at>250 || e.id===player.id || e.sid===self.sid ||
+                (self.team!==0 && self.team===e.team))continue;
+            const d=returnDist(e,a);
+            if(d<=distance && (!best || d<distance || e.id<best.id)){best=e;distance=d;}
+        }
+        return best;
+    }
+    function refreshFixedDeathGoal(now){
+        const anchor=fixedDeath.anchor,self=deathReturn.self;
+        if(!settings.fixedDeathReturn || !anchor || !self || !deathReturn.target ||
+            fixedDeath.epoch!==session.connectionEpoch || deathReturn.manualMove)return;
+        if(!fixedDeath.entered && returnDist(self,anchor)<=RETURN_ARRIVED+8)fixedDeath.entered=true;
+        const enemy=fixedDeath.entered?fixedDeathEnemy(now):null;
+        let goal=anchor;
+        if(enemy){
+            const d=returnDist(self,enemy);
+            goal=d<=42?{x:self.x,y:self.y}:{
+                x:enemy.x+(self.x-enemy.x)*40/d,y:enemy.y+(self.y-enemy.y)*40/d};
+            const offset=returnDist(goal,anchor),radius=settings.fixedDeathRadius;
+            if(offset>radius)goal={x:anchor.x+(goal.x-anchor.x)*radius/offset,
+                y:anchor.y+(goal.y-anchor.y)*radius/offset};
+        }
+        const id=enemy?.id??null,changed=id!==fixedDeath.targetId;
+        if(!changed && returnDist(goal,deathReturn.target)<=14)return;
+        if(!changed && enemy && now-fixedDeath.lastPlanAt<120)return;
+        stopReturnMovement();fixedDeath.targetId=id;fixedDeath.lastPlanAt=now;
+        deathReturn.target={x:goal.x,y:goal.y};deathReturn.route=[];deathReturn.step=0;
+        deathReturn.bad=[];deathReturn.fails=0;deathReturn.attempted=0;
+        deathReturn.phase='ready';deathReturn.startedAt=now;deathReturn.nextAt=now;
+        deathReturn.learningClean=false;deathReturn.recorded=[];
+        deathReturn.status=enemy?'Seguindo alvo #'+enemy.id:'Voltando ao ponto fixo';
+    }
+    function fixedCircleGeometry(rect,self,anchor,radius){
+        const scale=Math.max(rect.width/1824,rect.height/1026);
+        return {x:rect.left+rect.width/2+(anchor.x-self.x)*scale,
+            y:rect.top+rect.height/2+(anchor.y-self.y)*scale,radius:radius*scale};
+    }
+    function drawFixedDeathCircle(now=performance.now()){
+        const a=fixedDeath.anchor,self=session.self,canvas=document.getElementById('game-canvas');
+        if(!settings.fixedDeathReturn || !settings.fixedDeathCircle || !player.alive ||
+            !a || !self || fixedDeath.epoch!==session.connectionEpoch ||
+            now-self.at>500 || !canvas || !document.body){
+            if(fixedDeath.circle)fixedDeath.circle.style.display='none';return;
+        }
+        const rect=canvas.getBoundingClientRect();
+        if(!rect.width || !rect.height){if(fixedDeath.circle)fixedDeath.circle.style.display='none';return;}
+        const g=fixedCircleGeometry(rect,self,a,settings.fixedDeathRadius);
+        if(!fixedDeath.circle){
+            const el=document.createElement('div');
+            el.id='nx-fixed-death-circle';el.setAttribute('aria-hidden','true');
+            Object.assign(el.style,{position:'fixed',pointerEvents:'none',zIndex:'40',
+                border:'2px solid rgba(255,210,80,.85)',borderRadius:'50%',
+                boxSizing:'border-box',background:'rgba(255,210,80,.06)'});
+            document.body.appendChild(el);fixedDeath.circle=el;
+        }
+        Object.assign(fixedDeath.circle.style,{display:'block',left:(g.x-g.radius)+'px',
+            top:(g.y-g.radius)+'px',width:2*g.radius+'px',height:2*g.radius+'px'});
+    }
     function stopReturnMovement(force=false) {
         if(deathReturn.moveTimer!==null)clearTimeout(deathReturn.moveTimer);
         deathReturn.moveTimer=null;deathReturn.moveRevision++;
@@ -941,7 +1025,7 @@
         deathReturn.moveOwned=false;
     }
     function resetReturnForServer() {
-        stopReturnMovement(false);
+        resetFixedDeath();stopReturnMovement(false);
         deathReturn.epoch++;
         deathReturn.target=null;deathReturn.lastSelf=null;
         deathReturn.aliveTrail=[];deathReturn.recorded=[];
@@ -1043,15 +1127,20 @@
         deathReturn.lastPlanSignature='';deathReturn.repeatedPlans=0;
         deathReturn.lastPlanOrigin=null;deathReturn.lastPlanAt=0;
         deathReturn.recorded=[];
-        if(!settings.returnAfterBed)return;
+        fixedDeath.entered=false;fixedDeath.targetId=null;
+        if(!returnEnabled())return;
         const last=deathReturn.lastSelf;
+        if(settings.fixedDeathReturn && fixedDeath.anchor && fixedDeath.epoch===session.connectionEpoch){
+            deathReturn.target={...fixedDeath.anchor};return;
+        }
         // Never navigate to a stale or previous-server position.
         if(!last || now-last.at>RETURN_TTL ||
             deathReturn.socketEpoch!==session.connectionEpoch){
             deathReturn.status='Morte: última posição não recebida';return;
         }
         // The circle is a retention boundary, never an arrival boundary.
-        deathReturn.target=previousTarget && returnDist(last,previousTarget)<=RETURN_DEATH_RADIUS
+        deathReturn.target=settings.fixedDeathReturn?{...fixedDeathAnchor(last)}:
+            previousTarget && returnDist(last,previousTarget)<=RETURN_DEATH_RADIUS
             ? previousTarget : {x:last.x,y:last.y};
         const trace=deathReturn.aliveTrail;
         if(trace.length>2)deathReturn.recorded=trace.slice(-500).map(p=>({x:p.x,y:p.y}));
@@ -1555,7 +1644,7 @@
     }
     function saveSuccessfulReturn(){
         const evidence=deathReturn.verifiedPath;
-        if(!deathReturn.learningClean || !deathReturn.target || !bed.origin ||
+        if((settings.fixedDeathReturn && fixedDeath.targetId!==null) || !deathReturn.learningClean || !deathReturn.target || !bed.origin ||
             evidence.length<3 || returnDist(evidence[0],bed.origin)>125 ||
             returnDist(evidence.at(-1),deathReturn.target)>RETURN_ARRIVED+12)return;
         const layout=deathReturn.spawnLayout||'clear',socket=deathReturn.server;
@@ -1576,7 +1665,7 @@
         saveReturnPaths();deathReturn.learned=true;
     }
     function beginReturnIfReady(now=performance.now()){
-        if(!lifeGate.respawnAuthorized||!settings.returnAfterBed||!deathReturn.target||!player.alive||
+        if(!lifeGate.respawnAuthorized||!returnEnabled()||!deathReturn.target||!player.alive||
             deathReturn.phase!=='waiting' || !bed.confirmed ||
             !settings.autoSpawnBed || !bed.self ||
             deathReturn.socketEpoch!==session.connectionEpoch)return false;
@@ -1595,7 +1684,7 @@
         return true;
     }
     function returnCanMove(now){
-        return lifeGate.respawnAuthorized && player.alive && connected() && settings.returnAfterBed &&
+        return lifeGate.respawnAuthorized && player.alive && connected() && returnEnabled() &&
             deathReturn.target && bed.confirmed && !bed.pending &&
             deathReturn.socketEpoch===session.connectionEpoch &&
             deathReturn.self && now-deathReturn.self.at<=RETURN_SNAPSHOT_TTL &&
@@ -1702,7 +1791,7 @@
         spin.lastSentAt=now;return true;
     }
     function driveReturn(now=performance.now()){
-        if(!lifeGate.respawnAuthorized||!settings.returnAfterBed||!player.alive||
+        if(!lifeGate.respawnAuthorized||!returnEnabled()||!player.alive||
             deathReturn.socketEpoch!==session.connectionEpoch)return;
         if(!deathReturn.target){
             if(deathReturn.phase==='waiting')deathReturn.status='Sem posição da morte nesta vida';
@@ -1719,6 +1808,7 @@
         // Arrival is NOT terminal. Continue observing server-confirmed position
         // every snapshot, including when the page is hidden.
         if(!deathReturn.self || now-deathReturn.self.at>RETURN_SNAPSHOT_TTL)return;
+        refreshFixedDeathGoal(now);
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
             const nav=t && auraIsSpike(t)?t:auraNavigationSpike(now);
@@ -1739,7 +1829,7 @@
                 (recentHit && distance>RETURN_ARRIVED+4);
             if(!displaced){
                 deathReturn.driftSamples=0;
-                deathReturn.status='Fixado no local da morte';
+                deathReturn.status=fixedDeath.targetId!==null?'Acompanhando alvo #'+fixedDeath.targetId:'Fixado no local da morte';
                 return;
             }
             // No extra snapshot required: server position itself confirms
@@ -1772,7 +1862,7 @@
                 deathReturn.verifiedPath.push({x:deathReturn.self.x,y:deathReturn.self.y});
             stopReturnMovement();deathReturn.phase='arrived';
             deathReturn.driftSamples=0;deathReturn.arrivals++;
-            deathReturn.status='Fixado no local da morte';
+            deathReturn.status=fixedDeath.targetId!==null?'Acompanhando alvo #'+fixedDeath.targetId:'Fixado no local da morte';
             saveSuccessfulReturn();return;
         }
         if(deathReturn.phase==='moving'){
@@ -1981,7 +2071,7 @@
                 bed.pending=false;bed.confirmed=true;bed.phase='existing';
                 bed.route=[];bed.waypoint=0;bed.moveTo=null;
                 releaseBedInput();
-                if(settings.returnAfterBed && deathReturn.target)
+                if(returnEnabled() && deathReturn.target)
                     beginReturnIfReady(now);
                 return;
             }
@@ -2013,7 +2103,7 @@
                 // Early input release in 1.8.18 could leave a synthetic WASD
                 // handoff active permanently. The opted-in return owns movement
                 // once this bed is confirmed; clear that stale handoff.
-                if(settings.returnAfterBed && deathReturn.target){
+                if(returnEnabled() && deathReturn.target){
                     if(bed.handoffMove){transmit([15]);bed.handoffMove=false;}
                     bed.manualAfterPlacement=false;
                     bed.moveKeys.clear();
@@ -3931,7 +4021,7 @@
             {id:heal.observedItem,select:false}:null;
     }
     function observeCounter(packet,now){
-        if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat) || !player.alive || !session.self ||
+        if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn) || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
         const self=session.self;
         for(let i=1;i+18<packet.length;i+=19){
@@ -4048,10 +4138,9 @@
         return best;
     }
     function spikeBreakReach(now){
-        const hammer=auraHammerAvailable();
-        const w=counterWeapon(now);
-        // A longer-range primary can clear a spike the Hammer cannot reach.
-        return Math.max(COUNTER_REACH.get(hammer)??0,COUNTER_REACH.get(w?.id)??0);
+        const hammer=session.self?.trapped===true?auraHammerAvailable():null;
+        const w=counterWeapon(now),main=session.weaponIds[0];
+        return Math.max(COUNTER_REACH.get(hammer)??0,COUNTER_REACH.get(w?.id)??0,KATANA_WEAPONS.has(main)?COUNTER_REACH.get(main)??0:0);
     }
     function auraNavigationSpike(now,explicitGoal=null){
         const self=session.self;
@@ -4062,7 +4151,7 @@
             (counter.breakAvoid.get(t.key)??0)<=now);
         const bedTask=settings.autoSpawnBed && lifeGate.respawnAuthorized && bed.pending &&
             !bed.handoffMove && !bed.manualAfterPlacement;
-        const returnTask=settings.returnAfterBed && lifeGate.respawnAuthorized && !!deathReturn.target &&
+        const returnTask=returnEnabled() && lifeGate.respawnAuthorized && !!deathReturn.target &&
             ['ready','moving','arrived'].includes(deathReturn.phase) && !deathReturn.manualMove;
         // Remember the blocked leg while its path is paused, never chase the
         // structure once it is outside weapon reach or navigation is cancelled.
@@ -4300,7 +4389,7 @@
         // A deletion or stale position is not proof of freedom. Keep the hat
         // during the clear-confirmation window, but never equip a new one
         // without fresh threat data. Two dangerous enemies override the delay.
-        const allow=escaping && (threats===null?auraHat.owned:threats<=1);
+        const allow=escaping && session.self?.trapped===true && !!target && threats!==null && threats<=1;
         // Manual hat choices get priority. Do not acquire ownership based on a
         // stale or unknown pre-break hat.
         if(allow && !auraHat.owned){
@@ -4342,8 +4431,10 @@
     }
     function strikeAuraTrap(t,now,w){
         const distance=auraTrapDistance(t,session.self);
-        const available=auraHammerAvailable();
+        const available=session.self?.trapped===true?auraHammerAvailable():null;
         const hammer=available!==null && distance<=(COUNTER_REACH.get(available)??0)?available:null;
+        const main=session.weaponIds[0];
+        if(hammer===null && auraIsSpike(t) && KATANA_WEAPONS.has(main))w={id:main,select:true,packet:[0,0]};
         const id=hammer??w?.id, name=auraStructureName(t);
         if(id==null || distance>(COUNTER_REACH.get(id)??0)){counter.status=name+': aguardando arma/alcance';return false;}
         const self=session.self;
@@ -4380,7 +4471,7 @@
             // An exact item selection is the fallback for inventory-only evidence.
             const select=session.weaponIds[1]===id?[0,1]:[2,id];
             if(!transmit(select)){counter.status=name+': falha ao selecionar Hammer';return false;}
-        }else if(w?.select && !transmit(session.weaponPacket))return false;
+        }else if(w?.select && !transmit(w.packet||session.weaponPacket))return false;
         const hit=transmit([19,...aim]);
         transmit([18]);
         if(temporary)restoreWeapon(); // retain watchdog even after successful send
@@ -4393,6 +4484,8 @@
     function selectAuraTarget(now,reach){
         const self=session.self;
         if(!self)return null;
+        const preferred=settings.fixedDeathReturn && fixedDeath.entered?fixedDeathEnemy(now):null;
+        if(preferred && Math.hypot(preferred.x-self.x,preferred.y-self.y)<=reach)return preferred;
         let best=null,bestDistance=reach;
         for(const e of counter.players.values()){
             if(now-e.at>250 || e.id===player.id || e.sid===self.sid ||
@@ -4412,7 +4505,7 @@
             ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024)return null;
         const trap=auraTrapTarget(now);
         if(trap)return trap;
-        if(!settings.killAura)return null;
+        if(!settings.killAura || !settings.auraLockAim)return null;
         const w=counterWeapon(now);
         const saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
         const reach=COUNTER_REACH.get(w?.id??saved);
@@ -4480,6 +4573,10 @@
         transmit([18]);
         counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;counter.target=t;counter.status='Mirando inimigo #'+t.id;
         counter.aim=targetAim(t);counter.aimAt=now;
+        if(!settings.auraLockAim){
+            if(settings.returnSpin)driveSpin(now);
+            else if(currentAim())transmit([13,...currentAim()]);
+        }
         return true;
     }
     // FUN: real public game chat. Prefer the native chat control on visible
@@ -5159,7 +5256,7 @@
         if (this === session.ws && raw && raw.length) {
             // Native movement temporarily owns the controls. Unlike before,
             // it never disables the death-position anchor for the current life.
-            if(settings.returnAfterBed && deathReturn.target &&
+            if(returnEnabled() && deathReturn.target &&
                 ['moving','ready','arrived'].includes(deathReturn.phase)){
                 if(raw[0]===1 || raw[0]===6){
                     deathReturn.manualMove=true;
@@ -5360,8 +5457,14 @@
                 session.nativeAim)transmit([13,...session.nativeAim]);
         }
         // Speed changes preserve the existing phase, avoiding an angle reset.
-        if(key==='returnAfterBed') {
-            if(!settings.returnAfterBed)cancelReturn('Retorno desativado');
+        if(key==='auraLockAim' && !settings.auraLockAim && !settings.returnSpin && !auraTrapTarget(performance.now()) && session.nativeAim && player.alive && connected() && !session.attacking)transmit([13,...session.nativeAim]);
+        if(key==='fixedDeathReturn'){
+            if(!settings.fixedDeathReturn){resetFixedDeath();cancelReturn('Ponto fixo desativado; aguarda nova morte');deathReturn.target=null;}
+            else {cancelReturn('Aguardando primeira morte do modo fixo');deathReturn.target=null;}
+        }
+        if(key==='fixedDeathCircle')drawFixedDeathCircle();
+        if(key==='returnAfterBed' || key==='fixedDeathReturn') {
+            if(!returnEnabled())cancelReturn('Retorno desativado');
             else if(!settings.autoSpawnBed)deathReturn.status='Ative Cama no Respawn';
             else if(deathReturn.target && player.alive && bed.confirmed &&
                     deathReturn.phase==='cancelled'){
@@ -5446,11 +5549,13 @@
             const memoryInfo=memory ? ` • OK ${memory.ok||0} • Rotas bloqueadas ${memory.blocks?.length||0} • Posições rejeitadas ${memory.badGoals?.length||0}` : '';
             bedStatus.textContent=state+memoryInfo+(bed.pending ? ` • Paredes ${bedObstacles().filter(o=>o.type===8||o.type===22).length} • Bloqueios locais ${bed.localBlocked.length}` : '');
         }
+        const fixedStatus=menu.querySelector('#nx-fixed-status');
+        if(fixedStatus)fixedStatus.textContent=!settings.fixedDeathReturn?'Ponto fixo: desativado':fixedDeath.anchor?'Ponto fixo: '+Math.round(fixedDeath.anchor.x)+', '+Math.round(fixedDeath.anchor.y)+(fixedDeath.targetId!==null?' • alvo #'+fixedDeath.targetId:''):'Ponto fixo: aguardando primeira morte';
         const returnStatus=menu.querySelector('#nx-return-status');
-        if(returnStatus)returnStatus.textContent=!settings.returnAfterBed?'Retorno: desativado' :
+        if(returnStatus)returnStatus.textContent=!returnEnabled()?'Retorno: desativado' :
             !settings.autoSpawnBed?'Retorno: ative Cama no Respawn' :
             !deathReturn.target?'Retorno: aguardando uma morte' :
-            deathReturn.status + ` • Raio ${RETURN_DEATH_RADIUS}u` + (['moving','ready','arrived'].includes(deathReturn.phase) ?
+            deathReturn.status + (settings.fixedDeathReturn?' • ponto fixo':` • Raio ${RETURN_DEATH_RADIUS}u`) + (['moving','ready','arrived'].includes(deathReturn.phase) ?
                 ` • ${Math.round(returnDist(deathReturn.self||bed.origin||deathReturn.target,deathReturn.target))} unidades • falhas ${deathReturn.fails}` : '') +
             (deathReturn.frontObstacle && deathReturn.phase!=='arrived' ?
                 ` • Frente: ${returnObstacleLabel(deathReturn.frontObstacle.type)}` : '')+
@@ -5499,7 +5604,7 @@
         if(returnField){
             const distance=deathReturn.target && deathReturn.self ?
                 Math.round(returnDist(deathReturn.self,deathReturn.target)) : null;
-            const detail=settings.returnAfterBed ?
+            const detail=returnEnabled() ?
                 `${deathReturn.status}${distance===null?'':` · ${distance}u`}` : 'DESATIVADO';
             if(returnField.textContent!==detail)returnField.textContent=detail;
         }
@@ -5714,6 +5819,12 @@
             <label title="Após morrer, tenta reequipar o último chapéu observado. O servidor precisa autorizar a compra/equipamento">Último Chapéu<input data-heal-setting="autoLastHat" type="checkbox"></label>
             <label title="Só inicia após morte confirmada e respawn na mesma conexão. Usa caminhos aprendidos, nunca destinos de outra vida ou aba.">Cama no Respawn<input data-heal-setting="autoSpawnBed" type="checkbox"></label>
             <label title="Após confirmar a cama, retorna ao ponto original da morte. Mortes dentro do raio de 120 unidades mantêm esse ponto; fora dele criam um novo. Requer Cama no Respawn.">Fixar no Local da Morte<input data-heal-setting="returnAfterBed" type="checkbox"></label>
+            <label title="Salva a primeira morte nesta conexão, ignora todas as próximas. Tem prioridade sobre o retorno por raio. Requer Cama no Respawn.">Ponto fixo da morte<input data-heal-setting="fixedDeathReturn" type="checkbox"></label>
+            <label>Mostrar círculo do ponto fixo<input data-heal-setting="fixedDeathCircle" type="checkbox"></label>
+            <label>Seguir inimigos dentro do círculo<input data-heal-setting="fixedDeathFollow" type="checkbox"></label>
+            <label>Raio de detecção (u)<input data-heal-setting="fixedDeathRadius" type="number" min="30" max="1000" step="1"></label>
+            <div class="nx-info-line" id="nx-fixed-status"></div>
+            <button type="button" id="nx-fixed-reset">Limpar ponto fixo</button>
             <div class="nx-info-line" id="nx-bed-status">Cama: aguardando respawn</div>
             <div class="nx-info-line" id="nx-return-status">Retorno: aguardando morte</div>
             <div class="pick-actions" style="margin-top:8px">
@@ -5735,6 +5846,7 @@
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
             <label title="Envia o total de mortes ao chat real do jogo após renascer, com intervalo mínimo de 3 segundos. HUD mostra apenas o contador e o estado do envio.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
             <label title="Ataca inimigos no alcance estimado. Prioriza fuga de traps e, se habilitado, spikes em contato. Usa Hammer disponível e restaura a arma anterior. Não persegue nem ataca aliados. Cura e ataque manual têm prioridade.">Kill Aura<input data-heal-setting="killAura" type="checkbox"></label>
+            <label title="Mantém a mira no inimigo entre ataques; desligado, ainda acerta o alvo durante o golpe.">Mirar continuamente no alvo<input data-heal-setting="auraLockAim" type="checkbox"></label>
             <label title="Independente do Kill Aura: quebra spikes inimigos em contato, cercos de respawn e bloqueios da navegação da cama/retorno. Desativar não desliga a fuga de traps.">Quebrar spikes inimigos<input data-heal-setting="auraBreakSpikes" type="checkbox"></label>
             <div class="nx-info-line" id="nx-counter-status">Kill Aura: desativada</div>
             <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
@@ -5817,13 +5929,14 @@
             for (const tab of menu.querySelectorAll('[data-tab]')) tab.setAttribute('aria-selected', String(tab === button));
         });
         menu.querySelector('#nx-chat-test').addEventListener('click',()=>{queueDeathChatTest();refreshInputs();});
+        menu.querySelector('#nx-fixed-reset').addEventListener('click',()=>{resetFixedDeath();if(settings.fixedDeathReturn){cancelReturn('Ponto limpo; aguardando nova morte');deathReturn.target=null;}refreshInputs();});
         menu.querySelector('#nx-death-reset').addEventListener('click',()=>{resetDeathCount();refreshInputs();});
         menu.querySelector('#nx-bed-cancel').addEventListener('click',()=>{
             if(bed.pending)abortSpawnBed('Parada manual pelo HUD');
             refreshInputs();
         });
         menu.querySelector('#nx-return-stop').addEventListener('click',()=>{
-            editSetting('returnAfterBed',false);refreshInputs();
+            editSetting('returnAfterBed',false);editSetting('fixedDeathReturn',false);refreshInputs();
         });
         menu.querySelector('#nx-return-clear').addEventListener('click',()=>{
             returnPaths.length=0;saveReturnPaths();
@@ -6039,7 +6152,7 @@
     },500);
     function spinFrame(){
         if(!document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}
-        requestAnimationFrame(spinFrame);
+        drawFixedDeathCircle();requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
     // Hidden tabs use snapshots plus a timer; no packet bursts on resume.
