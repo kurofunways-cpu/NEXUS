@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.57
+// @version      1.8.58
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.57';
+    const NEXUS_VERSION = '1.8.58';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -92,6 +92,7 @@
         smartNames: false,
         deathChat: true,
         killAura: false,
+        auraBreakSpikes: true,
         copyNearbyHat: false,
         spikeMs: 1,
         trapMs: 1,
@@ -3924,6 +3925,12 @@
         // from a prior life or earlier damage is carried over.
     }
     const AURA_TRAP_TYPE=6, AURA_TRAP_CONTACT=60, AURA_TRAP_RETAIN=70;
+    // Entity IDs corroborated by Astral Lite and the existing placement map.
+    const AURA_SPIKE_TYPES=new Set([2,7,17]);
+    const AURA_SPIKE_BODY=28, AURA_SPIKE_MARGIN=5;
+    function auraIsSpike(t){return AURA_SPIKE_TYPES.has(t.type);}
+    function auraStructureEnabled(t){return !auraIsSpike(t)||settings.auraBreakSpikes;}
+    function auraStructureName(t){return auraIsSpike(t)?'spike':'trap';}
     // World updates may be incremental. Do not forget a stationary trap after
     // ten seconds merely because another trap was updated more recently.
     const AURA_TRAP_TTL=120000, AURA_ESCAPE_CLEAR_MS=700;
@@ -3941,11 +3948,12 @@
     function auraTrapNearby(now,self){
         const result=[];
         for(const t of counter.traps.values()){
-            if(now-t.at>AURA_TRAP_TTL || !auraTrapHostile(t,self))continue;
+            if(now-t.at>AURA_TRAP_TTL || !auraTrapHostile(t,self) || !auraStructureEnabled(t))continue;
             const c=counter.contacts.get(t.key);
             // Hysteresis keeps a confirmed capture valid at its edge, but
             // never makes a distant remembered trap a movement destination.
-            const limit=c?.confirmed?AURA_TRAP_RETAIN:AURA_TRAP_CONTACT;
+            const limit=auraIsSpike(t)?(BED_ENTITY_RADII[t.type]??45)+AURA_SPIKE_BODY+AURA_SPIKE_MARGIN+(c?.confirmed?5:0):
+                c?.confirmed?AURA_TRAP_RETAIN:AURA_TRAP_CONTACT;
             const distance=auraTrapDistance(t,self);
             if(distance<=limit)result.push({t,c,distance});
         }
@@ -3956,11 +3964,15 @@
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
         const self=session.self;
         for(let i=1;i+18<packet.length;i+=19){
-            if(packet[i]!==AURA_TRAP_TYPE)continue;
-            const sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8,key=sid+':'+id;
+            const type=packet[i];
+            if(type!==AURA_TRAP_TYPE && !AURA_SPIKE_TYPES.has(type))continue;
+            const sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8;
+            // Include type for spikes: deleting a spike cannot delete a trap
+            // or another spike tier sharing an owner/entity ID.
+            const key=type===AURA_TRAP_TYPE?sid+':'+id:sid+':'+type+':'+id;
             // Delete ONLY this trap. All other traps and contacts survive.
             if(packet[i+8]&2){dropAuraTrap(key);continue;}
-            const t={key,sid,team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
+            const t={key,type,sid,team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
                 y:packet[i+6]|packet[i+7]<<8,at:now};
             if(!auraTrapHostile(t,self)){dropAuraTrap(key);continue;}
             counter.traps.set(key,t);
@@ -3999,7 +4011,9 @@
         for(const {t,c} of nearby){
             // Keep evidence for every overlapping trap. Once an escape is
             // active, a push into another trap can be handled immediately.
-            if(counter.escapeActive || c?.confirmed){
+            // Recent damage plus actual spike contact is enough to react
+            // during knockback, even before two stationary samples arrive.
+            if(counter.escapeActive || c?.confirmed || (auraIsSpike(t) && now-heal.lastDamageAt<=250)){
                 counter.contacts.set(t.key,{since:c?.since??self.at,samples:c?.samples??1,confirmed:true});
                 continue;
             }
@@ -4024,7 +4038,10 @@
         const nearby=auraTrapNearby(now,self);
         let best=null,distance=Infinity;
         for(const {t,distance:d} of nearby){
-            if(d<distance){distance=d;best=t;}
+            // A touching spike can inflict damage while the trap only pins us.
+            // Prefer that spike, then the nearest eligible structure of its kind.
+            if(!best || (auraIsSpike(t) && !auraIsSpike(best)) ||
+                (auraIsSpike(t)===auraIsSpike(best) && d<distance)){distance=d;best=t;}
         }
         return best;
     }
@@ -4105,8 +4122,8 @@
     }
     function strikeAuraTrap(t,now,w){
         const hammer=auraHammerAvailable();
-        const id=hammer??w?.id;
-        if(id==null){counter.status='Trap: aguardando arma';return false;}
+        const id=hammer??w?.id, name=auraStructureName(t);
+        if(id==null){counter.status=name+': aguardando arma';return false;}
         const self=session.self;
         const aim=apAngleBytes(Math.atan2(t.y-self.y,t.x-self.x));
         const saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
@@ -4116,7 +4133,7 @@
         session.lastAutomationAt=now;
         if(temporary){
             counter.hammerEchoUntil=now+1500;
-            if(!transmit([2,id])){counter.status='Trap: falha ao selecionar Hammer';return false;}
+            if(!transmit([2,id])){counter.status=name+': falha ao selecionar Hammer';return false;}
         }else if(w?.select && !transmit(session.weaponPacket))return false;
         const hit=transmit([19,...aim]);
         transmit([18]);
@@ -4125,7 +4142,7 @@
         }
         counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
         counter.aim=aim;counter.aimAt=now;
-        counter.status=hit?(hammer!==null?'Quebrando trap com Hammer #'+id:'Quebrando trap com arma atual'):'Trap: golpe não enviado';
+        counter.status=hit?('Quebrando '+name+(hammer!==null?' com Hammer #'+id:' com arma atual')):name+': golpe não enviado';
         return true;
     }
     function selectAuraTarget(now,reach){
@@ -4204,7 +4221,7 @@
         const w=counterWeapon(now);
         if(trap)return strikeAuraTrap(trap,now,w);
         if(auraEscapeInProgress()){
-            counter.status='Trap: confirmando liberação';return aiming;
+            counter.status='Confirmando saída de traps/spikes';return aiming;
         }
         if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return aiming;}
         const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
@@ -5063,6 +5080,17 @@
             if(counter.restorePending)recoverAuraWeapon(performance.now());
             if(!settings.killAura)driveAuraHat(performance.now());
         }
+        if(key==='auraBreakSpikes'){
+            // Do not reset trap history or inventory when toggling spikes.
+            if(!settings.auraBreakSpikes){
+                for(const [key,t] of counter.traps)if(auraIsSpike(t))counter.contacts.delete(key);
+                const self=session.self,now=performance.now();
+                if(self && now-self.at<=250 && !auraTrapNearby(now,self).length){
+                    counter.escapeActive=false;counter.clearSince=null;counter.clearSamples=0;
+                    driveAuraHat(now);
+                }
+            }
+        }
         if(key==='copyNearbyHat'){
             resetHatCopy();
             if(!settings.copyNearbyHat && settings.autoLastHat && hat.wanted && player.alive){
@@ -5452,7 +5480,8 @@
             <label title="Com Goofy Names ligado, escolhe nomes com base na duração da vida, mortes seguidas, lag recente, cama destruída ou espinhos próximos. Desligado = nomes aleatórios.">Smart Names<input data-heal-setting="smartNames" type="checkbox"></label>
             <div class="nx-info-line">Memória dos últimos 100 nomes nesta aba</div>
             <label title="Envia o total de mortes ao chat real do jogo após renascer, com intervalo mínimo de 3 segundos. HUD mostra apenas o contador e o estado do envio.">Death Chat<input data-heal-setting="deathChat" type="checkbox"></label>
-            <label title="Ataca inimigos no alcance estimado. Se ficar preso em trap inimiga, prioriza quebrá-la com Hammer disponível e restaura a arma anterior. Não persegue nem ataca aliados. Cura e ataque manual têm prioridade.">Kill Aura<input data-heal-setting="killAura" type="checkbox"></label>
+            <label title="Ataca inimigos no alcance estimado. Prioriza fuga de traps e, se habilitado, spikes em contato. Usa Hammer disponível e restaura a arma anterior. Não persegue nem ataca aliados. Cura e ataque manual têm prioridade.">Kill Aura<input data-heal-setting="killAura" type="checkbox"></label>
+            <label title="Com Kill Aura ativo, quebra spikes inimigos em contato quando preso ou recebendo dano. Desativar não desliga a fuga de traps.">Quebrar spikes inimigos<input data-heal-setting="auraBreakSpikes" type="checkbox"></label>
             <div class="nx-info-line" id="nx-counter-status">Kill Aura: desativada</div>
             <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
             <div class="nx-info-line" id="nx-hat-copy-status">Chapéu: cópia desativada</div>
