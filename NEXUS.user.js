@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.62
+// @version      1.8.63
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.62';
+    const NEXUS_VERSION = '1.8.63';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -75,6 +75,7 @@
         trapMacro: true,
         legitMacro: false,
         autoPlace: false,
+        autoPush: false,
         autoReplace: false,
         autoPlaceTrap: true,
         autoPlaceSpike: true,
@@ -776,6 +777,7 @@
         }
     }
     function claimBedInput(now=performance.now()) {
+        stopAutoPush();
         if (bed.locked) return true;
         if (!bed.pending || !bed.unlocked || !bed.origin || !bed.self || !bedCanWork(now)) return false;
         bed.locked = true;
@@ -1699,6 +1701,7 @@
     function returnMoveTo(point,now){
         const self=deathReturn.self;
         if(!point||!self||!returnCanMove(now))return false;
+        stopAutoPush();
         const blocker=spikeNavBlocker(self,point,now);
         if(blocker){
             if(auraTrapDistance(blocker,self)<=spikeBreakReach(now) && (counter.breakAvoid.get(blocker.key)??0)<=now)pauseReturnForSpike(blocker,now);
@@ -3322,7 +3325,7 @@
     // Smart Auto Place. Independent geometry/scoring implementation; public protocol
     // references: Astral LITE (Greasy Fork 551961) and Socket API (550560).
     // Object sizes, placement radius and latency are estimates, not server guarantees.
-    const AP_RADIUS=70, AP_MAX_RANGE=230, AP_PLAYER_TTL=340, AP_OBJECT_TTL=1600;
+    const AP_RADIUS=70, AP_MAX_RANGE=250, AP_PLAYER_TTL=340, AP_OBJECT_TTL=15000;
     const AP_BURST=12, AP_BATCH_MAX=3; // Local budget, not a server throughput guarantee.
     const AP_OBJECT_RADII={1:75,2:45,3:90,4:76,5:50,6:40,7:45,8:45,9:60,
         10:40,11:40,12:0,13:45,14:90,15:50,16:54,17:42,18:45,19:80,20:80,21:60,22:59};
@@ -3330,16 +3333,20 @@
     // are eligible. Missing/stale objects are not evidence of destruction.
     const AR_TTL=650, AR_MAX_TRIES=2, AR_TOLERANCE=20;
     const autoPlacementEnabled=()=>settings.autoPlace||settings.autoReplace;
+    const apTrackingEnabled=()=>autoPlacementEnabled()||settings.autoPush;
     const ap={entities:new Map(), self:null, nextAt:0, manualUntil:0, manualItem:false,
-        pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off'};
+        pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off',plannedAt:-Infinity};
+    const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,progressAt:0,cooldown:0,status:'Desativado'};
     function resetAutoPlace() {
+        stopAutoPush();push.manual=false;push.cooldown=0;ap.plannedAt=-Infinity;
         if (ap.timer!==null) clearTimeout(ap.timer); ap.timer=null; ap.timerAt=Infinity;
         ap.entities.clear(); ap.self=null; ap.nextAt=0; ap.manualUntil=0;
         ap.manualItem=false; ap.replaceQueue.clear(); ap.replaced=[]; ap.pending=[]; ap.attempts=[]; ap.confirmed=[]; ap.misses=[]; ap.tick=100; ap.lastBatchAt=-Infinity; ap.target=null; ap.targetUntil=0; ap.status='Idle';
     }
     function apDistance(a,b) { return Math.hypot(a.x-b.x,a.y-b.y); }
     function apFriendly(entity,self) {
-        return (entity.type===0 ? entity.id===self.id : entity.sid===self.sid) || (self.team!==0 && self.team===entity.team);
+        if(entity.type===0)return entity.id===self.id || entity.sid===self.sid || (self.team!==0 && self.team===entity.team);
+        return !auraTrapHostile(entity,self);
     }
     function apAngleBytes(angle) {
         const tau=2*Math.PI;
@@ -3356,22 +3363,23 @@
         ap.nextAt=Math.min(ap.nextAt,now);
     }
     function observeAutoPlace(packet, now) {
-        if (!autoPlacementEnabled() || (packet.length-1)%19!==0) return false;
+        if (!apTrackingEnabled() || (packet.length-1)%19!==0) return false;
+        apExpire(now);
         let selfSeen=false;
         const removed=new Set();
         for (let i=1;i+18<packet.length;i+=19) {
             if (!(packet[i+8]&2)) continue;
-            const key=`${packet[i]}:${packet[i+2]|packet[i+3]<<8}`;
-            removed.add(key);
-            queueAutoReplace(key,ap.entities.get(key),now);
-            ap.entities.delete(key);
+            const id=packet[i+2]|packet[i+3]<<8;
+            removed.add(id);
+            for(const [key,e] of ap.entities)if(e.id===id){queueAutoReplace(key,e,now);ap.entities.delete(key);}
         }
         for (let i=1;i+18<packet.length;i+=19) {
             const type=packet[i], sid=packet[i+1], id=packet[i+2]|packet[i+3]<<8;
             const key=`${type}:${id}`;
-            if (removed.has(key)) continue;
+            if (removed.has(id)) continue;
+            for(const [k,e] of ap.entities)if(e.id===id && k!==key)ap.entities.delete(k);
             const x=packet[i+4]|packet[i+5]<<8, y=packet[i+6]|packet[i+7]<<8;
-            const old=ap.entities.get(key), dt=old?now-old.at:0;
+            const prior=ap.entities.get(key),old=prior && prior.sid===sid?prior:null,dt=old?now-old.at:0;
             if (type!==0 && !old && ap.self && sid===ap.self.sid) {
                 let match=-1, bestDistance=45;
                 for (let j=0;j<ap.pending.length;j++) {
@@ -3415,6 +3423,11 @@
         for (const [key,e] of ap.entities) {
             if (now-e.at>(e.type===0?AP_PLAYER_TTL:AP_OBJECT_TTL)) ap.entities.delete(key);
         }
+        if(ap.entities.size>512){
+            const center=ap.self||session.self||{x:0,y:0};
+            const victims=[...ap.entities.entries()].filter(([k,e])=>e!==ap.self).sort((a,b)=>apDistance(b[1],center)-apDistance(a[1],center));
+            for(const [k] of victims.slice(0,ap.entities.size-512))ap.entities.delete(k);
+        }
         apExpire(now);
         return selfSeen || !!ap.self;
     }
@@ -3424,7 +3437,7 @@
         return {angle,dx:AP_RADIUS*Math.cos(angle),dy:AP_RADIUS*Math.sin(angle)};
     });
     function apExpire(now) {
-        const timeout=Math.max(100,Math.min(330,ap.tick*2.1));
+        const timeout=Math.max(160,Math.min(650,ap.tick*3.2));
         ap.pending=ap.pending.filter(p=>{
             if (now-p.at<timeout) return true;
             ap.misses.push({...p,at:now}); return false;
@@ -3449,99 +3462,154 @@
         const t=Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/(dx*dx+dy*dy||1)));
         return Math.hypot(p.x-a.x-t*dx,p.y-a.y-t*dy);
     }
-    // Finisher policy: conservative heuristic, not a server damage guarantee.
-    // Health is a quantized 0..255 value; gear, healing and actual contact damage
-    // are not known reliably from these snapshots. Never treat a guess as a kill.
-    const AP_SPIKE_MAX_HP=12; // at most ~4.7% observed health
-    const AP_SPIKE_CONTACT=74; // estimated player + spike contact distance
-    function spikeFinisher(e,point,clearance,self,now,lead) {
-        if (!e.trapped || !e.captureStable || e.health<=0 || e.health>AP_SPIKE_MAX_HP || e.spikePending || e.existingSpike) return false;
-        if (e.age>Math.min(110,Math.max(45,ap.tick*1.1)) || now-self.at>Math.min(110,Math.max(45,ap.tick*1.1))) return false;
-        if (clearance<35) return false; // reject more marginal geometry than ordinary traps
-        const selfDrift=Math.hypot(self.vx||0,self.vy||0)*lead*.4;
-        const uncertainty=3+e.speed*(e.age+lead)+selfDrift;
-        if (uncertainty>10) return false;
-        // Both the observed position and all short-horizon samples must be
-        // comfortably within the estimated contact radius, not just one sample.
-        return Math.max(apDistance(point,e.observed),...e.path.map(p=>apDistance(point,p)))+uncertainty<=AP_SPIKE_CONTACT;
+    // Tactical placement planner: predicted intercepts and observed capture.
+    // The geometry is estimated; the server remains authoritative.
+    const AP_TRAP_CONTACT=65, AP_SPIKE_CONTACT=78;
+    function apCapture(e,traps){
+        const t=traps.filter(o=>apDistance(o,e)<=65).sort((a,b)=>apDistance(a,e)-apDistance(b,e))[0];
+        return t && ((e.state&32)||((e.stillFrames||0)>=2 && e.motion<=.12 && apDistance(t,e)<=42))?t:null;
     }
-    function planAutoPlace(self, entities, now, count=2) {
+    function apStatic(e,now){
+        return e.type!==0 && !BED_NAV_DYNAMIC.has(e.type) && e.type!==12 && now-e.at<=AP_OBJECT_TTL;
+    }
+    function apPlacementSpace(point,radius,objects,allies){
+        if(point.x<1||point.y<1||point.x>65534||point.y>65534||
+            allies.some(e=>apDistance(point,e)<radius+24) ||
+            ap.pending.some(p=>apDistance(point,p)<radius+(p.key==='KeyF'?40:45)-12))return null;
+        let margin=Infinity;
+        for(const o of objects){
+            const clearance=apDistance(point,o)-(AP_OBJECT_RADII[o.type]??BED_ENTITY_RADII[o.type]??48)-radius;
+            if(clearance< -17)return null;
+            margin=Math.min(margin,clearance);
+        }
+        return margin;
+    }
+    function planAutoPlace(self,entities,now,count=2){
         apExpire(now);
-        const lead=Math.max(25,Math.min(85,ap.tick*.55));
-        const origin=apPredict(self,Math.max(0,now-self.at)+lead*.4);
-        const nearby=entities.filter(e=>apDistance(origin,e)<=AP_MAX_RANGE+140);
+        const lead=Math.max(25,Math.min(100,ap.tick*.65));
+        const origin=apPredict(self,Math.max(0,now-self.at)+lead*.35);
+        const nearby=entities.filter(e=>apDistance(origin,e)<=AP_MAX_RANGE+150);
         const players=nearby.filter(e=>e.type===0 && e.id!==self.id && e.health>0 && now-e.at<=AP_PLAYER_TTL);
-        const objects=nearby.filter(e=>e.type!==0 && e.type!==12 && now-e.at<=AP_OBJECT_TTL);
-        const traps=objects.filter(o=>placementTypes.KeyF.has(o.type)&&apFriendly(o,self));
+        const objects=nearby.filter(e=>apStatic(e,now));
+        const friendly=objects.filter(o=>apFriendly(o,self));
+        const traps=friendly.filter(o=>o.type===6),spikes=friendly.filter(o=>placementTypes.KeyV.has(o.type));
         const allies=players.filter(e=>apFriendly(e,self)).map(e=>apPredict(e,Math.max(0,now-e.at)+lead));
         const enemies=players.filter(e=>!apFriendly(e,self)).map(e=>{
-            const age=Math.max(0,now-e.at),current=apPredict(e,age);
-            // A nearby trap alone does not establish capture; require proximity
-            // plus low observed speed. A moving opponent still gets trap priority.
-            const speed=e.motion??Math.hypot(e.vx||0,e.vy||0);
-            const trapped=traps.some(o=>apDistance(current,o)<42 && apDistance(e,o)<42 && speed<.18);
-            const path=[current,...[lead,lead*1.8,lead*2.6].map(t=>trapped?current:apPredict(e,age+t))];
-            const d=apDistance(origin,current),approach=d-apDistance(origin,path[2]);
-            const pending=!trapped && settings.autoPlaceTrap && ap.pending.some(p=>p.key==='KeyF' && p.target===e.id &&
-                path.slice(1).some((q,i)=>apSegmentDistance(p,path[i],q)<55));
-            const threat=Math.max(0,180-Math.min(d,apDistance(origin,path[2])))*.4+Math.max(0,approach)*.6;
-            const lock=ap.target===e.id && now<ap.targetUntil?12:0;
-            const captureStable=(e.stillFrames||0)>=2 && speed<=.12 && traps.some(o=>
-                apDistance(e,o)<=34 && apDistance(current,o)<=34);
-            const spikePending=ap.pending.some(p=>p.key==='KeyV' && (p.target===e.id || apDistance(p,current)<AP_SPIKE_CONTACT));
-            const existingSpike=objects.some(o=>placementTypes.KeyV.has(o.type) && apFriendly(o,self) && apDistance(o,current)<AP_SPIKE_CONTACT-5);
-            return {current,path,trapped,captureStable,spikePending,existingSpike,observed:e,health:e.health,age,speed,d,approach,pending,id:e.id,threat:threat+lock};
-        }).filter(e=>Math.min(...e.path.map(p=>apDistance(origin,p)))<=AP_MAX_RANGE)
-          .sort((a,b)=>b.threat-a.threat||a.d-b.d).slice(0,4);
-        if (!enemies.length) { ap.target=null; ap.status='No enemy'; return []; }
-        const candidates=[], trapTargets=new Set();
-        for (const r of AP_RING) {
+            const age=Math.max(0,now-e.at),capture=apCapture(e,traps);
+            const path=[0,lead*.7,lead*1.5,lead*2.4].map(dt=>capture?{x:e.x,y:e.y}:apPredict(e,age+dt));
+            const dist=Math.min(...path.map(p=>apDistance(origin,p)));
+            const pendingTrap=ap.pending.some(p=>p.key==='KeyF'&&p.target===e.id);
+            const nearSpike=spikes.some(o=>apDistance(o,e)<=AP_SPIKE_CONTACT);
+            const threat=Math.max(0,AP_MAX_RANGE-dist)+Math.max(0,apDistance(origin,path[0])-apDistance(origin,path[2]))*.5+(ap.target===e.id&&now<ap.targetUntil?12:0);
+            return {e,capture,path,dist,pendingTrap,nearSpike,threat};
+        }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>b.threat-a.threat).slice(0,4);
+        if(!enemies.length){ap.target=null;ap.status='No enemy';return [];}
+        const candidates=[];
+        for(const r of AP_RING){
             const point={x:origin.x+r.dx,y:origin.y+r.dy};
-            if (point.x<0 || point.y<0 || allies.some(e=>apDistance(point,e)<60)) continue;
-            let clearance=Infinity;
-            for (const o of objects) clearance=Math.min(clearance,apDistance(point,o)-(AP_OBJECT_RADII[o.type]??48));
-            if (clearance<20 || ap.pending.some(p=>apDistance(point,p)<48)) continue;
-            for (const key of ['KeyF','KeyV']) {
+            for(const key of ['KeyF','KeyV']){
                 const trap=key==='KeyF',radius=trap?40:45;
-                if (!(trap?settings.autoPlaceTrap:settings.autoPlaceSpike)) continue;
-                const overlap=Math.max(0,radius-clearance);
-                if (overlap>17) continue;
-                const failed=ap.misses.reduce((n,p)=>n+(p.key===key && apDistance(point,p)<27?1:0),0);
-                if (failed>=2) continue;
-                for (const e of enemies) {
-                    if (e.pending || (trap && e.trapped)) continue;
-                    if (!trap && !spikeFinisher(e,point,clearance,self,now,lead)) continue;
-                    const ds=e.path.map(p=>apDistance(point,p));
-                    const path=Math.min(...e.path.slice(1).map((p,i)=>apSegmentDistance(point,e.path[i],p)));
-                    if (path>(trap?61:78)) continue;
-                    // Prefer intercepting the early trajectory over merely being
-                    // close to its endpoint. Reject behind-the-target trap spots
-                    // when a moving target is already leaving the area.
-                    if (trap && ds[0]>45 && ds[1]>ds[0]+8 && ds[2]>ds[1]) continue;
-                    const intercept=trap?Math.min(ds[1],ds[2]+8,ds[3]+18,ds[0]+5):Math.min(...ds);
-                    const score=(trap?100-intercept*1.15-path*.35:110-Math.max(...ds)*1.1-e.health*.5)
-                        +e.threat*.55-overlap*2.5-failed*26+Math.min(12,Math.max(0,clearance-radius)*.25);
-                    // Only high-confidence finishers reach this branch. No spike
-                    // fallback against free enemies, even if no trap fits.
-                    const priority=trap?4:3;
+                if(!(trap?settings.autoPlaceTrap:settings.autoPlaceSpike))continue;
+                const margin=apPlacementSpace(point,radius,objects,allies);
+                if(margin===null)continue;
+                const failures=ap.misses.filter(p=>p.key===key&&apDistance(point,p)<27).length;
+                if(failures>=2)continue;
+                for(const x of enemies){
+                    const {e,capture,path,pendingTrap,nearSpike}=x;
+                    if(pendingTrap || (trap&&capture))continue;
+                    const distances=path.map(p=>apDistance(point,p));
+                    const cross=Math.min(...path.slice(1).map((p,i)=>apSegmentDistance(point,path[i],p)));
+                    if(trap){
+                        if(cross>AP_TRAP_CONTACT || (distances[0]>48&&distances[1]>distances[0]+8&&distances[2]>distances[1]))continue;
+                    }else{
+                        if(cross>AP_SPIKE_CONTACT || (!capture&&distances[0]>AP_SPIKE_CONTACT&&distances[1]>distances[0]))continue;
+                        if(nearSpike&&Math.min(...distances)>60)continue;
+                    }
+                    const priority=trap?4:capture?5:2;
+                    const intercept=trap?Math.min(distances[0]+5,distances[1],distances[2]+8,distances[3]+18):Math.min(...distances);
+                    const score=120-intercept*1.25-cross*.3+x.threat*.35+Math.min(15,margin)*.4-failures*24+(capture&&!trap?20:0);
                     candidates.push({key,angle:r.angle,point,score,priority,target:e.id});
-                    if (trap) trapTargets.add(e.id);
                 }
             }
         }
-        const eligible=candidates.filter(c=>c.key==='KeyF'||!trapTargets.has(c.target));
-        eligible.sort((a,b)=>b.priority-a.priority||b.score-a.score);
+        candidates.sort((a,b)=>b.priority-a.priority||b.score-a.score);
         const chosen=[];
-        for (const c of eligible) {
-            if (chosen.some(p=>apDistance(c.point,p.point)<75 ||
-                p.target===c.target)) continue;
-            // Allow useful spikes against another captured enemy in the same
-            // batch; never replace the leading trap or send speculative fillers.
-            if (chosen.length && (c.priority===1 || (c.priority===chosen[0].priority && c.score<chosen[0].score-28))) continue;
-            chosen.push(c); if (chosen.length===count) break;
+        for(const c of candidates){
+            if(chosen.some(p=>p.target===c.target||apDistance(p.point,c.point)<75))continue;
+            if(chosen.length&&c.priority===chosen[0].priority&&c.score<chosen[0].score-32)continue;
+            chosen.push(c);if(chosen.length>=count)break;
         }
-        if (!chosen.length) ap.status=enemies.some(e=>e.pending)?'Waiting trap':enemies.some(e=>e.trapped)&&settings.autoPlaceSpike?'Waiting finisher':'No valid spot';
+        if(!chosen.length)ap.status=enemies.some(e=>e.pendingTrap)?'Waiting trap confirmation':'No valid spot';
         return chosen;
+    }
+    function stopAutoPush(send=true){
+        if(push.owned&&send&&player.alive&&connected()&&push.epoch===session.connectionEpoch)transmit([15]);
+        push.owned=false;push.target=null;push.spike=null;push.lastAt=-Infinity;
+        push.best=Infinity;push.progressAt=0;push.startedAt=0;
+    }
+    function apPushPathClear(a,b,objects,self){
+        if(b.x<1||b.y<1||b.x>65534||b.y>65534)return false;
+        for(const o of objects){
+            if(o.type===6&&apFriendly(o,self))continue;
+            const radius=(AP_OBJECT_RADII[o.type]??BED_ENTITY_RADII[o.type]??48)+26;
+            if(apSegmentDistance(o,a,b)<radius&&(apDistance(o,a)>=radius||apDistance(o,b)<=apDistance(o,a)+2))return false;
+        }
+        return true;
+    }
+    function planAutoPush(self,entities,now){
+        const objects=entities.filter(e=>apStatic(e,now));
+        const traps=objects.filter(o=>o.type===6&&apFriendly(o,self));
+        const spikes=objects.filter(o=>placementTypes.KeyV.has(o.type)&&apFriendly(o,self));
+        const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=220);
+        let best=null;
+        for(const e of enemies){
+            if(!apCapture(e,traps))continue;
+            for(const spike of spikes){
+                const gap=apDistance(e,spike);
+                if(gap<30||gap>150)continue;
+                const ux=(e.x-spike.x)/gap,uy=(e.y-spike.y)/gap;
+                const behind={x:e.x+ux*68,y:e.y+uy*68};
+                if(apDistance(behind,self)>245)continue;
+                const dot=(self.x-e.x)*ux+(self.y-e.y)*uy,side=Math.abs((self.x-e.x)*uy-(self.y-e.y)*ux);
+                const aligned=dot>=35&&side<=24;
+                const goal=aligned?{x:e.x+ux*32,y:e.y+uy*32}:behind;
+                if(!apPushPathClear(self,goal,objects,self))continue;
+                const score=apDistance(self,goal)+gap*.6-(push.target===e.id?15:0);
+                if(!best||score<best.score)best={enemy:e,spike,goal,aligned,score};
+            }
+        }
+        return best;
+    }
+    function driveAutoPush(now=performance.now()){
+        const self=ap.self;
+        const blocked=!settings.autoPush||!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL||
+            push.manual||session.attacking||bed.pending||bed.locked||bed.handoffMove||deathReturn.moveOwned||
+            (returnEnabled()&&deathReturn.target)||ageRecovery.pending||session.self?.trapped||auraTrapTarget(now)||
+            ap.manualItem||now<ap.manualUntil||macro.selected||Object.keys(macroDefs).some(macroActive)||
+            heal.phase!=='idle'||heal.foodSelected||(isEligible()&&now>=heal.nextAt&&heal.snapshotSerial>heal.sentSnapshotSerial)||
+            pauseAutoPlaceForLag(now)||session.ws.bufferedAmount>=1024||
+            (!document.hidden&&(editing({target:document.activeElement})||(menu&&!menu.hidden)));
+        if(blocked||now<push.cooldown){stopAutoPush();push.status=settings.autoPush?'Pausado':'Desativado';return false;}
+        const plan=planAutoPush(self,[...ap.entities.values()],now);
+        if(!plan){stopAutoPush();push.status='Sem combinação trap + spike';return false;}
+        const distance=apDistance(self,plan.goal);
+        if(push.target!==plan.enemy.id||push.spike!==plan.spike.id){
+            stopAutoPush();push.target=plan.enemy.id;push.spike=plan.spike.id;
+            push.startedAt=now;push.progressAt=now;push.best=distance;
+        }
+        if(distance<push.best-3){push.best=distance;push.progressAt=now;}
+        if(now-push.startedAt>3200||(distance>14&&now-push.progressAt>650)){
+            stopAutoPush();push.cooldown=now+800;push.status='Sem progresso; pausado';return false;
+        }
+        if(distance<=12){
+            if(push.owned){transmit([15]);push.owned=false;}
+            push.status='Alinhado com spike';return true;
+        }
+        if(now-push.lastAt<80)return true;
+        if(!transmit([1,...apAngleBytes(Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x))])){stopAutoPush();return false;}
+        push.owned=true;push.epoch=session.connectionEpoch;push.lastAt=now;
+        push.status=plan.aligned?'Empurrando para spike':'Alinhando atrás do alvo';
+        return true;
     }
     function planAutoReplace(self,entities,now) {
         if (!settings.autoReplace) return [];
@@ -3552,7 +3620,7 @@
             .map(e=>apPredict(e,Math.max(0,now-e.at)+lead));
         const candidates=[];
         for (const r of ap.replaceQueue.values()) {
-            if (settings.autoPlace && !(r.key==='KeyF'?settings.autoPlaceTrap:settings.autoPlaceSpike)) continue;
+            if (!(r.key==='KeyF'?settings.autoPlaceTrap:settings.autoPlaceSpike)) continue;
             if (r.tries>=AR_MAX_TRIES || now-r.last<Math.max(100,ap.tick*2.1)) continue;
             const distance=apDistance(origin,r);
             // Direction alone cannot choose an arbitrary distance: only replace
@@ -3562,7 +3630,7 @@
             const point={x:origin.x+AP_RADIUS*Math.cos(angle),y:origin.y+AP_RADIUS*Math.sin(angle)};
             if (point.x<0 || point.y<0 || allies.some(e=>apDistance(point,e)<60) || ap.pending.some(p=>apDistance(point,p)<48)) continue;
             const radius=r.key==='KeyF'?40:45;
-            if (entities.some(o=>o.type!==0 && o.type!==12 && now-o.at<=AP_OBJECT_TTL &&
+            if (entities.some(o=>apStatic(o,now) &&
                 apDistance(point,o)<(AP_OBJECT_RADII[o.type]??48)+radius-17)) continue;
             // Reject positions that repeatedly failed rather than consuming
             // another cycle exclusively on the same bad location.
@@ -3595,7 +3663,7 @@
         if (allowMaintenance && !chosen.length) {
             // Rebuild at most one unrelated structure per batch, preserving
             // budget for the next incoming combat update.
-            const r=replacements.find(r=>r.key==='KeyF'); // never build a speculative maintenance spike
+            const r=replacements[0]; // confirmed own structure removal
             if (r) chosen.push(r);
         }
         return chosen;
@@ -3634,7 +3702,7 @@
         }
         const blocked = ap.manualItem || now<ap.manualUntil ? 'Manual item' :
             macro.selected || Object.keys(macroDefs).some(macroActive) ? 'Manual macro' :
-            heal.phase!=='idle' || (isEligible() && now>=heal.nextAt) ? 'Heal' : !currentAim() ? 'No aim' : '';
+            ageRecovery.pending || counter.restorePending || heal.foodSelected || heal.phase!=='idle' || (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ? 'Heal/weapon restore' : !currentAim() ? 'No aim' : '';
         if (blocked) { ap.status=blocked; scheduleAutoPlace(5); return; }
         if (now<ap.nextAt) { scheduleAutoPlace(ap.nextAt-now); return; }
         // Reserve more background bandwidth for Heal/Age Recovery. Auto Place
@@ -3650,22 +3718,20 @@
             scheduleAutoPlace(Math.max(1,(cost-macro.tokens)*1000/rate,
                 session.ws.bufferedAmount>=queueLimit?40:0));return;
         }
+        const planGap=Math.max(15,Math.min(50,ap.tick*.35));
+        if(now-ap.plannedAt<planGap){scheduleAutoPlace(planGap-(now-ap.plannedAt));return;}
+        ap.plannedAt=now;
         const entities=[...ap.entities.values()];
         const combat=settings.autoPlace?planAutoPlace(ap.self,entities,now,AP_BATCH_MAX):[];
         const combatStatus=ap.status;
         const replacements=planAutoReplace(ap.self,entities,now);
         const candidates=mergePlacementPlans(combat,replacements,!settings.autoPlace||combatStatus==='No enemy');
-        if (!settings.autoPlace && settings.autoReplace && settings.autoPlaceSpike && replacements.some(r=>r.key==='KeyV')) {
-            const finishers=planAutoPlace(ap.self,entities,now,AP_BATCH_MAX).filter(c=>c.key==='KeyV');
-            const matched=mergePlacementPlans(finishers,replacements,false).filter(c=>c.replaceId!==undefined);
-            if (matched.length) candidates.splice(0,candidates.length,...matched);
-        }
         if (!candidates.length) {
             if (!settings.autoPlace || combatStatus==='No enemy') {
                 if (ap.replaceQueue.size) ap.status='Replace waiting';
                 else if (!settings.autoPlace) ap.status='Replace idle';
             }
-            scheduleAutoPlace(document.hidden?35:8);return;
+            scheduleAutoPlace(document.hidden?65:Math.max(20,ap.tick*.5));return;
         }
         const capacity=Math.floor((macro.tokens-overhead)/3);
         // First placement is immediate. During sustained placement, amortize the
@@ -5202,9 +5268,9 @@
             lastMenuSnapshotPaint=performance.now();
             refreshInputs();
         }
-        if (id===20 && packet instanceof Uint8Array && player.alive && autoPlacementEnabled()) {
+        if (id===20 && packet instanceof Uint8Array && player.alive && apTrackingEnabled()) {
             const now=performance.now();
-            if (observeAutoPlace(packet,now)) runAutoPlace(now);
+            if (observeAutoPlace(packet,now)){driveAutoPush(now);runAutoPlace(now);}
         }
         if(player.alive){if(!driveCounter())driveSpin();driveHatCopy();announceDeathCount();}
     }
@@ -5254,6 +5320,7 @@
             bindGameSocket(this);
         }
         if (this === session.ws && raw && raw.length) {
+            if(!bed.locked && (raw[0]===1||raw[0]===6||raw[0]===15)){stopAutoPush(false);push.manual=raw[0]!==15;}
             // Native movement temporarily owns the controls. Unlike before,
             // it never disables the death-position anchor for the current life.
             if(returnEnabled() && deathReturn.target &&
@@ -5384,8 +5451,9 @@
         if (key === 'spikeMacro' && !settings.spikeMacro) macro.held.KeyV=false;
         if (key === 'trapMacro' && !settings.trapMacro) macro.held.KeyF=false;
         if (key==='legitMacro') clearMacros();
-        if (key==='autoPlace'||key==='autoReplace') {
-            if (!autoPlacementEnabled()) { const item=ap.manualItem, until=ap.manualUntil; resetAutoPlace(); ap.manualItem=item; ap.manualUntil=until; }
+        if (key==='autoPlace'||key==='autoReplace'||key==='autoPush') {
+            if(!settings.autoPush)stopAutoPush();
+            if (!apTrackingEnabled()) { const item=ap.manualItem, until=ap.manualUntil,manual=push.manual; resetAutoPlace(); ap.manualItem=item; ap.manualUntil=until;push.manual=manual; }
             else { if (!settings.autoReplace) ap.replaceQueue.clear(); ap.nextAt=0; if (ap.self) scheduleAutoPlace(1); }
         }
         if (key === 'spikeMacro' || key === 'trapMacro' || key === 'spikeMs' || key === 'trapMs') {
@@ -5520,6 +5588,8 @@
     }
     function refreshInputs() {
         if (!menu) return;
+        const pushStatus=menu.querySelector('#nx-push-status');
+        if(pushStatus)pushStatus.textContent='Auto Push: '+(settings.autoPush?push.status:'desativado');
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
         if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
@@ -5868,7 +5938,9 @@
             <label title="Predict nearby opponent movement and search placement angles">Smart Auto Place<input data-heal-setting="autoPlace" type="checkbox"></label>
             <label title="Rebuild removed own traps; spikes only at approved finisher positions">Auto Replace<input data-heal-setting="autoReplace" type="checkbox"></label>
             <label title="Prioritize trapping free opponents before placing spikes">Auto Trap<input data-heal-setting="autoPlaceTrap" type="checkbox"></label>
-            <label title="Only use automatic spikes for low-health, stable trapped opponents with high-confidence estimated contact; no guaranteed kill">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
+            <label title="Spikes para inimigos capturados ou em contato previsto, sem limite artificial de HP">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
+            <label title="Alinha o personagem atrás de inimigos presos para empurrá-los contra spikes próprios/aliados. Não interfere com retorno, cura ou movimento manual.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-push-status">Auto Push: desativado</div>
             <label title="Minimum interval between automatic attempts; server updates may be slower">Place ms<input data-heal-setting="autoPlaceMs" type="number" min="1" max="1000" step="1"></label>
             <label title="Local Auto Place packet budget only; higher values may cause lag or rejection">AP packets/s<input data-heal-setting="autoPlaceRate" type="number" min="240" max="480" step="20"></label>
           </div>
@@ -6094,6 +6166,7 @@
         // Never continue a movement command issued before browser suspension.
         // Fresh authoritative data is required before any next movement.
         const now=performance.now();
+        if(push.owned && (!ap.self || now-ap.self.at>AP_PLAYER_TTL))stopAutoPush();
         if(deathReturn.moveOwned &&
            (!deathReturn.self || now-deathReturn.self.at>RETURN_SNAPSHOT_TTL)){
             stopReturnMovement();
@@ -6155,6 +6228,7 @@
         drawFixedDeathCircle();requestAnimationFrame(spinFrame);
     }
     requestAnimationFrame(spinFrame);
+    setInterval(()=>{if(push.owned)driveAutoPush();},100);
     // Hidden tabs use snapshots plus a timer; no packet bursts on resume.
     setInterval(()=>{if(document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}},SPIN_INTERVAL_MS);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
