@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.88
+// @version      1.8.89
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -117,6 +117,11 @@
 //   Restauração de Hammer limitada; após falhas retoma combate com arma
 //   conhecida. Death Chat usa até duas mensagens legíveis de 35 bytes
 //   (ou limite nativo menor), respeitando intervalo e mesma vida.
+// - 1.8.89: foco coletivo prioriza o último inimigo a entrar no círculo.
+//   Compartilha eventos via localStorage, restritos a servidor/centro/raio.
+//   Cada aba valida SID, ID, equipe, posição e frescor local; não autoriza
+//   movimento novo, não persegue fora da área. Sem alvo válido, usa o
+//   inimigo mais próximo elegível. Abas em outros dispositivos não sincronizam.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -126,7 +131,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.88';
+    const NEXUS_VERSION = '1.8.89';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1067,9 +1072,11 @@
     };
     const returnDist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
     const FIXED_MARK_KEY=PREFIX+'fixed_mark_command_v1';
+    const FIXED_FOCUS_KEY=PREFIX+'fixed_focus_event_v1';
     const fixedDeath={anchor:null,epoch:-1,entered:false,targetId:null,lastPlanAt:-Infinity,circle:null,liveMarked:false,camera:null};
     function returnEnabled(){return settings.returnAfterBed || settings.fixedDeathReturn;}
     function resetFixedDeath(){
+        resetFixedFocus();
         fixedDeath.anchor=null;fixedDeath.epoch=-1;fixedDeath.entered=false;fixedDeath.liveMarked=false;
         fixedDeath.targetId=null;fixedDeath.lastPlanAt=-Infinity;fixedDeath.camera=null;
         if(fixedDeath.circle)fixedDeath.circle.style.display='none';
@@ -1081,10 +1088,88 @@
         fixedDeath.anchor={x:last.x,y:last.y};fixedDeath.epoch=session.connectionEpoch;
         return fixedDeath.anchor;
     }
+    const fixedFocus={scope:null,seen:new Map(),initialized:false,event:null,invalid:false};
+    function resetFixedFocus(){
+        fixedFocus.scope=null;fixedFocus.seen.clear();fixedFocus.initialized=false;
+        fixedFocus.event=null;fixedFocus.invalid=false;
+    }
+    function fixedFocusScope(){
+        const a=fixedDeath.anchor;
+        return settings.fixedDeathReturn&&settings.fixedDeathFollow&&a&&connected()&&fixedDeath.epoch===session.connectionEpoch?
+            JSON.stringify([String(session.ws.url),a.x,a.y,settings.fixedDeathRadius]):null;
+    }
+    function syncFixedFocusScope(){
+        const scope=fixedFocusScope();
+        if(scope!==fixedFocus.scope){
+            resetFixedFocus();fixedFocus.scope=scope;
+            if(scope){try{receiveFixedFocus(localStorage.getItem(FIXED_FOCUS_KEY));}catch(_){}}
+        }
+        return scope;
+    }
+    function receiveFixedFocus(raw){
+        try{
+            const p=JSON.parse(raw||'null'),scope=fixedFocusScope();
+            if(!scope||!p||p.scope!==scope||!Number.isInteger(p.id)||p.id<0||!Number.isInteger(p.sid)||p.sid<0||
+                !Number.isFinite(p.at)||Math.abs(Date.now()-p.at)>5000)return false;
+            if(fixedFocus.scope!==scope){resetFixedFocus();fixedFocus.scope=scope;}
+            const old=fixedFocus.event;
+            if(old&&(p.at<old.at||(p.at===old.at&&p.id<=old.id)))return false;
+            fixedFocus.event=p;fixedFocus.invalid=false;
+            return true;
+        }catch(_){return false;}
+    }
+    function publishFixedFocus(e){
+        const scope=fixedFocus.scope;if(!scope)return;
+        try{receiveFixedFocus(localStorage.getItem(FIXED_FOCUS_KEY));}catch(_){}
+        const at=Date.now(),old=fixedFocus.event;
+        // Several tabs can see the same crossing one snapshot apart.
+        if(old&&old.id===e.id&&old.sid===e.sid&&at-old.at<1500&&!fixedFocus.invalid)return;
+        const p={scope,id:e.id,sid:e.sid,at:Math.max(at,old?old.at+1:at)};
+        fixedFocus.event=p;fixedFocus.invalid=false;
+        try{localStorage.setItem(FIXED_FOCUS_KEY,JSON.stringify(p));}catch(_){}
+    }
+    function observeFixedFocus(now,updated,removed){
+        if(!syncFixedFocusScope())return;
+        const self=session.self,a=fixedDeath.anchor;
+        if(!self)return;
+        for(const id of removed){
+            fixedFocus.seen.delete(id);
+            if(fixedFocus.event?.id===id)fixedFocus.invalid=true;
+        }
+        const entrants=[];
+        for(const e of updated){
+            const old=fixedFocus.seen.get(e.id);
+            const hostile=e.id!==player.id&&e.sid!==self.sid&&!(self.team!==0&&self.team===e.team);
+            const inside=hostile&&returnDist(e,a)<=settings.fixedDeathRadius;
+            const same=old&&old.sid===e.sid;
+            if(inside&&fixedFocus.initialized&&(!same||!old.inside))entrants.push(e);
+            fixedFocus.seen.set(e.id,{sid:e.sid,inside,at:now});
+            if(fixedFocus.event?.id===e.id&&(!inside||fixedFocus.event.sid!==e.sid))fixedFocus.invalid=true;
+        }
+        // Initial observation establishes a baseline, not a fake entry.
+        if(updated.length||session.self&&now-session.self.at<=250)fixedFocus.initialized=true;
+        for(const [id,p] of fixedFocus.seen)if(now-p.at>10000)fixedFocus.seen.delete(id);
+        if(entrants.length){
+            // Deterministic order if multiple players enter in one packet.
+            entrants.sort((a,b)=>a.id-b.id);
+            publishFixedFocus(entrants[0]);
+        }
+    }
+    function fixedPriorityEnemy(now,reach=Infinity){
+        if(!syncFixedFocusScope()||fixedFocus.invalid)return null;
+        const p=fixedFocus.event,self=session.self;
+        if(!p||!self||now-self.at>250)return null;
+        const e=counter.players.get(p.id);
+        if(!e||e.sid!==p.sid||now-e.at>(reach===Infinity?350:250)||e.id===player.id||e.sid===self.sid||
+            (self.team!==0&&self.team===e.team)||returnDist(e,fixedDeath.anchor)>settings.fixedDeathRadius||
+            returnDist(e,self)>reach)return null;
+        return e;
+    }
     function fixedDeathEnemy(now,reach=Infinity){
         const a=fixedDeath.anchor,self=session.self;
         if(!settings.fixedDeathReturn || (!settings.fixedDeathFollow && reach===Infinity) || !a || !self ||
             fixedDeath.epoch!==session.connectionEpoch || now-self.at>250)return null;
+        const focus=fixedPriorityEnemy(now,reach);if(focus)return focus;
         let best=null,distance=reach;
         for(const e of counter.players.values()){
             if(now-e.at>(reach===Infinity?350:250) || e.id===player.id || e.sid===self.sid ||
@@ -1111,7 +1196,7 @@
             editSetting('fixedDeathReturn',true,remote);
             if(remote&&isTabIndependent('fixedDeathReturn'))persist('fixedDeathReturn');
         }
-        stopAutoPush();stopReturnMovement();
+        stopAutoPush();stopReturnMovement();resetFixedFocus();
         fixedDeath.anchor={x:point.x,y:point.y};fixedDeath.epoch=session.connectionEpoch;
         fixedDeath.entered=!!(player.alive&&self&&now-self.at<=250&&returnDist(self,point)<=settings.fixedDeathRadius);
         fixedDeath.liveMarked=player.alive;fixedDeath.targetId=null;fixedDeath.lastPlanAt=-Infinity;fixedDeath.camera=null;
@@ -4173,7 +4258,10 @@
             const inReach=dist<=165;
             const threat=Math.max(0,AP_MAX_RANGE-dist)+Math.max(0,apDistance(origin,path[0])-apDistance(origin,path[2]))*.5+(ap.target===e.id&&now<ap.targetUntil?12:0);
             return {e,capture,path,dist,pendingTrap,pendingSpike,nearbySpikes,nearSpike,threat,inReach};
-        }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>apDistance(a.e,self)-apDistance(b.e,self)||a.e.id-b.e.id).slice(0,4);
+        }).filter(x=>x.dist<=AP_MAX_RANGE).sort((a,b)=>{
+            const focus=fixedPriorityEnemy(now)?.id;
+            return Number(b.e.id===focus)-Number(a.e.id===focus)||apDistance(a.e,self)-apDistance(b.e,self)||a.e.id-b.e.id;
+        }).slice(0,4);
         if(!enemies.length){ap.target=null;ap.status='No enemy';return [];}
         const candidates=[];
         for(const r of AP_RING){
@@ -4279,7 +4367,8 @@
         const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<=300);
         let best=null;
         for(const [key,until] of push.avoid)if(now>=until)push.avoid.delete(key);
-        enemies.sort((a,b)=>apDistance(a,self)-apDistance(b,self)||a.id-b.id);
+        const focus=fixedPriorityEnemy(now)?.id;
+        enemies.sort((a,b)=>Number(b.id===focus)-Number(a.id===focus)||apDistance(a,self)-apDistance(b,self)||a.id-b.id);
         for(const e of enemies){
             if(!apCapture(e,traps))continue;
             for(const spike of spikes){
@@ -4880,17 +4969,19 @@
     function observeCounter(packet,now){
         if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn && !settings.clownEscape && !settings.autoPush) || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
-        const self=session.self;
+        const self=session.self,updated=[],removed=[];
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8,sid=packet[i+1];
-            if(type===0 && (packet[i+8]&2)){counter.players.delete(id);if(counter.target?.id===id)counter.target=null;continue;}
+            if(type===0 && (packet[i+8]&2)){counter.players.delete(id);removed.push(id);if(counter.target?.id===id)counter.target=null;continue;}
             if(packet[i+8]&2)continue;
             const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
             if(type!==0 || id===player.id || sid===self.sid)continue;
-            if(packet[i+13]===0){counter.players.delete(id);if(counter.target?.id===id)counter.target=null;continue;}
-            counter.players.set(id,{id,sid,x,y,at:now,weapon:packet[i+10],hat:packet[i+11],
-                team:packet[i+12],state:packet[i+8],angle:packet[i+9]*2*Math.PI/255-Math.PI});
+            if(packet[i+13]===0){counter.players.delete(id);removed.push(id);if(counter.target?.id===id)counter.target=null;continue;}
+            const e={id,sid,x,y,at:now,weapon:packet[i+10],hat:packet[i+11],
+                team:packet[i+12],state:packet[i+8],angle:packet[i+9]*2*Math.PI/255-Math.PI};
+            counter.players.set(id,e);updated.push(e);
         }
+        observeFixedFocus(now,updated,removed);
         for(const [id,e] of counter.players)if(now-e.at>900)counter.players.delete(id);
         if(counter.players.size>128)for(const [id] of [...counter.players.entries()].sort((a,b)=>a[1].at-b[1].at).slice(0,counter.players.size-128))counter.players.delete(id);
         if(settings.copyNearbyHat){
@@ -6815,7 +6906,7 @@
         const slots=menu.querySelector('#nx-trap-slots');
         if(slots){const now=performance.now();slots.textContent='Traps próprias: '+ownTrapCount(now)+'/'+OWN_TRAP_LIMIT+' • Spikes próprios: '+ownSpikeCount(now)+'/'+OWN_SPIKE_LIMIT+(trapCleanupActive(now)?' • liberando vagas':'');}
         const fixedStatus=menu.querySelector('#nx-fixed-status');
-        if(fixedStatus)fixedStatus.textContent=!settings.fixedDeathReturn?'Ponto fixo: desativado':fixedDeath.anchor?'Ponto fixo: '+Math.round(fixedDeath.anchor.x)+', '+Math.round(fixedDeath.anchor.y)+(fixedDeath.targetId!==null?' • alvo #'+fixedDeath.targetId:''):'Ponto fixo: aguardando primeira morte';
+        if(fixedStatus){const focus=fixedPriorityEnemy(performance.now());fixedStatus.textContent=!settings.fixedDeathReturn?'Ponto fixo: desativado':fixedDeath.anchor?'Ponto fixo: '+Math.round(fixedDeath.anchor.x)+', '+Math.round(fixedDeath.anchor.y)+(focus?' • foco coletivo #'+focus.id:fixedDeath.targetId!==null?' • alvo #'+fixedDeath.targetId:''):'Ponto fixo: aguardando primeira morte';}
         const returnStatus=menu.querySelector('#nx-return-status');
         if(returnStatus)returnStatus.textContent=!returnEnabled()?'Retorno: desativado' :
             !settings.autoSpawnBed&&!settings.fixedDeathReturn?'Retorno: ative Cama no Respawn' :
@@ -7363,6 +7454,7 @@
     window.addEventListener('storage',event=>{
         if (event.storageArea && event.storageArea!==localStorage) return;
         if(event.key===FIXED_MARK_KEY){receiveFixedMark(event.newValue);refreshInputs();return;}
+        if(event.key===FIXED_FOCUS_KEY){if(receiveFixedFocus(event.newValue))refreshInputs();return;}
         if (event.key===GAME_TOGGLES_KEY) {
             try {
                 const incoming=JSON.parse(event.newValue||'{}');
