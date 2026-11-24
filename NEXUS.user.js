@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.56
+// @version      1.8.57
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.56';
+    const NEXUS_VERSION = '1.8.57';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -3860,12 +3860,12 @@
     const auraHat={previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0};
     function resetAuraHat(){Object.assign(auraHat,{previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0});}
     const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map(),
-        traps:new Map(),contact:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
+        traps:new Map(),contacts:new Map(),escapeActive:false,clearSince:null,clearSamples:0,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
         restorePending:false,restoreTries:0,restoreNextAt:0,aim:null,aimAt:-Infinity};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
-        counter.traps.clear();counter.contact=null;counter.lastSelf=null;counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
+        resetAuraEscape();counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
         counter.hammerEchoUntil=0;counter.restorePending=false;counter.restoreTries=0;counter.restoreNextAt=0;
         counter.aim=null;counter.aimAt=-Infinity;
         resetAuraHat();
@@ -3923,7 +3923,34 @@
         // Selection is performed at the instant of a strike; no stale target
         // from a prior life or earlier damage is carried over.
     }
-    const AURA_TRAP_TYPE=6, AURA_TRAP_CONTACT=60, AURA_TRAP_TTL=10000;
+    const AURA_TRAP_TYPE=6, AURA_TRAP_CONTACT=60, AURA_TRAP_RETAIN=70;
+    // World updates may be incremental. Do not forget a stationary trap after
+    // ten seconds merely because another trap was updated more recently.
+    const AURA_TRAP_TTL=120000, AURA_ESCAPE_CLEAR_MS=700;
+    function resetAuraEscape(){
+        counter.traps.clear();counter.contacts.clear();counter.escapeActive=false;
+        counter.clearSince=null;counter.clearSamples=0;counter.lastSelf=null;
+    }
+    function dropAuraTrap(key){
+        counter.traps.delete(key);counter.contacts.delete(key);
+    }
+    function auraTrapHostile(t,self){
+        return t.sid!==self.sid && !(self.team!==0 && self.team===t.team);
+    }
+    function auraTrapDistance(t,self){return Math.hypot(t.x-self.x,t.y-self.y);}
+    function auraTrapNearby(now,self){
+        const result=[];
+        for(const t of counter.traps.values()){
+            if(now-t.at>AURA_TRAP_TTL || !auraTrapHostile(t,self))continue;
+            const c=counter.contacts.get(t.key);
+            // Hysteresis keeps a confirmed capture valid at its edge, but
+            // never makes a distant remembered trap a movement destination.
+            const limit=c?.confirmed?AURA_TRAP_RETAIN:AURA_TRAP_CONTACT;
+            const distance=auraTrapDistance(t,self);
+            if(distance<=limit)result.push({t,c,distance});
+        }
+        return result;
+    }
     function observeAuraTrap(packet,now){
         if(!settings.killAura || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
@@ -3931,44 +3958,78 @@
         for(let i=1;i+18<packet.length;i+=19){
             if(packet[i]!==AURA_TRAP_TYPE)continue;
             const sid=packet[i+1],id=packet[i+2]|packet[i+3]<<8,key=sid+':'+id;
-            if(packet[i+8]&2){counter.traps.delete(key);if(counter.contact?.key===key)counter.contact=null;continue;}
-            const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8,team=packet[i+12];
-            if(sid===self.sid || (self.team!==0 && self.team===team) ||
-                Math.hypot(x-self.x,y-self.y)>260){counter.traps.delete(key);continue;}
-            counter.traps.set(key,{key,sid,team,x,y,at:now});
+            // Delete ONLY this trap. All other traps and contacts survive.
+            if(packet[i+8]&2){dropAuraTrap(key);continue;}
+            const t={key,sid,team:packet[i+12],x:packet[i+4]|packet[i+5]<<8,
+                y:packet[i+6]|packet[i+7]<<8,at:now};
+            if(!auraTrapHostile(t,self)){dropAuraTrap(key);continue;}
+            counter.traps.set(key,t);
         }
-        for(const [key,t] of counter.traps)if(now-t.at>AURA_TRAP_TTL)counter.traps.delete(key);
-        if(counter.traps.size>96)for(const [key] of [...counter.traps.entries()].sort((a,b)=>a[1].at-b[1].at).slice(0,counter.traps.size-96))counter.traps.delete(key);
-        // Entity-only packets can remove/update traps, but cannot provide a
-        // second independent player position observation.
+        for(const [key,t] of counter.traps){
+            if(now-t.at>AURA_TRAP_TTL || !auraTrapHostile(t,self))dropAuraTrap(key);
+        }
+        if(counter.traps.size>128){
+            // Evict distant objects first; active contacts have priority.
+            const victims=[...counter.traps.values()].sort((a,b)=>
+                Number(counter.contacts.has(a.key))-Number(counter.contacts.has(b.key)) ||
+                auraTrapDistance(b,self)-auraTrapDistance(a,self));
+            for(const t of victims.slice(0,counter.traps.size-128))dropAuraTrap(t.key);
+        }
+        // Only actual new self snapshots prove position/capture/escape.
+        // Object-only packets can delete a trap without clearing the episode.
         const previous=counter.lastSelf;
         if(previous && self.at<=previous.at)return;
         counter.lastSelf={x:self.x,y:self.y,at:self.at};
-        let nearest=null,distance=AURA_TRAP_CONTACT;
-        for(const t of counter.traps.values()){
-            if(t.sid===self.sid || (self.team!==0 && self.team===t.team))continue;
-            const d=Math.hypot(t.x-self.x,t.y-self.y);
-            if(d<=distance){distance=d;nearest=t;}
-        }
-        if(!nearest){counter.contact=null;return;}
         const dt=previous?self.at-previous.at:0;
         const stationary=dt>=20 && dt<=350 &&
             Math.hypot(self.x-previous.x,self.y-previous.y)/dt<=.12;
-        if(!stationary || counter.contact?.key!==nearest.key){
-            counter.contact={key:nearest.key,since:self.at,samples:1,confirmed:false};
+        const nearby=auraTrapNearby(now,self),keys=new Set(nearby.map(e=>e.t.key));
+        for(const key of counter.contacts.keys())if(!keys.has(key))counter.contacts.delete(key);
+        if(!nearby.length){
+            if(counter.escapeActive){
+                if(counter.clearSince===null){counter.clearSince=self.at;counter.clearSamples=1;}
+                else counter.clearSamples++;
+                if(counter.clearSamples>=2 && self.at-counter.clearSince>=AURA_ESCAPE_CLEAR_MS){
+                    counter.escapeActive=false;counter.clearSince=null;counter.clearSamples=0;
+                }
+            }
             return;
         }
-        counter.contact.samples++;
-        if(counter.contact.samples>=2 && self.at-counter.contact.since>=45)
-            counter.contact.confirmed=true;
+        counter.clearSince=null;counter.clearSamples=0;
+        for(const {t,c} of nearby){
+            // Keep evidence for every overlapping trap. Once an escape is
+            // active, a push into another trap can be handled immediately.
+            if(counter.escapeActive || c?.confirmed){
+                counter.contacts.set(t.key,{since:c?.since??self.at,samples:c?.samples??1,confirmed:true});
+                continue;
+            }
+            if(!c || !stationary){
+                counter.contacts.set(t.key,{since:self.at,samples:1,confirmed:false});
+                continue;
+            }
+            c.samples++;
+            if(c.samples>=2 && self.at-c.since>=45)c.confirmed=true;
+        }
+        if([...counter.contacts.values()].some(c=>c.confirmed)){
+            counter.escapeActive=true;
+            // Propagate to other traps that are already touching us.
+            for(const {t} of nearby)counter.contacts.get(t.key).confirmed=true;
+        }
     }
     function auraTrapTarget(now){
-        const c=counter.contact,t=c&&counter.traps.get(c.key),self=session.self;
-        if(!c?.confirmed || !t || !self || now-t.at>AURA_TRAP_TTL ||
-            now-self.at>250 || t.sid===self.sid ||
-            (self.team!==0 && self.team===t.team) ||
-            Math.hypot(t.x-self.x,t.y-self.y)>AURA_TRAP_CONTACT+3)return null;
-        return t;
+        const self=session.self;
+        if(!settings.killAura || !counter.escapeActive || !self || now-self.at>250)return null;
+        // Re-evaluate ALL remaining traps on every strike/aim decision, even
+        // immediately after an object-only deletion of the previous target.
+        const nearby=auraTrapNearby(now,self);
+        let best=null,distance=Infinity;
+        for(const {t,distance:d} of nearby){
+            if(d<distance){distance=d;best=t;}
+        }
+        return best;
+    }
+    function auraEscapeInProgress(){
+        return !!(settings.killAura && counter.escapeActive);
     }
     function noteAuraInventory(packet){
         if(!player.alive || !(packet instanceof Uint8Array) || packet[0]!==2)return;
@@ -4006,10 +4067,14 @@
     }
     function driveAuraHat(now=performance.now()){
         if(!player.alive || !connected() || ageRecovery.pending || session.ws.bufferedAmount>=1024)return;
-        const trap=settings.killAura && auraTrapTarget(now);
+        const escaping=auraEscapeInProgress();
         const threats=auraThreatCount(now);
         auraHat.threats=threats;
-        const allow=!!trap && threats!==null && threats<=1;
+        // A deletion or stale position is not proof of freedom. Keep the hat
+        // during the clear-confirmation window, but never equip a new one
+        // without fresh threat data. Two dangerous enemies override the delay.
+        if(escaping && threats===null)return;
+        const allow=escaping && threats!==null && threats<=1;
         // Manual hat choices get priority. Do not acquire ownership based on a
         // stale or unknown pre-break hat.
         if(allow && !auraHat.owned){
@@ -4112,7 +4177,7 @@
     }
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
-        if(auraHat.owned || (settings.killAura && auraTrapTarget(now)))return false;
+        if(auraHat.owned || auraEscapeInProgress())return false;
         if(!settings.copyNearbyHat || !player.alive || !connected() || ageRecovery.pending ||
             !t || now-t.at>350 || now<hatCopy.nextAt || now-hat.lastManualAt<1500 ||
             session.ws.bufferedAmount>=1024 || (settings.lagGuard&&networkState(now)!=='OK'))return false;
@@ -4138,6 +4203,9 @@
         const trap=auraTrapTarget(now);
         const w=counterWeapon(now);
         if(trap)return strikeAuraTrap(trap,now,w);
+        if(auraEscapeInProgress()){
+            counter.status='Trap: confirmando liberação';return aiming;
+        }
         if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return aiming;}
         const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
         if(!t){counter.status=trap?'Preso em trap; Hammer indisponível':'Nenhum inimigo no alcance';return false;}
@@ -4989,7 +5057,7 @@
         }
         if(key==='killAura'){
             // Toggle does not erase current-life inventory or restoration state.
-            counter.target=null;counter.contact=null;counter.lastSelf=null;counter.traps.clear();
+            counter.target=null;resetAuraEscape();
             counter.status='Aguardando inimigo';
             if(!settings.killAura && !settings.returnSpin && session.nativeAim && !session.attacking && heal.phase==='idle')transmit([13,...session.nativeAim]);
             if(counter.restorePending)recoverAuraWeapon(performance.now());
@@ -5070,7 +5138,7 @@
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
         if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
-        if(counterStatus)counterStatus.textContent='Kill Aura: '+(settings.killAura?counter.status+(auraTrapTarget(performance.now())?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
+        if(counterStatus)counterStatus.textContent='Kill Aura: '+(settings.killAura?counter.status+(auraEscapeInProgress()?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
