@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.89
+// @version      1.8.90
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -122,6 +122,13 @@
 //   Cada aba valida SID, ID, equipe, posição e frescor local; não autoriza
 //   movimento novo, não persegue fora da área. Sem alvo válido, usa o
 //   inimigo mais próximo elegível. Abas em outros dispositivos não sincronizam.
+// - 1.8.90: LOOTBOX=11 (Dsync, raio 40/HP 4 históricos), CHEST=30 é boss.
+//   Socket API 550560: kill local 28 contém nome, 32/33 nomes por SID.
+//   Auto Loot só com kill local, nome único, posição recente da vítima e
+//   caixa nova próxima. Não há prova de associação direta caixa/vítima;
+//   não coletar em caso ambíguo. Servidor decide quem recebe ouro.
+//   Orbit Combat muda ângulo após ataques sem progresso observado de HP,
+//   sem abandonar círculo, segurança ou prioridades de cura/respawn.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -131,7 +138,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.89';
+    const NEXUS_VERSION = '1.8.90';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -180,6 +187,8 @@
         fixedDeathCircle: true,
         bedOutsideFixed: true,
         fixedDeathFollow: true,
+        collectKillLoot: true,
+        orbitCombat: true,
         clearDeathStructures: false,
         fixedDeathRadius: 120,
         returnSpin: true, // legacy key retained for existing tab preferences
@@ -1236,10 +1245,123 @@
             return applyFixedMark(p,performance.now(),true);
         }catch(_){return false;}
     }
+    const killLoot={names:new Map(),recent:new Map(),boxes:new Map(),claim:null,status:'Aguardando kill própria'};
+    const combatOrbit={id:null,sid:null,hp:null,since:0,attempts:0,until:0,point:null,center:null,side:1,nextAt:0};
+    function resetKillLoot(server=false){
+        killLoot.recent.clear();killLoot.boxes.clear();killLoot.claim=null;killLoot.status='Aguardando kill própria';
+        if(server)killLoot.names.clear();
+    }
+    function resetCombatOrbit(){
+        Object.assign(combatOrbit,{id:null,sid:null,hp:null,since:0,attempts:0,until:0,point:null,center:null,side:1,nextAt:0});
+    }
+    function observeLootNames(packet){
+        if(!Array.isArray(packet))return;
+        const put=(sid,name)=>{
+            if(Number.isInteger(sid)&&sid>=0&&sid<=255&&typeof name==='string'&&name.trim())
+                killLoot.names.set(sid,name.trim());
+        };
+        if(packet[0]===32)put(packet[1],packet[2]);
+        if(packet[0]===33&&Array.isArray(packet[3]))for(const row of packet[3])
+            if(Array.isArray(row))put(row[0],row[1]);
+    }
+    function observeKillLoot(packet,now){
+        if(!settings.collectKillLoot||!player.alive||!fixedDeath.anchor||fixedDeath.epoch!==session.connectionEpoch)return;
+        for(let i=1;i+18<packet.length;i+=19){
+            const type=packet[i],id=packet[i+2]|packet[i+3]<<8,sid=packet[i+1],state=packet[i+8],hp=packet[i+13];
+            const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
+            if(type===0&&id!==player.id&&!(state&2)&&hp>0){
+                killLoot.recent.set(id,{id,sid,x,y,team:packet[i+12],at:now});
+            }else if(type===11){
+                const key=sid+':'+id,old=killLoot.boxes.get(key);
+                if(state&2||(old&&old.hp>0&&hp===0)){
+                    killLoot.boxes.delete(key);
+                    if(killLoot.claim?.key===key){killLoot.claim=null;killLoot.status='Caixa removida; ouro não confirmado';}
+                }else if(hp>0)killLoot.boxes.set(key,{key,id,sid,x,y,hp,at:now,first:old?.first??now});
+            }
+        }
+        for(const [id,e] of killLoot.recent)if(now-e.at>4000)killLoot.recent.delete(id);
+        for(const [key,b] of killLoot.boxes)if(now-b.at>10000)killLoot.boxes.delete(key);
+        if(killLoot.recent.size>160)for(const id of [...killLoot.recent.keys()].slice(0,killLoot.recent.size-160))killLoot.recent.delete(id);
+        if(killLoot.boxes.size>160)for(const key of [...killLoot.boxes.keys()].slice(0,killLoot.boxes.size-160))killLoot.boxes.delete(key);
+    }
+    function noteOwnLootKill(packet,now=performance.now()){
+        if(!settings.collectKillLoot||!settings.fixedDeathReturn||!fixedDeath.anchor||!returnAuthorized()||!player.alive||
+            !Array.isArray(packet)||packet[0]!==28||typeof packet[1]!=='string'||!session.self)return false;
+        const name=packet[1].match(/^Killed\s+(.+)$/i)?.[1]?.trim();
+        if(!name)return false;
+        const sids=[...killLoot.names].filter(([,n])=>n===name).map(([sid])=>sid);
+        if(sids.length!==1){killLoot.status='Kill recebida; identidade ambígua';return false;}
+        const victims=[...killLoot.recent.values()].filter(e=>e.sid===sids[0]&&now-e.at<=2000&&e.sid!==session.self.sid&&
+            !(session.self.team&&session.self.team===e.team)&&returnDist(e,fixedDeath.anchor)<=settings.fixedDeathRadius);
+        if(victims.length!==1){killLoot.status='Kill recebida; posição da vítima não confirmada';return false;}
+        killLoot.claim={victim:victims[0],at:now,epoch:session.connectionEpoch,key:null,attempts:0,lastAt:-Infinity};
+        killLoot.status='Kill própria: procurando caixa';
+        return true;
+    }
+    function ownLootTarget(now){
+        const c=killLoot.claim;
+        if(!c)return null;
+        if(!settings.collectKillLoot||!settings.fixedDeathReturn||!fixedDeath.anchor||!player.alive||
+            c.epoch!==session.connectionEpoch||now-c.at>6500||c.attempts>=12){
+            killLoot.claim=null;killLoot.status='Coleta encerrada';return null;
+        }
+        if(!returnAuthorized()||!fixedDeath.entered||bed.pending||areaCleanupActive(now)||clownEscapeActive()||ageRecovery.pending)return null;
+        const boxes=[...killLoot.boxes.values()].filter(b=>now-b.at<=1800&&b.first>=c.at-1000&&b.first<=c.at+2200&&
+            returnDist(b,c.victim)<=65&&returnDist(b,fixedDeath.anchor)<=settings.fixedDeathRadius);
+        const b=c.key?boxes.find(b=>b.key===c.key):boxes.length===1?boxes[0]:null;
+        if(!b){if(boxes.length>1)killLoot.status='Caixas ambíguas; não coletando';return null;}
+        // A deletion alone is not a death: require the local kill packet above.
+        c.key=b.key;return b;
+    }
+    function lootCombatGoal(t,self,anchor,now){
+        const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110,d=returnDist(self,t);
+        if(d<=reach-8&&d>=48)return {x:self.x,y:self.y};
+        const obs=returnObstacles(now,self),r=settings.fixedDeathRadius;
+        let best=null,score=Infinity;
+        for(const distance of [Math.max(66,reach-20),Math.max(58,reach-35)])for(let i=0;i<24;i++){
+            const a=i*Math.PI/12,p={x:t.x+distance*Math.cos(a),y:t.y+distance*Math.sin(a)};
+            if(returnDist(p,anchor)>r||p.x<30||p.y<30||p.x>65505||p.y>65505||
+                obs.some(o=>returnDist(o,p)<o.radius+15)||spikeNavBlocker(self,p,now)||returnBadEdge(self,p,now))continue;
+            const value=returnDist(self,p)+(returnSegmentClear(self,p,obs,15)?0:80);
+            if(value<score){score=value;best=p;}
+        }
+        return best||{x:self.x,y:self.y};
+    }
+    function updateCombatOrbit(e,now,attempt=false){
+        if(combatOrbit.id!==e.id||combatOrbit.sid!==e.sid){
+            resetCombatOrbit();Object.assign(combatOrbit,{id:e.id,sid:e.sid,hp:e.hp,since:now,side:player.id%2?1:-1});
+        }
+        if(Number.isFinite(e.hp)&&Number.isFinite(combatOrbit.hp)&&e.hp<combatOrbit.hp){
+            combatOrbit.since=now;combatOrbit.attempts=0;combatOrbit.until=0;combatOrbit.point=null;
+        }
+        combatOrbit.hp=e.hp;
+        if(attempt)combatOrbit.attempts++;
+    }
+    function orbitCombatGoal(e,self,anchor,now,reach){
+        if(!settings.orbitCombat||!settings.killAura||!Number.isFinite(e.hp)||now-e.at>250)return null;
+        updateCombatOrbit(e,now);
+        const o=combatOrbit,d=returnDist(self,e),r=settings.fixedDeathRadius;
+        if(o.point&&now<o.until&&o.center&&returnDist(o.center,e)<25&&returnDist(self,o.point)>8&&
+            !spikeNavBlocker(self,o.point,now)&&!returnBadEdge(self,o.point,now))return o.point;
+        if(o.point){o.point=null;o.until=0;o.nextAt=now+200;o.since=now;o.attempts=0;return null;}
+        if(now<o.nextAt||d>reach+45||o.attempts<3||now-o.since<Math.max(1250,(AURA_STATS.get(counterWeapon(now)?.id)?.[1]??300)*2.2))return null;
+        const obs=returnObstacles(now,self),base=Math.atan2(self.y-e.y,self.x-e.x);
+        const distance=Math.max(48,Math.min(100,reach-20,d));
+        for(const side of [o.side,-o.side])for(const delta of [Math.PI/3,Math.PI/2,Math.PI/4,Math.PI*2/3]){
+            const a=base+side*delta,p={x:e.x+distance*Math.cos(a),y:e.y+distance*Math.sin(a)};
+            if(returnDist(p,anchor)>r||p.x<30||p.y<30||p.x>65505||p.y>65505||
+                returnDist(self,p)<20||!returnSegmentClear(self,p,obs,15)||
+                spikeNavBlocker(self,p,now)||returnBadEdge(self,p,now))continue;
+            o.point=p;o.center={x:e.x,y:e.y};o.until=now+900;o.side=-side;
+            return p;
+        }
+        o.nextAt=now+350;return null;
+    }
     function fixedCombatGoal(enemy,self,anchor,now){
         const d=returnDist(self,enemy),radius=settings.fixedDeathRadius;
         const placing=settings.autoPlace&&settings.autoPlaceSpike;
         const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110;
+        const orbit=orbitCombatGoal(enemy,self,anchor,now,reach);if(orbit)return orbit;
         if(!placing){
             const desired=Math.max(55,Math.min(100,reach-20));
             if(d<=desired+12&&d>=desired-15)return {x:self.x,y:self.y};
@@ -1297,16 +1419,17 @@
             fixedDeath.epoch!==session.connectionEpoch || deathReturn.manualMove || bed.approach)return;
         if(!fixedDeath.entered && returnDist(self,anchor)<=settings.fixedDeathRadius)fixedDeath.entered=true;
         const sweeping=areaCleanupActive(now),cleaning=!sweeping&&trapCleanupActive(now);
-        const enemy=fixedDeath.entered&&!cleaning&&!sweeping?fixedDeathEnemy(now):null;
-        let goal=sweeping?areaCleanupGoal(now,anchor,self):cleaning?trapCleanupGoal(now,anchor,self)||anchor:anchor;
+        const loot=!sweeping&&!cleaning?ownLootTarget(now):null;
+        const enemy=fixedDeath.entered&&!cleaning&&!sweeping&&!loot?fixedDeathEnemy(now):null;
+        let goal=sweeping?areaCleanupGoal(now,anchor,self):cleaning?trapCleanupGoal(now,anchor,self)||anchor:loot?lootCombatGoal(loot,self,anchor,now):anchor;
         if(enemy){
             goal=fixedCombatGoal(enemy,self,anchor,now);
             const offset=returnDist(goal,anchor),radius=settings.fixedDeathRadius;
             if(offset>radius)goal={x:anchor.x+(goal.x-anchor.x)*radius/offset,
                 y:anchor.y+(goal.y-anchor.y)*radius/offset};
         }
-        const id=enemy?.id??null,changed=id!==fixedDeath.targetId;
-        if((sweeping||enemy)&&returnDist(goal,self)<=6&&deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;}
+        const id=loot?'loot:'+loot.key:enemy?.id??null,changed=id!==fixedDeath.targetId;
+        if((sweeping||enemy||loot)&&returnDist(goal,self)<=6&&deathReturn.moveOwned){stopReturnMovement();deathReturn.phase='ready';deathReturn.route=[];deathReturn.step=0;}
         if(!changed && returnDist(goal,deathReturn.target)<=(sweeping?3:10))return;
         if(!changed && enemy && now-fixedDeath.lastPlanAt<85)return;
         const continuous=deathReturn.moveOwned&&returnCanMove(now)&&returnDist(self,goal)>(sweeping?6:RETURN_ARRIVED)&&
@@ -1314,11 +1437,11 @@
             (sweeping||!returnRiskOnSegment(self,goal,returnRiskZones(now,self)))&&!returnBadEdge(self,goal)&&!spikeNavBlocker(self,goal,now);
         if(!continuous)stopReturnMovement();fixedDeath.targetId=id;fixedDeath.lastPlanAt=now;
         deathReturn.target={x:goal.x,y:goal.y};deathReturn.route=[];deathReturn.step=0;
-        if(!sweeping&&!enemy)deathReturn.bad=[];
+        if(!sweeping&&!enemy&&!loot)deathReturn.bad=[];
         deathReturn.fails=0;deathReturn.attempted=0;
         deathReturn.phase='ready';deathReturn.startedAt=now;deathReturn.nextAt=now;
         deathReturn.learningClean=false;deathReturn.recorded=[];
-        deathReturn.status=sweeping?'Limpando estruturas da área':cleaning?'Liberando vagas de traps':enemy?'Seguindo alvo #'+enemy.id:'Voltando ao ponto fixo';
+        deathReturn.status=sweeping?'Limpando estruturas da área':cleaning?'Liberando vagas de traps':loot?'Coletando caixa da kill própria':enemy?(combatOrbit.point?'Contornando alvo #':'Seguindo alvo #')+enemy.id:'Voltando ao ponto fixo';
         if(continuous){
             deathReturn.route=[{...goal}];deathReturn.step=0;
             if(!returnMoveTo(goal,now))stopReturnMovement();
@@ -3541,7 +3664,7 @@
         return session.nativeAim || session.serverAim;
     }
     function resetCombatState() {
-        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();
+        clearClownFlight(false);resetSpin();resetCounter();resetHatCopy();resetKillLoot();resetCombatOrbit();
         session.nativeAim = null;
         session.serverAim = null;
         session.self = null;
@@ -4405,6 +4528,8 @@
     function autoPushBlock(now){
         const self=ap.self;
         if(!settings.autoPush)return 'Desativado';
+        if(ownLootTarget(now))return 'Coleta de caixa própria';
+        if(settings.orbitCombat&&combatOrbit.point&&now<combatOrbit.until)return 'Contornando inimigo';
         if(clownEscapeActive())return 'Clown: fuga prioritária';
         if(areaCleanupActive(now))return 'Limpeza da área';
         if(!player.alive||!connected()||!self||now-self.at>AP_PLAYER_TTL)return 'Aguardando posição';
@@ -4552,6 +4677,7 @@
     }
     function apCombatBlocked(now){
         if(areaCleanupActive(now))return 'Limpeza da área';
+        if(ownLootTarget(now))return 'Coleta de caixa própria';
         if(clownEscapeActive())return 'Clown: fuga prioritária';
         if(!session.self||now-session.self.at>AP_PLAYER_TTL||now-ap.self.at>AP_PLAYER_TTL)return 'Waiting update';
         if(apTyping())return 'Digitando no jogo';
@@ -4978,7 +5104,7 @@
             if(type!==0 || id===player.id || sid===self.sid)continue;
             if(packet[i+13]===0){counter.players.delete(id);removed.push(id);if(counter.target?.id===id)counter.target=null;continue;}
             const e={id,sid,x,y,at:now,weapon:packet[i+10],hat:packet[i+11],
-                team:packet[i+12],state:packet[i+8],angle:packet[i+9]*2*Math.PI/255-Math.PI};
+                team:packet[i+12],state:packet[i+8],hp:packet[i+13],angle:packet[i+9]*2*Math.PI/255-Math.PI};
             counter.players.set(id,e);updated.push(e);
         }
         observeFixedFocus(now,updated,removed);
@@ -5694,6 +5820,8 @@
         if(counterUrgentStructure(trap,now))return trap;
         const w=counterWeapon(now),saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
         const reach=COUNTER_REACH.get(w?.id??saved);
+        const loot=ownLootTarget(now);
+        if(loot&&reach&&returnDist(loot,session.self)<=reach)return loot;
         const enemy=settings.killAura&&settings.auraLockAim&&reach?selectAuraTarget(now,reach):null;
         return enemy||trap||cleanup;
     }
@@ -5754,11 +5882,11 @@
     function driveCounter(now=performance.now()){
         if(clownEscapeActive()&&!selfPinned(now))return false;
         driveAuraHat(now);
-        const sweeping=areaCleanupActive(now);
+        const sweeping=areaCleanupActive(now),loot=!sweeping?ownLootTarget(now):null;
         const hostile=auraTrapTarget(now),cleanup=sweeping?areaCleanupTarget(now,true):trapCleanupTarget(now);
         const structure=sweeping?(selfPinned(now)&&hostile?hostile:cleanup):hostile||cleanup;
         if(recoverAuraWeapon(now,!!structure))return true;
-        if((!sweeping&&!settings.killAura&&!settings.auraBreakSpikes&&!trapCleanupActive(now))||!player.alive||!connected())return false;
+        if((!sweeping&&!loot&&!settings.killAura&&!settings.auraBreakSpikes&&!trapCleanupActive(now))||!player.alive||!connected())return false;
         const aiming=driveAuraAim(now),blocked=counterBlockReason(now);
         if(blocked){counter.status='Pausado: '+blocked;return aiming;}
         if(now<counter.nextStrikeAt)return aiming;
@@ -5766,6 +5894,14 @@
         const enemy=!sweeping&&(settings.killAura||trapCleanupActive(now))&&w?selectAuraTarget(now,COUNTER_REACH.get(w.id)):null;
         if(sweeping&&!structure){counter.status='Limpeza: '+areaSweep.status;return false;}
         const urgent=counterUrgentStructure(structure,now);
+        if(loot&&!urgent&&w&&returnDist(loot,session.self)<=COUNTER_REACH.get(w.id)){
+            if(w.select&&!transmit(w.packet||session.weaponPacket))return false;
+            if(transmit([19,...targetAim(loot)])){
+                transmit([18]);killLoot.claim.attempts++;killLoot.claim.lastAt=now;
+                counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;
+                killLoot.status='Quebrando caixa da kill própria';counter.status=killLoot.status;return true;
+            }
+        }
         // True capture/contact damage retains priority. Otherwise alternate
         // reachable structure work and enemy defense instead of monopolizing
         // the weapon with a harmless spike or a stale escape flag.
@@ -5787,6 +5923,7 @@
         transmit([18]);
         counter.lastAt=now;counter.lastEnemyStrike=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;
         counter.target=enemy;counter.status='Ataque ao inimigo #'+enemy.id;
+        if(settings.orbitCombat&&settings.fixedDeathReturn&&fixedDeath.anchor)updateCombatOrbit(enemy,now,true);
         counter.aim=aim;counter.aimAt=now;
         if(!settings.auraLockAim){
             if(settings.returnSpin)driveSpin(now);
@@ -6325,6 +6462,8 @@
         if(!Number.isInteger(id)||id<0||id>255)return;
         if(id===20&&(!(packet instanceof Uint8Array)||(packet.length-1)%19!==0))return;
         if(id===33||id===35)serverCheckRecord(session.ws,'Servidor respondeu');
+        if(id===32||id===33)observeLootNames(packet);
+        if(id===28)noteOwnLootKill(packet);
         if(id===30)observeDeathChatEcho(packet);
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false,apSnapshotProcessed=false;
@@ -6461,6 +6600,7 @@
                 // over more expensive general placement bookkeeping.
                 observeSpawnBed(packet);
                 observeReturnObjects(packet);
+                observeKillLoot(packet,performance.now());
                 observeSmartBed(packet);
                 observePlacement(packet);
                 observeTargetProximity(packet);
@@ -6513,7 +6653,7 @@
     const retiredGameSockets=new WeakSet();
     const observedGameSockets=new WeakSet();
     function clearGameConnection() {
-        clearLifeGate();counter.clanId=null;counter.clanMembers.clear();
+        clearLifeGate();counter.clanId=null;counter.clanMembers.clear();resetKillLoot(true);
         resetDeathChatConnection();
         resetSmartLife(true);
         goofy.pending=false;
@@ -6878,6 +7018,8 @@
         if(counterStatus)counterStatus.textContent=areaCleanupActive()?'Limpeza: '+counter.status:(settings.killAura?'Kill Aura: ':settings.auraBreakSpikes?'Proteção spikes: ':'Kill Aura: ')+((settings.killAura||settings.auraBreakSpikes)?counter.status+(auraEscapeInProgress()?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
         const sweepStatus=menu.querySelector('#nx-area-cleanup-status');
         if(sweepStatus)sweepStatus.textContent=!settings.clearDeathStructures?'Limpeza desativada':areaSweep.done?'Área limpa; automações retomadas':areaCleanupActive()?areaSweep.status+' • AP/Aura/Replace/Push pausados':'Aguardando ponto fixo';
+        const lootStatus=menu.querySelector('#nx-loot-status');
+        if(lootStatus)lootStatus.textContent='Loot: '+(settings.collectKillLoot?killLoot.status:'desativado');
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+(deathChat.lastDeath?' • Última vida: '+formatDeathDuration(deathChat.lastDeath.duration)+' • Por: '+(deathChat.lastDeath.killer||'Desconhecido'):'')+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
@@ -7180,6 +7322,9 @@
             <label>Mostrar círculo do ponto fixo<input data-heal-setting="fixedDeathCircle" type="checkbox"></label>
             <label title="Constrói camas novas fora do círculo com margem; não destrói camas existentes.">Cama fora da área fixa<input data-heal-setting="bedOutsideFixed" type="checkbox"></label>
             <label>Seguir inimigos dentro do círculo<input data-heal-setting="fixedDeathFollow" type="checkbox"></label>
+            <label>Auto Loot (kill própria)<input data-heal-setting="collectKillLoot" type="checkbox"></label>
+            <label>Contornar inimigo sem progresso<input data-heal-setting="orbitCombat" type="checkbox"></label>
+            <div class="nx-info-line" id="nx-loot-status">Loot: aguardando kill própria</div>
             <label title="Uma varredura por ativação ou novo ponto fixo. Inclui construções próprias e inimigas e camas dentro do círculo. Pausa Auto Place, Auto Replace, Kill Aura e Auto Push até concluir. Desligue e ligue para repetir.">Limpar estruturas da área<input data-heal-setting="clearDeathStructures" type="checkbox"></label>
             <div class="nx-info-line" id="nx-area-cleanup-status"></div>
             <label>Raio de detecção (u)<input data-heal-setting="fixedDeathRadius" type="number" min="30" max="1000" step="1"></label>
