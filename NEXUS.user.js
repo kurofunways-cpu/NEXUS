@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.54
+// @version      1.8.55
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.54';
+    const NEXUS_VERSION = '1.8.55';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -580,6 +580,7 @@
     function observeSelfHat(id, now=performance.now()) {
         if (!Number.isInteger(id) || id<0 || id>12) return;
         hat.current=id;
+        if(auraHat.owned || now<auraHat.echoUntil)return;
         if(settings.copyNearbyHat){
             if(hatCopy.target && id===hatCopy.target.hat){hatCopy.status='Chapéu confirmado #'+id;hatCopy.tries=0;}
             return; // Never overwrite the user's saved last hat with a copied hat.
@@ -594,7 +595,7 @@
         // fresh spawn snapshot doesn't mean the previous hat was unequipped.
     }
     function tryRestoreHat(now=performance.now()) {
-        if (ageRecovery.pending || (settings.copyNearbyHat && hatCopy.target)) return; // Copy/Immunity owns hat selection.
+        if (ageRecovery.pending || auraHat.owned || (settings.copyNearbyHat && hatCopy.target)) return; // Copy/Immunity owns hat selection.
         if (!hat.pending || !settings.autoLastHat || !player.alive || !connected() ||
             !hat.wanted || hat.tries>=2 || now<hat.nextAt ||
             session.ws.bufferedAmount>2048) return;
@@ -3848,7 +3849,14 @@
         [68,[115,700]],[69,[115,700]],[70,[115,700]],[71,[80,150]]
     ]);
     const COUNTER_REACH=new Map([...AURA_STATS].map(([id,[reach]])=>[id,reach+30]));
-    function auraReload(id){return AURA_STATS.get(id)?.[1]??400;}
+    // The server owns actual weapon cooldowns. A fixed nominal reload plus
+    // snapshot scheduling can miss an entire ready window. Send bounded
+    // attempts instead, without claiming a successful hit from a send.
+    const AURA_ATTEMPT_MS=90, AURA_BREAK_ATTEMPT_MS=110;
+    const AURA_DEMOLIST=11, AURA_DANGEROUS=new Set([17,28,36,37,40,44,45]);
+    const AURA_THREAT_RADIUS=225;
+    const auraHat={previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0};
+    function resetAuraHat(){Object.assign(auraHat,{previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0});}
     const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map(),
         traps:new Map(),contact:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
         restorePending:false,restoreTries:0,restoreNextAt:0};
@@ -3857,6 +3865,7 @@
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
         counter.traps.clear();counter.contact=null;counter.lastSelf=null;counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
         counter.hammerEchoUntil=0;counter.restorePending=false;counter.restoreTries=0;counter.restoreNextAt=0;
+        resetAuraHat();
     }
     function resetHatCopy(){
         hatCopy.target=null;hatCopy.nextAt=0;hatCopy.tries=0;hatCopy.status='Aguardando jogador';
@@ -3981,6 +3990,51 @@
         if(counter.restoreTries>=3)counter.restorePending=false;
         return true;
     }
+    function auraThreatCount(now){
+        const self=session.self;
+        if(!self || now-self.at>250)return null;
+        let count=0;
+        for(const e of counter.players.values()){
+            if(now-e.at>350 || e.id===player.id || e.sid===self.sid ||
+                (self.team!==0&&self.team===e.team))continue;
+            if(AURA_DANGEROUS.has(e.weapon) && Math.hypot(e.x-self.x,e.y-self.y)<=AURA_THREAT_RADIUS)count++;
+        }
+        return count;
+    }
+    function driveAuraHat(now=performance.now()){
+        if(!player.alive || !connected() || ageRecovery.pending || session.ws.bufferedAmount>=1024)return;
+        const trap=settings.killAura && auraTrapTarget(now);
+        const threats=auraThreatCount(now);
+        auraHat.threats=threats;
+        const allow=!!trap && threats!==null && threats<=1;
+        // Manual hat choices get priority. Do not acquire ownership based on a
+        // stale or unknown pre-break hat.
+        if(allow && !auraHat.owned){
+            if(now-hat.lastManualAt<1500 || hat.current===null)return;
+            if(hat.current===AURA_DEMOLIST)return;
+            auraHat.previous=hat.current;auraHat.owned=true;
+            auraHat.requested=null;auraHat.tries=0;
+        }
+        if(!auraHat.owned)return;
+        const desired=allow?AURA_DEMOLIST:auraHat.previous;
+        if(desired!==auraHat.requested){
+            auraHat.requested=desired;auraHat.tries=0;
+            // Safety transitions may be attempted immediately. Any server
+            // hat cooldown still applies, so wait for observed confirmation.
+            if(!allow)auraHat.nextAt=now;
+        }
+        if(hat.current===desired){
+            if(!allow){
+                auraHat.owned=false;auraHat.previous=null;auraHat.requested=null;
+                auraHat.echoUntil=now+1500;
+            }
+            return;
+        }
+        if(now<auraHat.nextAt || auraHat.tries>=3)return;
+        if(transmit([5,desired])){
+            auraHat.tries++;auraHat.nextAt=now+1500;auraHat.echoUntil=now+2000;
+        }
+    }
     function strikeAuraTrap(t,now,w){
         const hammer=auraHammerAvailable();
         const id=hammer??w?.id;
@@ -3993,7 +4047,7 @@
         const temporary=hammer!==null && saved!==hammer;
         session.lastAutomationAt=now;
         if(temporary){
-            counter.hammerEchoUntil=now+Math.max(1000,auraReload(id)+300);
+            counter.hammerEchoUntil=now+1500;
             if(!transmit([2,id])){counter.status='Trap: falha ao selecionar Hammer';return false;}
         }else if(w?.select && !transmit(session.weaponPacket))return false;
         const hit=transmit([19,...aim]);
@@ -4001,7 +4055,7 @@
         if(temporary && !restoreWeapon()){
             counter.restorePending=true;counter.restoreTries=0;counter.restoreNextAt=now+50;
         }
-        counter.lastAt=now;counter.nextStrikeAt=now+auraReload(id);resetSpin();
+        counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;resetSpin();
         counter.status=hit?(hammer!==null?'Quebrando trap com Hammer #'+id:'Quebrando trap com arma atual'):'Trap: golpe não enviado';
         return true;
     }
@@ -4019,6 +4073,7 @@
     }
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
+        if(auraHat.owned || (settings.killAura && auraTrapTarget(now)))return false;
         if(!settings.copyNearbyHat || !player.alive || !connected() || ageRecovery.pending ||
             !t || now-t.at>350 || now<hatCopy.nextAt || now-hat.lastManualAt<1500 ||
             session.ws.bufferedAmount>=1024 || (settings.lagGuard&&networkState(now)!=='OK'))return false;
@@ -4029,6 +4084,7 @@
         return true;
     }
     function driveCounter(now=performance.now()){
+        driveAuraHat(now);
         if(recoverAuraWeapon(now))return true;
         if(!settings.killAura || !player.alive || !connected())return false;
         if(!session.self || now-session.self.at>250 || session.attacking ||
@@ -4049,7 +4105,7 @@
         const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
         if(!transmit([19,...apAngleBytes(angle)]))return false;
         transmit([18]);
-        counter.lastAt=now;counter.nextStrikeAt=now+auraReload(w.id);counter.target=null;counter.status='Golpe enviado ao inimigo #'+t.id;
+        counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;counter.target=null;counter.status='Tentativa de golpe no inimigo #'+t.id;
         resetSpin();
         const aim=currentAim();
         if(!settings.returnSpin && aim)transmit([13,...aim]);
@@ -4764,7 +4820,7 @@
         // Record a native choice only after the original send succeeds.
         if (this === session.ws && raw && raw.length === 2) {
             if (raw[0] === 14) { clearUpgradeRetry(); recordChoice(raw[1]); }
-            if (raw[0] === 5 && player.alive) { rememberHat(raw[1]);hat.lastManualAt=performance.now(); }
+            if (raw[0] === 5 && player.alive) { resetAuraHat();rememberHat(raw[1]);hat.lastManualAt=performance.now(); }
         }
         return result;
     };
@@ -4855,6 +4911,7 @@
             counter.target=null;counter.contact=null;counter.lastSelf=null;counter.traps.clear();
             counter.status='Aguardando inimigo';
             if(counter.restorePending)recoverAuraWeapon(performance.now());
+            if(!settings.killAura)driveAuraHat(performance.now());
         }
         if(key==='copyNearbyHat'){
             resetHatCopy();
@@ -4931,7 +4988,7 @@
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
         if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
-        if(counterStatus)counterStatus.textContent='Kill Aura: '+(settings.killAura?counter.status:'desativada');
+        if(counterStatus)counterStatus.textContent='Kill Aura: '+(settings.killAura?counter.status+(auraTrapTarget(performance.now())?' • ameaças Katana/Naginata: '+(auraHat.threats??'?'):''):'desativada');
         const countStatus=menu.querySelector('#nx-death-count');
         if(countStatus)countStatus.textContent='Mortes: '+deathChat.total+' • Chat do jogo: '+(settings.deathChat?deathChat.status:'desativado');
         const ageStatus=menu.querySelector('#nx-age-recovery-status');
