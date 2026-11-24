@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.55
+// @version      1.8.56
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -44,7 +44,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.55';
+    const NEXUS_VERSION = '1.8.56';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1658,11 +1658,9 @@
     }
     function spinCanAim(now){
         return settings.returnSpin && player.alive && connected() && !session.attacking &&
-            now-counter.lastAt>=110 && !counter.restorePending &&
+            !counter.restorePending && !auraAimTarget(now) &&
             session.self && now-session.self.at<=RETURN_SNAPSHOT_TTL &&
             !(bed.pending && bed.phase==='placing') && !ageRecovery.pending &&
-            heal.phase==='idle' && !heal.foodSelected &&
-            !(isEligible() && now>=heal.nextAt) &&
             !macro.selected && !Object.keys(macroDefs).some(macroActive) &&
             session.ws.bufferedAmount<2048;
     }
@@ -1683,6 +1681,10 @@
     function driveSpin(now=performance.now()){
         if(!settings.returnSpin || !player.alive)return false;
         if(!spinCanAim(now))return false;
+        if(counter.aim){
+            spin.angle=((counter.aim[0]+256*counter.aim[1])*360/65535-180+360)%360;
+            spin.lastAt=now;spin.lastSentAt=-Infinity;counter.aim=null;
+        }
         // Allow small frame-clock jitter without skipping every other 60 Hz
         // frame. The single timestamp also deduplicates timer/socket wakes.
         if(now-spin.lastSentAt<SPIN_INTERVAL_MS-0.75)return true;
@@ -2743,7 +2745,7 @@
     function restoreWeapon() {
         if (!connected() || !transmit(session.weaponPacket)) return false;
         // Restore direction/attack only if a real, manual attack was in progress.
-        const aim = !session.attacking && settings.returnSpin && spin.aim ? spin.aim : currentAim();
+        const aim = automationAim(performance.now());
         if (aim) transmit(session.attacking ? [19, ...aim] : [13, ...aim]);
         return true;
     }
@@ -2935,7 +2937,7 @@
             return false;
         }
         session.lastAutomationAt = now;
-        if (!transmit([19, ...currentAim()])) return false;
+        if (!transmit([19, ...automationAim(now)])) return false;
         requestHealRestore(now);
         heal.foodSelected = false;
         heal.phase = 'idle';
@@ -2955,7 +2957,7 @@
         // normal onGameMessage tail will use that newer position instead.
         if(bed.pending && bed.self && session.self && bed.self.at>=session.self.at)
             trySpawnBed(now);
-        driveCounter(now); // Ordered weapon restoration already sent; no extra tick required.
+        if(!driveCounter(now))driveSpin(now); // Resume aim immediately after food.
         return true;
     }
     function randomHold() {
@@ -3859,12 +3861,13 @@
     function resetAuraHat(){Object.assign(auraHat,{previous:null,owned:false,requested:null,nextAt:0,tries:0,echoUntil:0,threats:0});}
     const counter={target:null,lastAt:-Infinity,status:'Aguardando inimigo',players:new Map(),
         traps:new Map(),contact:null,lastSelf:null,hammerSeen:null,hammerEchoUntil:0,inventory:new Set(),nextStrikeAt:0,
-        restorePending:false,restoreTries:0,restoreNextAt:0};
+        restorePending:false,restoreTries:0,restoreNextAt:0,aim:null,aimAt:-Infinity};
     const hatCopy={target:null,nextAt:0,tries:0,status:'Aguardando jogador'};
     function resetCounter(){
         counter.target=null;counter.lastAt=-Infinity;counter.status='Aguardando inimigo';counter.players.clear();
         counter.traps.clear();counter.contact=null;counter.lastSelf=null;counter.hammerSeen=null;counter.inventory.clear();counter.nextStrikeAt=0;
         counter.hammerEchoUntil=0;counter.restorePending=false;counter.restoreTries=0;counter.restoreNextAt=0;
+        counter.aim=null;counter.aimAt=-Infinity;
         resetAuraHat();
     }
     function resetHatCopy(){
@@ -4055,7 +4058,8 @@
         if(temporary && !restoreWeapon()){
             counter.restorePending=true;counter.restoreTries=0;counter.restoreNextAt=now+50;
         }
-        counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;resetSpin();
+        counter.lastAt=now;counter.nextStrikeAt=now+AURA_BREAK_ATTEMPT_MS;
+        counter.aim=aim;counter.aimAt=now;
         counter.status=hit?(hammer!==null?'Quebrando trap com Hammer #'+id:'Quebrando trap com arma atual'):'Trap: golpe não enviado';
         return true;
     }
@@ -4070,6 +4074,41 @@
             if(d<=bestDistance){bestDistance=d;best=e;}
         }
         return best;
+    }
+    // Aim ownership is independent of swing cooldown. Food's atomic select /
+    // consume / restore transaction can share the same angle safely.
+    function auraAimTarget(now){
+        if(!settings.killAura || !player.alive || !connected() || session.attacking ||
+            !session.self || now-session.self.at>250 || ageRecovery.pending ||
+            (bed.pending && bed.phase==='placing' && bed.locked) ||
+            macro.selected || Object.keys(macroDefs).some(macroActive) ||
+            ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024)return null;
+        const trap=auraTrapTarget(now);
+        if(trap)return trap;
+        const w=counterWeapon(now);
+        const saved=session.weaponPacket[0]===2?session.weaponPacket[1]:session.weaponIds[session.weapon];
+        const reach=COUNTER_REACH.get(w?.id??saved);
+        return reach?selectAuraTarget(now,reach):null;
+    }
+    function targetAim(t){
+        return apAngleBytes(Math.atan2(t.y-session.self.y,t.x-session.self.x));
+    }
+    function driveAuraAim(now=performance.now()){
+        const t=auraAimTarget(now);
+        if(!t)return false;
+        const aim=targetAim(t);
+        if(now-counter.aimAt>=25 &&
+            (!counter.aim || aim[0]!==counter.aim[0] || aim[1]!==counter.aim[1] || now-counter.aimAt>=100)){
+            if(transmit([13,...aim])){counter.aim=aim;counter.aimAt=now;}
+        }
+        return true;
+    }
+    function automationAim(now=performance.now()){
+        if(session.attacking)return currentAim();
+        const t=auraAimTarget(now);
+        if(t)return targetAim(t);
+        if(settings.returnSpin && spin.aim)return spin.aim;
+        return currentAim();
     }
     function driveHatCopy(now=performance.now()){
         const t=hatCopy.target;
@@ -4087,6 +4126,7 @@
         driveAuraHat(now);
         if(recoverAuraWeapon(now))return true;
         if(!settings.killAura || !player.alive || !connected())return false;
+        const aiming=driveAuraAim(now);
         if(!session.self || now-session.self.at>250 || session.attacking ||
             heal.phase!=='idle' || heal.foodSelected ||
             (isEligible() && now>=heal.nextAt && heal.snapshotSerial>heal.sentSnapshotSerial) ||
@@ -4094,29 +4134,28 @@
             macro.selected || Object.keys(macroDefs).some(macroActive) ||
             ap.manualItem || now<ap.manualUntil || session.ws.bufferedAmount>=1024 ||
             (settings.lagGuard && networkState(now)!=='OK') ||
-            now<counter.nextStrikeAt)return false;
+            now<counter.nextStrikeAt)return aiming;
         const trap=auraTrapTarget(now);
         const w=counterWeapon(now);
         if(trap)return strikeAuraTrap(trap,now,w);
-        if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return false;}
+        if(!w){counter.status=trap?'Preso em trap; Hammer indisponível':'Aguardando arma';return aiming;}
         const t=selectAuraTarget(now,COUNTER_REACH.get(w.id));
         if(!t){counter.status=trap?'Preso em trap; Hammer indisponível':'Nenhum inimigo no alcance';return false;}
         if(w.select && !transmit(session.weaponPacket))return false;
         const angle=Math.atan2(t.y-session.self.y,t.x-session.self.x);
         if(!transmit([19,...apAngleBytes(angle)]))return false;
         transmit([18]);
-        counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;counter.target=null;counter.status='Tentativa de golpe no inimigo #'+t.id;
-        resetSpin();
-        const aim=currentAim();
-        if(!settings.returnSpin && aim)transmit([13,...aim]);
+        counter.lastAt=now;counter.nextStrikeAt=now+AURA_ATTEMPT_MS;counter.target=t;counter.status='Mirando inimigo #'+t.id;
+        counter.aim=targetAim(t);counter.aimAt=now;
         return true;
     }
-    // FUN: publish the confirmed death total via the actual game chat.
-    // Outbound 7 + UTF-8; inbound entity chat 30 + uint16 id + UTF-8.
+    // FUN: real public game chat. Prefer the native chat control on visible
+    // tabs and observe its actual outbound packet. Background tabs use the
+    // documented binary chat command, not DOM overlays or clan chat.
     const DEATH_COUNT_KEY=PREFIX+'death_count_v1';
-    const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=1000;
+    const DEATH_CHAT_GAP=3000, DEATH_CHAT_SPAWN_DELAY=1500;
     const deathChat={total:0,pending:false,readyAt:Infinity,lastAt:-Infinity,epoch:-1,
-        echo:null,status:'Aguardando morte'};
+        echo:null,nativeTry:null,status:'Aguardando morte'};
     try{
         const count=Number(sessionStorage.getItem(DEATH_COUNT_KEY));
         if(Number.isSafeInteger(count)&&count>=0)deathChat.total=count;
@@ -4130,17 +4169,28 @@
         saveDeathCount();
         deathChat.pending=!!settings.deathChat;
         deathChat.epoch=session.connectionEpoch;
-        deathChat.readyAt=Infinity;deathChat.echo=null;
+        deathChat.readyAt=Infinity;deathChat.echo=null;deathChat.nativeTry=null;
         deathChat.status='Aguardando respawn';
         return true;
     }
     function armDeathChat(now=performance.now()){
         if(!deathChat.pending || !settings.deathChat)return;
-        // Respawn can reconnect the socket. Rebind only on a confirmed spawn,
-        // never while the new connection has no player.
         deathChat.epoch=session.connectionEpoch;
         deathChat.readyAt=now+DEATH_CHAT_SPAWN_DELAY;
+        deathChat.nativeTry=null;
         deathChat.status='Aguardando entrada no jogo';
+    }
+    function noteDeathChatSent(message,now,via){
+        deathChat.pending=false;deathChat.nativeTry=null;deathChat.lastAt=now;
+        deathChat.echo={message,at:now,epoch:session.connectionEpoch,playerId:player.id};
+        deathChat.status='Enviado ao chat do jogo ('+via+'); aguardando confirmação';
+    }
+    function observeNativeChatSend(raw,now=performance.now()){
+        deathChat.lastAt=now;
+        const n=deathChat.nativeTry;
+        if(!n || n.epoch!==session.connectionEpoch ||
+            new TextDecoder().decode(raw.subarray(1))!==n.message)return;
+        noteDeathChatSent(n.message,now,'cliente nativo');
     }
     function observeDeathChatEcho(packet,now=performance.now()){
         const e=deathChat.echo;
@@ -4153,29 +4203,60 @@
         deathChat.echo=null;deathChat.status='Confirmado pelo servidor: '+e.message;
         return true;
     }
+    function tryNativeDeathChat(message,now){
+        if(document.hidden)return false;
+        const input=document.getElementById('chat'),wrapper=document.getElementById('chat-wrapper');
+        if(!input || !wrapper || typeof input.value!=='string' ||
+            input.value!=='' || document.activeElement===input || editing({target:document.activeElement}))return false;
+        // Preserve the user's draft and focus. Only try the documented
+        // native Enter handler; never fake a chat bubble or a chat echo.
+        const display=wrapper.style.display;
+        deathChat.nativeTry={message,epoch:session.connectionEpoch,at:now};
+        try{
+            wrapper.style.display='block';input.value=message;
+            input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',
+                keyCode:13,which:13,bubbles:true,cancelable:true}));
+        }catch(_){}
+        finally{
+            if(input.value===message)input.value='';
+            wrapper.style.display=display;
+        }
+        return true;
+    }
     function announceDeathCount(now=performance.now()){
         if(deathChat.echo && now-deathChat.echo.at>5000){
-            deathChat.echo=null;deathChat.status='Enviado ao jogo; sem confirmação';
+            deathChat.echo=null;deathChat.status='Pacote enviado ao jogo; sem confirmação do servidor';
         }
         if(!settings.deathChat || !deathChat.pending || !player.alive ||
             !connected() || deathChat.epoch!==session.connectionEpoch ||
             now<deathChat.readyAt || now-deathChat.lastAt<DEATH_CHAT_GAP ||
-            !session.self || now-session.self.at>RETURN_SNAPSHOT_TTL ||
-            session.ws.bufferedAmount>=1024)return false;
+            !session.self || session.ws.bufferedAmount>=1024)return false;
         const message='Deaths: '+deathChat.total;
-        // Never simulate a chat bubble or count a local HUD update as delivery.
-        if(!transmit([7,...new TextEncoder().encode(message)]))return false;
-        deathChat.pending=false;deathChat.lastAt=now;
-        deathChat.echo={message,at:now,epoch:session.connectionEpoch,playerId:player.id};
-        deathChat.status='Enviado ao jogo; aguardando confirmação';
+        // A stationary player need not have a fresh position to send chat.
+        // Respect a real user's open chat/draft rather than interrupting it.
+        const input=document.getElementById('chat');
+        if(input && (input.value || document.activeElement===input))return false;
+        const n=deathChat.nativeTry;
+        if(!n && tryNativeDeathChat(message,now))return !deathChat.pending;
+        if(n && now-n.at<300)return false;
+        if(!transmit([7,...new TextEncoder().encode(message)])){
+            deathChat.status='Falha no envio ao jogo';return false;
+        }
+        noteDeathChatSent(message,now,'WebSocket');
         return true;
     }
+    function queueDeathChatTest(now=performance.now()){
+        if(!settings.deathChat || !player.alive || !connected())return false;
+        deathChat.pending=true;deathChat.epoch=session.connectionEpoch;deathChat.readyAt=now;
+        deathChat.nativeTry=null;deathChat.status='Teste do chat real pendente';
+        announceDeathCount(now);return true;
+    }
     function resetDeathChatConnection(){
-        deathChat.readyAt=Infinity;deathChat.epoch=-1;deathChat.echo=null;
+        deathChat.readyAt=Infinity;deathChat.epoch=-1;deathChat.echo=null;deathChat.nativeTry=null;
         if(deathChat.pending)deathChat.status='Aguardando respawn';
     }
     function resetDeathCount(){
-        deathChat.total=0;deathChat.pending=false;deathChat.echo=null;
+        deathChat.total=0;deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;
         deathChat.status='Aguardando morte';saveDeathCount();
     }
     // FUN: change the nickname once per observed death, before native Play.
@@ -4805,8 +4886,8 @@
                     if (raw[0] === 19) {
                         if(!session.attacking)resetSpin();
                         session.attacking=true;
-                    } else if(raw.length===3 && spinCanAim(performance.now())){
-                        driveSpin();return;
+                    } else if(raw.length===3 && (driveAuraAim() || driveSpin())){
+                        return;
                     }
                     break;
                 case 18:
@@ -4816,7 +4897,7 @@
             }
         }
         const result = originalSend.apply(this, arguments);
-        if(this===session.ws && raw && raw[0]===7)deathChat.lastAt=performance.now();
+        if(this===session.ws && raw && raw[0]===7)observeNativeChatSend(raw);
         // Record a native choice only after the original send succeeds.
         if (this === session.ws && raw && raw.length === 2) {
             if (raw[0] === 14) { clearUpgradeRetry(); recordChoice(raw[1]); }
@@ -4910,6 +4991,7 @@
             // Toggle does not erase current-life inventory or restoration state.
             counter.target=null;counter.contact=null;counter.lastSelf=null;counter.traps.clear();
             counter.status='Aguardando inimigo';
+            if(!settings.killAura && !settings.returnSpin && session.nativeAim && !session.attacking && heal.phase==='idle')transmit([13,...session.nativeAim]);
             if(counter.restorePending)recoverAuraWeapon(performance.now());
             if(!settings.killAura)driveAuraHat(performance.now());
         }
@@ -4919,7 +5001,7 @@
                 hat.pending=true;hat.tries=0;hat.nextAt=0;tryRestoreHat();
             }
         }
-        if(key==='deathChat' && !settings.deathChat){deathChat.pending=false;deathChat.echo=null;deathChat.status='Desativado';}
+        if(key==='deathChat' && !settings.deathChat){deathChat.pending=false;deathChat.echo=null;deathChat.nativeTry=null;deathChat.status='Desativado';}
         if(key==='goofyNames')syncGoofyNickname();
         if(key==='returnSpin'){
             resetSpin();
@@ -5295,7 +5377,7 @@
           </div>
           <div class="content" data-panel="fun" hidden>
             <div class="section-intro"><span><strong>FUN</strong><small>Rotação e nomes engraçados</small></span></div>
-            <label title="Giro contínuo com qualquer item. Ao atacar, respeita a mira do mouse e retoma o giro ao soltar. Não inicia ataques automaticamente.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
+            <label title="Giro contínuo com qualquer item, inclusive durante a espera da cura. Ataque manual e alvo do Kill Aura têm prioridade; retoma o giro quando livres.">Giro 360°<input data-heal-setting="returnSpin" type="checkbox"></label>
             <label title="Velocidade angular em graus por segundo, sem máximo configurado. 360 = uma volta por segundo.">Velocidade 360°/s<input data-heal-setting="spinDegreesPerSecond" type="number" min="0" step="any"></label>
             <div class="nx-info-line">360 = 1 volta/s • 720 = 2 voltas/s</div>
             <label title="Troca o apelido a cada respawn após uma morte. Guarda o nome original nesta aba e restaura ao desligar. Funciona também com Play manual.">Goofy Names<input data-heal-setting="goofyNames" type="checkbox"></label>
@@ -5307,6 +5389,7 @@
             <label title="Tenta equipar o chapéu do jogador mais próximo observado, incluindo aliados. O servidor pode rejeitar ou cobrar o preço normal do chapéu. Não interfere no Immunity Gear da recuperação de Age.">Copiar chapéu próximo<input data-heal-setting="copyNearbyHat" type="checkbox"></label>
             <div class="nx-info-line" id="nx-hat-copy-status">Chapéu: cópia desativada</div>
             <div class="nx-info-line" id="nx-death-count">Mortes: 0</div>
+            <button type="button" id="nx-chat-test" title="Envia uma única mensagem de teste ao chat real do jogo">Testar chat do jogo</button>
             <button type="button" id="nx-death-reset" title="Zera apenas o contador de mortes desta aba">Zerar mortes</button>
           </div>
           <div class="content" data-panel="macros" hidden>
@@ -5382,6 +5465,7 @@
             for (const panel of menu.querySelectorAll('[data-panel]')) panel.hidden = panel.dataset.panel !== button.dataset.tab;
             for (const tab of menu.querySelectorAll('[data-tab]')) tab.setAttribute('aria-selected', String(tab === button));
         });
+        menu.querySelector('#nx-chat-test').addEventListener('click',()=>{queueDeathChatTest();refreshInputs();});
         menu.querySelector('#nx-death-reset').addEventListener('click',()=>{resetDeathCount();refreshInputs();});
         menu.querySelector('#nx-bed-cancel').addEventListener('click',()=>{
             if(bed.pending)abortSpawnBed('Parada manual pelo HUD');
@@ -5608,7 +5692,7 @@
     }
     requestAnimationFrame(spinFrame);
     // Hidden tabs use snapshots plus a timer; no packet bursts on resume.
-    setInterval(()=>{if(document.hidden && settings.returnSpin && player.alive)driveSpin();},SPIN_INTERVAL_MS);
+    setInterval(()=>{if(document.hidden && player.alive){if(!driveCounter() && settings.returnSpin)driveSpin();}},SPIN_INTERVAL_MS);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
     else mount();
 })();
