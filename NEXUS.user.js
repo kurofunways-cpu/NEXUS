@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.95
+// @version      1.8.96
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -157,6 +157,13 @@
 //   ~60 Hz sem rajadas após suspensão/fila. Ações 19 mantêm ângulo explícito;
 //   13 da Aura não disputa giro. Clique manual mantém ângulo inicial real.
 //   Navegador/servidor podem limitar FPS e pacotes; não garante render remoto.
+// - 1.8.96: Auto Push Astral opcional (adaptação da geometria do trecho
+//   Auto Push do Astral [Without AI] 5.1.0:4 fornecido pelo usuário).
+//   Inimigo <220, trap própria <60, spike próprio mais próximo até 150
+//   da trap; posição 70 atrás do inimigo, pressão direta a <=50 desse ponto.
+//   Astral tem prioridade se ambos ligados; usa mesmo dono de movimento,
+//   validação de propriedade/área e watchdog do NEXUS. Sem código externo
+//   executado; não replica o teste de array sempre verdadeiro do original.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -166,7 +173,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.95';
+    const NEXUS_VERSION = '1.8.96';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -200,6 +207,7 @@
         defensivePlace: true,
         trapSlotRecovery: true,
         autoPush: false,
+        astralPush: false,
         autoReplace: false,
         autoPlaceTrap: true,
         autoPlaceSpike: true,
@@ -2512,7 +2520,7 @@
             deathReturn.nextAt=now;deathReturn.status='Preso: quebrando trap/spike sem andar';
             deathReturn.learningClean=false;return;
         }
-        if((push.owned||(settings.autoPush&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
+        if((push.owned||(autoPushEnabled()&&settings.fixedDeathReturn&&fixedDeath.entered))&&driveAutoPush(now)){deathReturn.status='Ponto fixo: Auto Push no círculo';deathReturn.learningClean=false;return;}
         refreshFixedDeathGoal(now);
         if(settings.auraBreakSpikes && !deathReturn.manualMove){
             const t=auraTrapTarget(now);
@@ -4318,7 +4326,8 @@
     // are eligible. Missing/stale objects are not evidence of destruction.
     const AR_TTL=650, AR_MAX_TRIES=2, AR_TOLERANCE=20;
     const autoPlacementEnabled=()=>settings.autoPlace||settings.autoReplace;
-    const apTrackingEnabled=()=>autoPlacementEnabled()||settings.autoPush;
+    const autoPushEnabled=()=>settings.autoPush||settings.astralPush;
+    const apTrackingEnabled=()=>autoPlacementEnabled()||autoPushEnabled();
     const ap={entities:new Map(), self:null, nextAt:0, manualUntil:0, manualItem:false,
         pending:[], attempts:[], confirmed:[], misses:[], replaceQueue:new Map(), replaced:[], timer:null, timerAt:Infinity, tick:100, lastBatchAt:-Infinity, target:null, targetUntil:0, status:'Off',plannedAt:-Infinity,revision:0,plannedRevision:-1,lastPlanMs:0,blockedAt:null,blockedReason:'',lastBlockMs:0};
     const push={owned:false,manual:false,epoch:-1,lastAt:-Infinity,startedAt:0,target:null,spike:null,best:Infinity,bestGap:Infinity,stage:null,progressAt:0,cooldown:0,avoid:new Map(),status:'Desativado'};
@@ -4657,9 +4666,38 @@
         }
         return best;
     }
+    // Astral-inspired direct geometry, using only NEXUS-observed entities.
+    function planAstralPush(self,entities,now){
+        const objects=entities.filter(e=>apStatic(e,now)&&apDistance(e,self)<=410);
+        const traps=objects.filter(o=>o.type===6&&apPushOwnStructure(o,self,now));
+        const spikes=objects.filter(o=>[2,7,17].includes(o.type)&&apPushOwnStructure(o,self,now));
+        const focus=fixedPriorityEnemy(now)?.id;
+        const enemies=entities.filter(e=>e.type===0&&e.id!==self.id&&e.health>0&&!apFriendly(e,self)&&
+            now-e.at<=AP_PLAYER_TTL&&apDistance(e,self)<220&&pushReturnAllowed(self,e,e,now));
+        enemies.sort((a,b)=>Number(b.id===focus)-Number(a.id===focus)||apDistance(a,self)-apDistance(b,self)||a.id-b.id);
+        for(const [key,until] of push.avoid)if(now>=until)push.avoid.delete(key);
+        const enemy=enemies[0];
+        if(!enemy)return null;
+        const trap=traps.filter(t=>apDistance(t,enemy)<60).sort((a,b)=>apDistance(a,enemy)-apDistance(b,enemy))[0];
+        if(!trap)return null;
+        const spike=spikes.filter(o=>apDistance(o,enemy)>0.01&&apDistance(o,trap)<=150&&
+            (push.avoid.get(enemy.id+':'+o.id)??0)<=now)
+            .sort((a,b)=>apDistance(a,enemy)-apDistance(b,enemy))[0];
+        if(!spike)return null;
+        const gap=apDistance(enemy,spike),ux=(enemy.x-spike.x)/gap,uy=(enemy.y-spike.y)/gap;
+        const behind={x:enemy.x+ux*70,y:enemy.y+uy*70};
+        const aligned=apDistance(self,behind)<=50;
+        const goal=aligned?{x:enemy.x,y:enemy.y}:behind;
+        const contact={x:enemy.x+ux*50,y:enemy.y+uy*50};
+        const dot=(self.x-enemy.x)*ux+(self.y-enemy.y)*uy;
+        const safeEnd=aligned&&dot<=50?self:aligned?contact:goal;
+        if(!pushReturnAllowed(self,enemy,goal,now)||goal.x<1||goal.y<1||goal.x>65534||goal.y>65534||
+            spikeNavBlocker(self,safeEnd,now))return null;
+        return {enemy,spike,goal,aligned,gap,astral:true,pressureAngle:Math.atan2(-uy,-ux)};
+    }
     function autoPushBlock(now){
         const self=ap.self;
-        if(!settings.autoPush)return 'Desativado';
+        if(!autoPushEnabled())return 'Desativado';
         if(ownLootTarget(now))return 'Coleta de caixa própria';
         if(settings.orbitCombat&&combatOrbit.point&&now<combatOrbit.until)return 'Contornando inimigo';
         if(clownEscapeActive())return 'Clown: fuga prioritária';
@@ -4687,7 +4725,8 @@
     function driveAutoPush(now=performance.now()){
         const blocked=autoPushBlock(now);
         if(blocked){stopAutoPush();push.status=blocked;return false;}
-        const self=ap.self,plan=planAutoPush(self,[...ap.entities.values()],now);
+        const self=ap.self,entities=[...ap.entities.values()];
+        const plan=settings.astralPush?planAstralPush(self,entities,now):planAutoPush(self,entities,now);
         if(!plan){
             stopAutoPush();
             const hasOwn=[...ap.entities.values()].some(o=>placementTypes.KeyV.has(o.type)&&apPushOwnStructure(o,self,now)&&apDistance(o,self)<=410);
@@ -4712,12 +4751,12 @@
         }
         if(distance<2&&!plan.aligned){stopAutoPush();push.status='Alinhamento atingido';return false;}
         if(now-push.lastAt<Math.max(35,Math.min(80,ap.tick*.6)))return true;
-        const angle=plan.aligned&&distance<45?plan.pressureAngle:Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x);
+        const angle=plan.aligned&&distance<(plan.astral?1:45)?plan.pressureAngle:Math.atan2(plan.goal.y-self.y,plan.goal.x-self.x);
         if(!transmit([1,...apAngleBytes(angle)])){
             stopAutoPush();push.status='Falha no envio';return false;
         }
         push.owned=true;push.epoch=session.connectionEpoch;push.lastAt=now;
-        push.status=(plan.aligned?'Empurrando para spike próprio':'Alinhando para spike próprio')+' #'+plan.spike.id;
+        push.status=(plan.astral?'Astral • ':'NEXUS • ')+(plan.aligned?'Empurrando para spike próprio':'Alinhando para spike próprio')+' #'+plan.spike.id;
         return true;
     }
     function planAutoReplace(self,entities,now) {
@@ -5224,7 +5263,7 @@
         return null;
     }
     function observeCounter(packet,now){
-        if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn && !settings.clownEscape && !settings.autoPush) || !player.alive || !session.self ||
+        if((!settings.killAura && !settings.auraBreakSpikes && !settings.copyNearbyHat && !settings.fixedDeathReturn && !settings.clownEscape && !autoPushEnabled()) || !player.alive || !session.self ||
             !(packet instanceof Uint8Array) || (packet.length-1)%19!==0)return;
         const self=session.self,updated=[],removed=[];
         for(let i=1;i+18<packet.length;i+=19){
@@ -6928,7 +6967,7 @@
             else if(!bed.locked&&movementStop){
                 // Do not let idle native STOP packets interrupt owned push;
                 // a real preceding manual movement still releases normally.
-                if(push.owned&&!push.manual&&settings.autoPush&&push.epoch===session.connectionEpoch)return;
+                if(push.owned&&!push.manual&&autoPushEnabled()&&push.epoch===session.connectionEpoch)return;
                 push.manual=false;
             }
             // Native movement temporarily owns the controls. Unlike before,
@@ -7069,8 +7108,9 @@
         if (key === 'spikeMacro' && !settings.spikeMacro) macro.held.KeyV=false;
         if (key === 'trapMacro' && !settings.trapMacro) macro.held.KeyF=false;
         if (key==='legitMacro') clearMacros();
-        if (key==='autoPlace'||key==='autoReplace'||key==='autoPush') {
-            if(!settings.autoPush)stopAutoPush();
+        if (key==='autoPlace'||key==='autoReplace'||key==='autoPush'||key==='astralPush') {
+            if(key==='autoPush'||key==='astralPush'){stopAutoPush();push.avoid.clear();push.cooldown=0;}
+            if(!autoPushEnabled())stopAutoPush();
             if (!apTrackingEnabled()) { const item=ap.manualItem, until=ap.manualUntil,manual=push.manual; resetAutoPlace(); ap.manualItem=item; ap.manualUntil=until;push.manual=manual; }
             else { if (!settings.autoReplace) ap.replaceQueue.clear(); ap.nextAt=0; if (ap.self) scheduleAutoPlace(1); }
         }
@@ -7229,7 +7269,7 @@
         const paused=areaCleanupActive();
         if(apStatus)apStatus.textContent='Auto Place: '+(paused?'pausado pela limpeza':!autoPlacementEnabled()?'desativado':ap.status)+' • cálculo '+ap.lastPlanMs.toFixed(1)+' ms • '+(ap.blockedAt!==null?'bloqueado '+Math.round(performance.now()-ap.blockedAt)+' ms':'última espera '+Math.round(ap.lastBlockMs)+' ms');
         const pushStatus=menu.querySelector('#nx-push-status');
-        if(pushStatus)pushStatus.textContent='Auto Push: '+(paused&&settings.autoPush?'pausado pela limpeza':settings.autoPush?push.status:'desativado');
+        if(pushStatus)pushStatus.textContent='Auto Push '+(settings.astralPush?'Astral':settings.autoPush?'NEXUS':'')+': '+(paused&&autoPushEnabled()?'pausado pela limpeza':autoPushEnabled()?push.status:'desativado');
         const hatCopyStatus=menu.querySelector('#nx-hat-copy-status');
         if(hatCopyStatus)hatCopyStatus.textContent='Chapéu: '+(settings.copyNearbyHat?hatCopy.status:'cópia desativada');
         const counterStatus=menu.querySelector('#nx-counter-status');
@@ -7596,7 +7636,8 @@
             <label title="Ao observar 12 traps próprias, suspende perseguição e tenta liberar duas vagas. Mantém defesa e cura.">Liberar vagas de traps<input data-heal-setting="trapSlotRecovery" type="checkbox"></label>
             <div class="nx-info-line" id="nx-trap-slots"></div>
             <label title="Spikes para inimigos capturados ou em contato previsto, sem limite artificial de HP">Auto Spike<input data-heal-setting="autoPlaceSpike" type="checkbox"></label>
-            <label title="Alinha o personagem atrás de inimigos presos em traps próprias para empurrá-los exclusivamente contra spikes próprios confirmados. Respeita movimento manual, cama e retorno inicial. No ponto fixo, pode empurrar o alvo prioritário dentro do círculo.">Auto Push<input data-heal-setting="autoPush" type="checkbox"></label>
+            <label title="Alinha o personagem atrás de inimigos presos em traps próprias para empurrá-los exclusivamente contra spikes próprios confirmados. Respeita movimento manual, cama e retorno inicial. No ponto fixo, pode empurrar o alvo prioritário dentro do círculo.">Auto Push NEXUS<input data-heal-setting="autoPush" type="checkbox"></label>
+            <label title="Modo direto inspirado no Astral: aproxima-se 70 unidades atrás do inimigo e pressiona ao chegar perto. Tem prioridade sobre o modo NEXUS se ambos ligados.">Auto Push Astral<input data-heal-setting="astralPush" type="checkbox"></label>
             <div class="nx-info-line" id="nx-push-status">Auto Push: desativado</div>
             <label title="Minimum interval between automatic attempts; server updates may be slower">Place ms<input data-heal-setting="autoPlaceMs" type="number" min="1" max="1000" step="1"></label>
             <label title="Local Auto Place packet budget only; higher values may cause lag or rejection">AP packets/s<input data-heal-setting="autoPlaceRate" type="number" min="240" max="480" step="20"></label>
