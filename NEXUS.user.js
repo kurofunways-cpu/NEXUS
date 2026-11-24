@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.86
+// @version      1.8.87
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -108,6 +108,9 @@
 //   de morte. Fora da área, admite desvios laterais para achar passagem.
 //   Confirmações tardias são comparadas às posições realmente tentadas.
 //   Não aprender rotas de centro original após deslocar a cama.
+// - 1.8.87: confirmação tardia não é marcada como cama preexistente ao
+//   mudar de centro. Busca de desvios filtra obstáculos locais e reutiliza
+//   a análise de risco. Falhas de posição expiram; não alteram âncora da morte.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -117,7 +120,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.86';
+    const NEXUS_VERSION = '1.8.87';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -2421,7 +2424,7 @@
                 y:packet[i+6]|packet[i+7]<<8,at:now});
         }
         if (!bed.origin || bed.sid===null || !bed.spawnAnchorConfirmed)return;
-        if(bed.tries===0 && bed.lastAt===0) {
+        if(!bed.attemptSites.length&&bed.tries===0 && bed.lastAt===0) {
             for(const existing of bed.earlyBeds.values()) {
                 if(now-existing.at>3000 ||
                    bedDistance(existing,bed.origin)>BED_POSITION_TOLERANCE)continue;
@@ -2441,9 +2444,10 @@
             if (packet[i+8]&2) {bed.nearby.delete(key);continue;}
             if (type===0 && id===player.id) continue;
             const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
-            if (Math.hypot(x-bed.origin.x,y-bed.origin.y)>270 && (!bed.self||Math.hypot(x-bed.self.x,y-bed.self.y)>360)) continue;
+            if (Math.hypot(x-bed.origin.x,y-bed.origin.y)>270 && (!bed.self||Math.hypot(x-bed.self.x,y-bed.self.y)>360)&&
+                !(type===SPAWN_BED_ENTITY_TYPE&&packet[i+1]===bed.sid&&bed.attemptSites.some(p=>now-p.at<=5000&&bedDistance(p,{x,y})<=BED_POSITION_TOLERANCE))) continue;
             bed.nearby.set(key,{type,x,y,at:now,sid:packet[i+1]});
-            if (type===SPAWN_BED_ENTITY_TYPE && bed.tries===0 && bed.lastAt===0)
+            if (type===SPAWN_BED_ENTITY_TYPE && !bed.attemptSites.length && bed.tries===0 && bed.lastAt===0)
                 bed.knownBedIds.add(key);
             if (type===SPAWN_BED_ENTITY_TYPE && packet[i+1]===bed.sid &&
                 !bed.knownBedIds.has(key) &&
@@ -3017,6 +3021,7 @@
         return true;
     }
     function bedFindAlternative(self,site,objects,now,allowed=()=>true,preferred=site){
+        objects=objects.filter(o=>bedDistance(o,self)<=BED_BUILD_DISTANCE+o.radius+70);
         let best=null;
         for(let i=0;i<48;i++){
             const a=i*Math.PI/24,p={x:self.x+BED_BUILD_DISTANCE*Math.cos(a),y:self.y+BED_BUILD_DISTANCE*Math.sin(a)};
@@ -3031,6 +3036,7 @@
         return best;
     }
     function bedAlternativeMove(self,objects,now,allowed,preferred){
+        const risks=returnRiskZones(now,self);
         let best=null;
         for(const length of [65,105,145])for(let i=0;i<24;i++){
             const a=i*Math.PI/12,p={x:self.x+length*Math.cos(a),y:self.y+length*Math.sin(a)};
@@ -3039,7 +3045,7 @@
                 bed.detours.some(q=>now-q.at<4000&&bedDistance(q,p)<32))continue;
             const build=bedFindAlternative(p,preferred,objects,now,allowed,preferred);
             if(!build)continue;
-            const score=build.score-length*.35-(returnRiskOnSegment(self,p,returnRiskZones(now,self))?120:0);
+            const score=build.score-length*.35-(returnRiskOnSegment(self,p,risks)?120:0);
             if(!best||score>best.score)best={point:p,place:false,score};
         }
         return best;
@@ -3325,7 +3331,7 @@
         // Explicit neutral movement before each placement attempt. The
         // previous route STOP may not have been sent if no owned leg remained.
         stopBedMovement(true,true);
-        if(bed.tries===0 && bed.lastAt===0) {
+        if(!bed.attemptSites.length&&bed.tries===0 && bed.lastAt===0) {
             for (const [id,obj] of bed.nearby)
                 if(obj.type===SPAWN_BED_ENTITY_TYPE)bed.knownBedIds.add(id);
         }
