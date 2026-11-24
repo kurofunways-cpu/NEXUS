@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.78
+// @version      1.8.79
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -62,6 +62,8 @@
 //   colocação em faixa próxima à borda. A âncora da morte não muda.
 // - Death Chat: envio direto, tentativa extra única se não houver eco.
 //   O eco não é garantido; pode haver uma duplicata. Testar tudo no jogo.
+// - 1.8.79: Jungle tem prioridade inclusive preso; Age Recovery espera o fim
+//   do Clown. Cancelar aproximação da cama libera o destino temporário.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -71,7 +73,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.78';
+    const NEXUS_VERSION = '1.8.79';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -575,6 +577,7 @@
     }
     function tryAgeRecovery(now=performance.now()) {
         if(!ageRecovery.pending)return;
+        if(clownEscapeActive()){wakeAgeRecovery(150);return;}
         if(!settings.ageRecovery || !player.alive || !connected() ||
             ageRecovery.connectionEpoch!==session.connectionEpoch){
             clearAgeRecovery('Recuperação cancelada');return;
@@ -914,6 +917,11 @@
         stopBedMovement();
         releaseBedInput();
         bed.pending=false;
+        if(bed.approach){
+            bed.approach=false;stopReturnMovement();
+            if(fixedDeath.anchor)deathReturn.target={...fixedDeath.anchor};
+            deathReturn.phase='waiting';deathReturn.route=[];deathReturn.step=0;
+        }
         bed.phase='cancelled';
         bed.abortReason=reason;
         if(returnEnabled() && deathReturn.target && deathReturn.phase==='waiting')
@@ -2920,6 +2928,12 @@
         return best;
     }
     function driveBedApproach(now){
+        if(bed.approach&&!bedOutsideActive()){
+            bed.approach=false;stopReturnMovement();
+            if(fixedDeath.anchor)deathReturn.target={...fixedDeath.anchor};
+            deathReturn.phase='waiting';deathReturn.route=[];deathReturn.step=0;
+            if(bed.self)bed.origin={...bed.self};bed.spawnAt=now;
+        }
         if(!bedOutsideActive()||!bed.origin||!bed.self||!bed.spawnAnchorConfirmed||
             bed.lastAt>0||bed.outsideGoal||now-bed.self.at>250)return false;
         const a=fixedDeath.anchor,r=settings.fixedDeathRadius,self=bed.self,d=returnDist(self,a);
@@ -3206,12 +3220,13 @@
             if(heal.phase!=='idle')cancelHeal();
             resetAuraHat();
         }
+        // Even while trapped or moving manually, regeneration is the priority.
+        // Only movement needs to wait for clear controls.
+        if(now-self.at<=250&&session.ws.bufferedAmount<1024&&hat.current!==3)
+            requestHat(3,'clown',now);
         if(now-self.at>250||push.manual||deathReturn.manualMove||bed.handoffMove||selfPinned(now)||session.ws.bufferedAmount>=1024){
             stopClownMovement();return true;
         }
-        // Ask for regeneration as soon as the state is observed; retain the
-        // normal hat transaction gate so a delayed reply cannot toggle it off.
-        if(hat.current!==3)requestHat(3,'clown',now);
         if(now-clownFlight.lastAt<95 && clownFlight.owned && clownFlight.goal &&
             !spikeNavBlocker(self,clownFlight.goal,now))return true;
         const threats=[...counter.players.values()].filter(e=>e.id!==player.id&&e.sid!==self.sid&&
