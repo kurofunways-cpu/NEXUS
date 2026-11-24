@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.93
+// @version      1.8.94
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -146,6 +146,12 @@
 //   simular morte nem liberar cama/Age Recovery. Preserva raio e não usa
 //   coordenadas de outro servidor. Limpar coletivo grava cancelamento;
 //   limpar local não apaga as outras abas. Mark antigo v1 ainda é lido.
+// - 1.8.94: Auto Loot aceita kill local 28 ou aumento observado do
+//   contador 22 (Socket API 550560). Correlaciona caixa nova 11 e vítima
+//   recente mesmo sem nome; aguarda eventos fora de ordem. HP zero inicial
+//   da caixa não significa deleção. Janela maior, tolerância na borda,
+//   movimento/ataque prioritários, diagnósticos no HUD. Associação ainda
+//   inferida; sem kill local ou com caixas ambíguas não coleta.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -155,7 +161,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.93';
+    const NEXUS_VERSION = '1.8.94';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -1319,10 +1325,11 @@
         receiveFixedMark(JSON.stringify(p));
         return saved;
     }
-    const killLoot={names:new Map(),recent:new Map(),boxes:new Map(),claim:null,status:'Aguardando kill própria'};
+    const killLoot={names:new Map(),recent:new Map(),boxes:new Map(),claim:null,kills:null,lastKillAt:-Infinity,lastKillName:null,status:'Aguardando kill própria'};
+    const LOOT_CLAIM_MS=12000,LOOT_ATTEMPT_MAX=36;
     const combatOrbit={id:null,sid:null,hp:null,since:0,attempts:0,until:0,point:null,center:null,side:1,nextAt:0};
     function resetKillLoot(server=false){
-        killLoot.recent.clear();killLoot.boxes.clear();killLoot.claim=null;killLoot.status='Aguardando kill própria';
+        killLoot.recent.clear();killLoot.boxes.clear();killLoot.claim=null;killLoot.kills=null;killLoot.lastKillAt=-Infinity;killLoot.lastKillName=null;killLoot.status='Aguardando kill própria';
         if(server)killLoot.names.clear();
     }
     function resetCombatOrbit(){
@@ -1343,63 +1350,103 @@
             for(const row of packet[3])if(Array.isArray(row))put(row[0],row[1]);
         }
     }
+    function lootClaimPending(now){
+        const c=killLoot.claim;
+        return !!(settings.collectKillLoot&&settings.fixedDeathReturn&&c&&c.epoch===session.connectionEpoch&&now-c.at<=LOOT_CLAIM_MS&&c.attempts<LOOT_ATTEMPT_MAX);
+    }
     function observeKillLoot(packet,now){
         if(!settings.collectKillLoot||!player.alive||!fixedDeath.anchor||fixedDeath.epoch!==session.connectionEpoch)return;
         for(let i=1;i+18<packet.length;i+=19){
             const type=packet[i],id=packet[i+2]|packet[i+3]<<8,sid=packet[i+1],state=packet[i+8],hp=packet[i+13];
             const x=packet[i+4]|packet[i+5]<<8,y=packet[i+6]|packet[i+7]<<8;
-            if(type===0&&id!==player.id&&!(state&2)&&hp>0){
-                killLoot.recent.set(id,{id,sid,x,y,team:packet[i+12],at:now});
+            if(type===0&&id!==player.id){
+                const old=killLoot.recent.get(id);
+                if(state&2||hp===0){
+                    if(old&&old.sid===sid){old.goneAt=now;if(hp===0&&!(state&2))old.deadAt=now;}
+                }else killLoot.recent.set(id,{id,sid,x,y,team:packet[i+12],hp,at:now,name:killLoot.names.get(sid)||null});
             }else if(type===11){
                 const key=sid+':'+id,old=killLoot.boxes.get(key);
                 if(state&2||(old&&old.hp>0&&hp===0)){
                     killLoot.boxes.delete(key);
-                    if(killLoot.claim?.key===key){killLoot.claim=null;killLoot.status='Caixa removida; ouro não confirmado';}
-                }else if(hp>0)killLoot.boxes.set(key,{key,id,sid,x,y,hp,at:now,first:old?.first??now});
+                    if(killLoot.claim?.key===key){killLoot.claim=null;killLoot.status='Caixa destruída/removida; ouro não confirmado';}
+                }else killLoot.boxes.set(key,{key,id,sid,x,y,hp,at:now,first:old?.first??now});
             }
         }
-        for(const [id,e] of killLoot.recent)if(now-e.at>4000)killLoot.recent.delete(id);
-        for(const [key,b] of killLoot.boxes)if(now-b.at>10000)killLoot.boxes.delete(key);
-        if(killLoot.recent.size>160)for(const id of [...killLoot.recent.keys()].slice(0,killLoot.recent.size-160))killLoot.recent.delete(id);
-        if(killLoot.boxes.size>160)for(const key of [...killLoot.boxes.keys()].slice(0,killLoot.boxes.size-160))killLoot.boxes.delete(key);
+        for(const [id,e] of killLoot.recent)if(now-e.at>8000)killLoot.recent.delete(id);
+        for(const [key,b] of killLoot.boxes)if(now-b.at>20000)killLoot.boxes.delete(key);
+        for(const map of [killLoot.recent,killLoot.boxes])if(map.size>200)
+            for(const key of [...map.keys()].slice(0,map.size-200))map.delete(key);
+    }
+    function beginLootClaim(name,now,source){
+        if(!settings.collectKillLoot||!settings.fixedDeathReturn||!fixedDeath.anchor||!returnAuthorized()||!player.alive||!session.self)return false;
+        const old=killLoot.claim;
+        // 22 and 28 often describe the same kill; enrich rather than restart.
+        if(old&&now-old.at<=1200&&(!name||!old.name||name===old.name)){
+            if(name)old.name=name;
+            if(source==='mensagem')old.source=source;
+            return true;
+        }
+        killLoot.claim={name,source,at:now,epoch:session.connectionEpoch,key:null,attempts:0,lastAt:-Infinity,
+            victim:null,attackTarget:counter.target?.id??null};
+        killLoot.lastKillAt=now;killLoot.lastKillName=name;
+        killLoot.status='Kill própria ('+source+'): aguardando caixa';
+        return true;
     }
     function noteOwnLootKill(packet,now=performance.now()){
-        if(!settings.collectKillLoot||!settings.fixedDeathReturn||!fixedDeath.anchor||!returnAuthorized()||!player.alive||
-            !Array.isArray(packet)||packet[0]!==28||typeof packet[1]!=='string'||!session.self)return false;
-        const name=packet[1].match(/^Killed\s+(.+)$/i)?.[1]?.trim();
-        if(!name)return false;
-        const sids=[...killLoot.names].filter(([,n])=>n===name).map(([sid])=>sid);
-        if(sids.length!==1){killLoot.status='Kill recebida; identidade ambígua';return false;}
-        const victims=[...killLoot.recent.values()].filter(e=>e.sid===sids[0]&&now-e.at<=2000&&e.sid!==session.self.sid&&
-            !(session.self.team&&session.self.team===e.team)&&returnDist(e,fixedDeath.anchor)<=settings.fixedDeathRadius);
-        if(victims.length!==1){killLoot.status='Kill recebida; posição da vítima não confirmada';return false;}
-        killLoot.claim={victim:victims[0],at:now,epoch:session.connectionEpoch,key:null,attempts:0,lastAt:-Infinity};
-        killLoot.status='Kill própria: procurando caixa';
-        return true;
+        if(!Array.isArray(packet)||Number(packet[0])!==28||typeof packet[1]!=='string')return false;
+        const name=packet[1].match(/^\s*Killed\s+(.+)$/i)?.[1]?.trim()||null;
+        // Opcode 28 is a local kill notification; text may be localized.
+        if(!name&&!packet[1].trim())return false;
+        return beginLootClaim(name,now,'mensagem');
+    }
+    function noteLootKillCount(packet,now=performance.now()){
+        if(!Array.isArray(packet)||Number(packet[0])!==22||!Array.isArray(packet[1]))return false;
+        const k=packet[1][0];if(!Number.isInteger(k)||k<0)return false;
+        const previous=killLoot.kills;killLoot.kills=k;
+        if(!player.alive)return false;
+        // Never treat the first nonzero count as a new kill without baseline.
+        return previous!==null&&k>previous?beginLootClaim(null,now,'contador'):false;
     }
     function ownLootTarget(now){
         const c=killLoot.claim;
         if(!c)return null;
-        if(!settings.collectKillLoot||!settings.fixedDeathReturn||!fixedDeath.anchor||!player.alive||
-            c.epoch!==session.connectionEpoch||now-c.at>6500||c.attempts>=12){
-            killLoot.claim=null;killLoot.status='Coleta encerrada';return null;
+        if(!lootClaimPending(now)||!fixedDeath.anchor||!player.alive){
+            killLoot.claim=null;killLoot.status='Coleta encerrada: '+(c.key?'caixa não confirmada':'caixa não localizada');return null;
         }
-        if(!returnAuthorized()||!fixedDeath.entered||bed.pending||areaCleanupActive(now)||clownEscapeActive()||ageRecovery.pending)return null;
-        const boxes=[...killLoot.boxes.values()].filter(b=>now-b.at<=1800&&b.first>=c.at-1000&&b.first<=c.at+2200&&
-            returnDist(b,c.victim)<=65&&returnDist(b,fixedDeath.anchor)<=settings.fixedDeathRadius);
-        const b=c.key?boxes.find(b=>b.key===c.key):boxes.length===1?boxes[0]:null;
-        if(!b){if(boxes.length>1)killLoot.status='Caixas ambíguas; não coletando';return null;}
-        // A deletion alone is not a death: require the local kill packet above.
-        c.key=b.key;return b;
+        if(!returnAuthorized()||!fixedDeath.entered||bed.pending||clownEscapeActive()||ageRecovery.pending)return null;
+        const anchor=fixedDeath.anchor,r=settings.fixedDeathRadius,self=session.self;
+        if(!self||now-self.at>250)return null;
+        const boxes=[...killLoot.boxes.values()].filter(b=>now-b.at<=10000&&b.first>=c.at-1800&&b.first<=c.at+4500&&returnDist(b,anchor)<=r+80);
+        if(c.key){
+            const b=boxes.find(b=>b.key===c.key);
+            if(b)return b;
+            killLoot.status='Caixa marcada: aguardando atualização';return null;
+        }
+        const victims=[...killLoot.recent.values()].filter(e=>e.sid!==self.sid&&!(self.team&&self.team===e.team)&&
+            e.at>=c.at-3500&&e.at<=c.at+1500&&returnDist(e,anchor)<=r+30);
+        const named=c.name?victims.filter(e=>(e.name||killLoot.names.get(e.sid)||'').trim()===c.name):[];
+        const pairs=[];
+        for(const b of boxes){
+            const near=(named.length?named:victims).filter(e=>returnDist(e,b)<=105);
+            const eligible=near.filter(e=>named.length||e.deadAt>=c.at-1800||e.goneAt>=c.at-1800||e.id===c.attackTarget||e.hp<=40||victims.length===1);
+            if(eligible.length===1)pairs.push({b,e:eligible[0]});
+        }
+        if(pairs.length!==1){
+            killLoot.status=boxes.length>1||pairs.length>1?'Caixas ambíguas; aguardando evidência':'Kill própria: '+boxes.length+' caixa(s), '+victims.length+' vítima(s) candidata(s)';
+            return null;
+        }
+        c.key=pairs[0].b.key;c.victim=pairs[0].e;
+        killLoot.status='Caixa #'+pairs[0].b.id+' localizada ('+c.source+')';
+        return pairs[0].b;
     }
     function lootCombatGoal(t,self,anchor,now){
         const reach=COUNTER_REACH.get(counterWeapon(now)?.id)??110,d=returnDist(self,t);
-        if(d<=reach-8&&d>=48)return {x:self.x,y:self.y};
+        if(d<=Math.max(48,reach-22))return {x:self.x,y:self.y};
         const obs=returnObstacles(now,self),r=settings.fixedDeathRadius;
         let best=null,score=Infinity;
-        for(const distance of [Math.max(66,reach-20),Math.max(58,reach-35)])for(let i=0;i<24;i++){
-            const a=i*Math.PI/12,p={x:t.x+distance*Math.cos(a),y:t.y+distance*Math.sin(a)};
-            if(returnDist(p,anchor)>r||p.x<30||p.y<30||p.x>65505||p.y>65505||
+        for(const distance of [Math.max(58,reach-30),Math.max(55,reach-45)])for(let i=0;i<32;i++){
+            const a=i*Math.PI/16,p={x:t.x+distance*Math.cos(a),y:t.y+distance*Math.sin(a)};
+            if(returnDist(p,anchor)>r+25||p.x<30||p.y<30||p.x>65505||p.y>65505||
                 obs.some(o=>returnDist(o,p)<o.radius+15)||spikeNavBlocker(self,p,now)||returnBadEdge(self,p,now))continue;
             const value=returnDist(self,p)+(returnSegmentClear(self,p,obs,15)?0:80);
             if(value<score){score=value;best=p;}
@@ -5551,7 +5598,7 @@
         const ready=!!(signature&&player.alive&&returnAuthorized()&&fixedDeath.entered&&self&&
             now-self.at<=250&&now-areaSweep.lastPacket<=350&&!bed.pending&&!ageRecovery.pending&&!clownEscapeActive());
         // Do not call ownLootTarget here (it calls areaCleanupActive).
-        const c=killLoot.claim,collecting=!!(settings.collectKillLoot&&c&&c.epoch===session.connectionEpoch&&now-c.at<=6500&&c.attempts<12);
+        const collecting=lootClaimPending(now);
         const hostile=ready&&[...counter.players.values()].some(e=>now-e.at<=900&&e.id!==player.id&&e.sid!==self.sid&&
             !(self.team&&self.team===e.team)&&returnDist(e,fixedDeath.anchor)<=settings.fixedDeathRadius);
         if(!ready||hostile||collecting){
@@ -6630,6 +6677,7 @@
         if(id===29)observeDeathAttack(packet,performance.now());
         if(id===20)observeDeathEvidence(packet,performance.now());
         if(id===28)noteOwnLootKill(packet);
+        if(id===22)noteLootKillCount(packet);
         if(id===30)observeDeathChatEcho(packet);
         if(id===16 || id===24 || id===27)observeAuraClan(packet);
         let ownSnapshotProcessed=false,apSnapshotProcessed=false;
@@ -6660,7 +6708,7 @@
             player.id = Number(packet[1]);
             player.alive = Number.isInteger(player.id) && player.id >= 0;
             player.health = 100;
-            if(player.alive){if(newDeathLife)deathLifeStart();armDeathChat();}
+            if(player.alive){killLoot.kills=0;if(newDeathLife)deathLifeStart();armDeathChat();}
             resetRespawnHat();
             armAgeRecoverySpawn();
             resetSpawnBed();
