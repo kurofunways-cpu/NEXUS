@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.102
+// @version      1.8.103
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -206,6 +206,8 @@
     //   renomear/excluir (até 25). Guarda snapshots em localStorage; aplicar
     //   usa overrides da aba em sessionStorage para preservar outras abas.
     //   Valores validados e atualizados via editSetting; sem reautorizar morte.
+// - 1.8.103: saveTabOverrides informa sucesso/falha real, para a mensagem
+    //   de Carregar perfil não indicar falha falsa após salvar corretamente.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -215,7 +217,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.102';
+    const NEXUS_VERSION = '1.8.103';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -312,7 +314,10 @@
             (typeof fallback === 'boolean' ? saved === 'true' : numericSetting(key,saved));
     }
     function saveTabOverrides() {
-        try { sessionStorage.setItem(TAB_LOCAL_KEY, JSON.stringify(tabOverrides)); } catch (_) {}
+        try {
+            sessionStorage.setItem(TAB_LOCAL_KEY, JSON.stringify(tabOverrides));
+            return true;
+        } catch (_) { return false; }
     }
     try {
         const saved=JSON.parse(sessionStorage.getItem(TAB_LOCAL_KEY)||'{}');
