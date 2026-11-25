@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NEXUS | Sploop Control
 // @namespace    https://sploop.io/
-// @version      1.8.101
+// @version      1.8.102
 // @updateURL    https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.meta.js
 // @downloadURL  https://raw.githubusercontent.com/kurofunways-cpu/NEXUS/main/NEXUS.user.js
 // @description  NEXUS: safer background automation, responsive death-return navigation and heal.
@@ -201,6 +201,11 @@
     //   breve estável. Próprio spike de destino não invalida a pressão.
     //   Astral mantém pressão no contato, sem oscilar a mira pelo centro.
     //   Testes sintéticos e sintaxe; jogabilidade/protocolo não confirmados.
+// - 1.8.102: perfis nomeados das configurações completas do NEXUS na aba
+    //   Perfis, separados dos perfis de upgrades; criar/salvar/carregar/
+    //   renomear/excluir (até 25). Guarda snapshots em localStorage; aplicar
+    //   usa overrides da aba em sessionStorage para preservar outras abas.
+    //   Valores validados e atualizados via editSetting; sem reautorizar morte.
 // - Referências: greasyfork.org/en/scripts/449995-dsync-client-sploop-io/code
 //   e greasyfork.org/en/scripts/550560-sploop-io-socket-api/code.
 //
@@ -210,7 +215,7 @@
 (() => {
     'use strict';
     // Independent implementation: Heal, Profiles, held macros and predictive auto placement.
-    const NEXUS_VERSION = '1.8.101';
+    const NEXUS_VERSION = '1.8.102';
     const INSTANCE = '__GPTMOD_HEAL_CLEAN_V1__';
     if (window[INSTANCE]) {
         // Different installed versions share this singleton key. Previously,
@@ -349,6 +354,72 @@
     normalizeHolds();
     const apRateLimit = value => Math.max(240, Math.min(480, Math.round(Number(value) || 360)));
     settings.autoPlaceRate = apRateLimit(settings.autoPlaceRate);
+
+    // Complete NEXUS settings snapshots, separate from upgrade profiles.
+    // Saved names/snapshots are shared in localStorage, but applying a profile
+    // is deliberately tab-local so PvP/defense tabs never overwrite each other.
+    const CONFIG_PROFILES_KEY=PREFIX+'settings_profiles_v1';
+    const CONFIG_SELECTED_KEY=PREFIX+'settings_profile_selected_v1';
+    const CONFIG_PROFILES_MAX=25;
+    let configProfiles=[],selectedConfigProfile='',configProfileStatus='';
+    try{selectedConfigProfile=sessionStorage.getItem(CONFIG_SELECTED_KEY)||'';}catch(_){}
+    function sanitizeConfigProfile(raw){
+        if(!raw||typeof raw!=='object'||Array.isArray(raw)||typeof raw.name!=='string'||
+            !raw.values||typeof raw.values!=='object'||Array.isArray(raw.values))return null;
+        const name=raw.name.trim().replace(/\s+/g,' ').slice(0,40);
+        if(!name)return null;
+        const values={};
+        for(const [key,fallback] of Object.entries(DEFAULTS)){
+            if(!Object.hasOwn(raw.values,key))continue;
+            const value=raw.values[key];
+            if(typeof fallback==='boolean'&&typeof value==='boolean')values[key]=value;
+            else if(typeof fallback==='number'&&typeof value==='number'&&Number.isFinite(value))
+                values[key]=key==='autoPlaceRate'?apRateLimit(value):numericSetting(key,value);
+        }
+        return Object.keys(values).length?{name,values}:null;
+    }
+    function reloadConfigProfiles(){
+        let incoming=[];
+        try{
+            const data=JSON.parse(localStorage.getItem(CONFIG_PROFILES_KEY)||'null');
+            if(data!==null && (!data||data.schema!==1||!Array.isArray(data.profiles)))return false;
+            if(data){
+                const seen=new Set();
+                for(const item of data.profiles){
+                    const profile=sanitizeConfigProfile(item);
+                    if(!profile)continue;
+                    const id=profile.name.toLocaleLowerCase();
+                    if(seen.has(id))continue;
+                    incoming.push(profile);seen.add(id);
+                    if(incoming.length>=CONFIG_PROFILES_MAX)break;
+                }
+            }
+        }catch(_){return false;}
+        configProfiles=incoming;
+        if(!configProfiles.some(p=>p.name===selectedConfigProfile))selectedConfigProfile='';
+        return true;
+    }
+    function writeConfigProfiles(next){
+        try{
+            localStorage.setItem(CONFIG_PROFILES_KEY,JSON.stringify({schema:1,profiles:next}));
+            configProfiles=next;
+            return true;
+        }catch(_){return false;}
+    }
+    function chooseConfigProfile(name){
+        selectedConfigProfile=name;
+        try{
+            if(name)sessionStorage.setItem(CONFIG_SELECTED_KEY,name);
+            else sessionStorage.removeItem(CONFIG_SELECTED_KEY);
+        }catch(_){}
+    }
+    function configSnapshot(){
+        const values={};
+        for(const key of Object.keys(DEFAULTS))values[key]=settings[key];
+        return values;
+    }
+    reloadConfigProfiles();
+
     // Never rewrite every setting when opening/duplicating a tab: another tab
     // may have changed it meanwhile. Persist only explicit user edits.
 
@@ -7526,6 +7597,102 @@
         }
         refreshInputs();
     }
+
+    function refreshConfigProfiles(){
+        if(!menu)return;
+        const select=menu.querySelector('#nx-config-profile-list');
+        const input=menu.querySelector('#nx-config-profile-name');
+        if(!select||!input)return;
+        // Text-only DOM insertion: saved profile names never become HTML.
+        select.replaceChildren();
+        const placeholder=document.createElement('option');
+        placeholder.value='';placeholder.textContent='Selecione um perfil';
+        select.appendChild(placeholder);
+        for(const profile of configProfiles){
+            const option=document.createElement('option');
+            option.value=profile.name;option.textContent=profile.name;
+            select.appendChild(option);
+        }
+        select.value=configProfiles.some(p=>p.name===selectedConfigProfile)?selectedConfigProfile:'';
+        if(document.activeElement!==input)input.value=select.value;
+        const selected=!!select.value;
+        for(const id of ['nx-config-save','nx-config-apply','nx-config-rename','nx-config-delete']){
+            const button=menu.querySelector('#'+id);
+            if(button)button.disabled=!selected;
+        }
+        const status=menu.querySelector('#nx-config-profile-status');
+        if(status)status.textContent=configProfileStatus;
+    }
+    function profileNameFromInput(){
+        const input=menu&&menu.querySelector('#nx-config-profile-name');
+        return input?input.value.trim().replace(/\s+/g,' ').slice(0,40):'';
+    }
+    function applyConfigProfile(profile){
+        // Adopt the profile in this tab only. Save the independent overrides
+        // BEFORE firing editSetting: existing helpers may normalize hold times.
+        for(const [key,value] of Object.entries(profile.values))tabOverrides[key]=value;
+        const persisted=saveTabOverrides();
+        for(const key of Object.keys(DEFAULTS)){
+            if(Object.hasOwn(profile.values,key)&&settings[key]!==profile.values[key])
+                editSetting(key,profile.values[key],true);
+        }
+        refreshInputs();
+        return persisted;
+    }
+    function configProfileAction(action){
+        if(!reloadConfigProfiles()){
+            configProfileStatus='Não foi possível ler os perfis salvos.';
+            refreshConfigProfiles();return;
+        }
+        const selected=configProfiles.find(p=>p.name===selectedConfigProfile);
+        const name=profileNameFromInput();
+        const duplicate=name&&configProfiles.some(p=>
+            p.name.toLocaleLowerCase()===name.toLocaleLowerCase()&&p.name!==selectedConfigProfile);
+        if(action==='apply'){
+            if(!selected)configProfileStatus='Selecione um perfil.';
+            else{
+                const persisted=applyConfigProfile(selected);
+                configProfileStatus=persisted?'Perfil carregado somente nesta aba.':
+                    'Aplicado nesta aba, mas não foi possível salvar para o próximo reload.';
+            }
+            refreshConfigProfiles();return;
+        }
+        if(action==='new' || action==='rename'){
+            if(!name){configProfileStatus='Digite um nome para o perfil.';refreshConfigProfiles();return;}
+            if(duplicate||(action==='new'&&configProfiles.some(p=>
+                p.name.toLocaleLowerCase()===name.toLocaleLowerCase()))){
+                configProfileStatus='Já existe um perfil com esse nome.';refreshConfigProfiles();return;
+            }
+        }
+        if(action!=='new'&&!selected){
+            configProfileStatus='Selecione um perfil primeiro.';refreshConfigProfiles();return;
+        }
+        let next=configProfiles;
+        let nextSelection=selectedConfigProfile;
+        if(action==='new'){
+            if(next.length>=CONFIG_PROFILES_MAX){
+                configProfileStatus='Limite de 25 perfis atingido.';refreshConfigProfiles();return;
+            }
+            next=[...next,{name,values:configSnapshot()}];
+            nextSelection=name;
+        }else if(action==='save'){
+            next=next.map(p=>p.name===selectedConfigProfile?
+                {name:p.name,values:configSnapshot()}:p);
+        }else if(action==='rename'){
+            next=next.map(p=>p.name===selectedConfigProfile?{name,values:p.values}:p);
+            nextSelection=name;
+        }else if(action==='delete'){
+            next=next.filter(p=>p.name!==selectedConfigProfile);
+            nextSelection='';
+        }else return;
+        if(writeConfigProfiles(next)){
+            chooseConfigProfile(nextSelection);
+            configProfileStatus=action==='new'?'Perfil criado e salvo.':
+                action==='save'?'Configurações atuais salvas no perfil.':
+                action==='rename'?'Perfil renomeado.':'Perfil excluído.';
+        }else configProfileStatus='Falha ao salvar; verifique o armazenamento do navegador.';
+        refreshConfigProfiles();
+    }
     function toggleTabSync(key) {
         if (!Object.hasOwn(DEFAULTS,key)) return;
         if (isTabIndependent(key)) {
@@ -7969,6 +8136,22 @@
             <div class="nx-info-line">Configurações do jogo são salvas automaticamente.</div>
           </div>
           <div class="content" data-panel="profiles" hidden>
+
+            <div class="section-intro"><span><strong>PERFIS DE CONFIGURAÇÃO</strong><small>Salve todas as opções do NEXUS</small></span></div>
+            <select id="nx-config-profile-list" class="pick-input" aria-label="Perfil de configurações salvo"></select>
+            <input id="nx-config-profile-name" class="pick-input" maxlength="40" placeholder="Nome: PvP, Defesa, Farm..." aria-label="Nome do perfil de configurações">
+            <div class="pick-actions">
+              <button type="button" id="nx-config-new">Criar</button>
+              <button type="button" id="nx-config-save">Salvar</button>
+              <button type="button" id="nx-config-apply">Carregar</button>
+            </div>
+            <div class="pick-actions">
+              <button type="button" id="nx-config-rename">Renomear</button>
+              <button type="button" id="nx-config-delete">Excluir</button>
+            </div>
+            <div class="nx-info-line">Carregar aplica todas as configurações salvas somente nesta aba e mantém as outras abas intactas. Use ↔ ao lado de cada opção para voltar a sincronizá-la. Os perfis ficam salvos neste navegador.</div>
+            <div id="nx-config-profile-status" class="nx-info-line" aria-live="polite"></div>
+            <div class="nx-group-title">Perfis de upgrades</div>
             <div class="section-intro"><span><strong>UPGRADE PROFILES</strong><small>Salve e reproduza seus upgrades</small></span></div>
             <label title="Automatically repeat the selected profile whenever its next item is offered">Auto Pick<input data-heal-setting="autoPick" type="checkbox"></label>
             <label title="Mostra Yes somente uma vez por vida, se Auto Pick estiver desligado e nenhum upgrade tiver sido escolhido.">Aviso de alvos<input data-heal-setting="notifyTargets" type="checkbox"></label>
@@ -8010,6 +8193,7 @@
         updateHealth();
         refreshInputs();
         refreshProfiles();
+        refreshConfigProfiles();
         for (const button of menu.querySelectorAll('[data-tab]')) button.addEventListener('click', () => {
             for (const panel of menu.querySelectorAll('[data-panel]')) panel.hidden = panel.dataset.panel !== button.dataset.tab;
             for (const tab of menu.querySelectorAll('[data-tab]')) tab.setAttribute('aria-selected', String(tab === button));
@@ -8041,6 +8225,15 @@
             }
             refreshInputs();
         });
+        const configSelect=menu.querySelector('#nx-config-profile-list');
+        configSelect.addEventListener('change',()=>{
+            chooseConfigProfile(configSelect.value);
+            configProfileStatus='';
+            refreshConfigProfiles();
+        });
+        for(const action of ['new','save','apply','rename','delete']){
+            menu.querySelector('#nx-config-'+action).addEventListener('click',()=>configProfileAction(action));
+        }
         const profileSelect = menu.querySelector('#gpt-pick-profile');
         const profileName = menu.querySelector('#gpt-pick-name');
         profileSelect.addEventListener('change', () => {
@@ -8144,6 +8337,8 @@
         grip.addEventListener('pointercancel', end);
     }
     function syncSettingsFromStorage() {
+        reloadConfigProfiles();
+        refreshConfigProfiles();
         for (const [key, fallback] of Object.entries(DEFAULTS)) {
             // Page visibility, storage events and pageshow must not overwrite
             // an unlinked option with another tab's value.
@@ -8176,6 +8371,9 @@
             refreshInputs();return;
         }
         if(event.key===FIXED_FOCUS_KEY){if(receiveFixedFocus(event.newValue))refreshInputs();return;}
+        if (event.key===CONFIG_PROFILES_KEY) {
+            reloadConfigProfiles();refreshConfigProfiles();return;
+        }
         if (event.key===GAME_TOGGLES_KEY) {
             try {
                 const incoming=JSON.parse(event.newValue||'{}');
